@@ -20,8 +20,12 @@ COPY --from=frontend /app/src/openjarvis/server/static src/openjarvis/server/sta
 RUN pip install --no-cache-dir uv && \
     uv pip install --system ".[server]"
 
+# Install Rust toolchain for maturin
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    . $HOME/.cargo/env
+
 # Build Rust extension for memory backend
-RUN uv run maturin develop -m rust/crates/openjarvis-python/Cargo.toml
+RUN . $HOME/.cargo/env && uv run maturin develop -m rust/crates/openjarvis-python/Cargo.toml
 
 # Generate API key if not provided
 RUN if [ -z "$OPENJARVIS_API_KEY" ]; then \
