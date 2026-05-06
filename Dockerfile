@@ -1,11 +1,11 @@
 # Stage 1: Build frontend SPA
 FROM node:22-slim AS frontend
 
-# Accept the API key from the build environment (Railway passes OPENJARVIS_API_KEY).
-# Re-declare after FROM so it is in scope for this stage, then expose it under
-# the VITE_ prefix so Vite inlines it into the built JavaScript bundle.
-ARG OPENJARVIS_API_KEY
-ENV VITE_OPENJARVIS_API_KEY=${OPENJARVIS_API_KEY}
+# NOTE: The API key is NOT passed as a build arg here.  Railway only makes
+# environment variables available at *runtime*, not during `docker build`.
+# Passing ARG OPENJARVIS_API_KEY would always produce an empty string, causing
+# every API request to fail with 401.  Instead, the frontend fetches the key
+# at runtime from the /v1/config endpoint (see frontend/src/lib/api.ts).
 
 WORKDIR /app
 COPY frontend/ ./frontend/

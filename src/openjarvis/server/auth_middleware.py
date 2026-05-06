@@ -40,9 +40,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 )
         return await call_next(request)
 
+    # Paths under /v1/ that are intentionally public — the frontend needs
+    # /v1/config to retrieve the API key before it can authenticate.
+    _PUBLIC_V1_PATHS: frozenset[str] = frozenset({"/v1/config"})
+
     @staticmethod
     def _requires_auth(path: str) -> bool:
         """Only protect API routes, not the frontend UI or static assets."""
+        if path in AuthMiddleware._PUBLIC_V1_PATHS:
+            return False
         return path.startswith("/v1/") or path.startswith("/api/")
 
 

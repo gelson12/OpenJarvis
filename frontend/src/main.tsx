@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import App from './App';
-import { initApiBase } from './lib/api';
+import { initApiBase, initApiKey } from './lib/api';
 import './index.css';
 
 function applyTheme() {
@@ -26,7 +26,11 @@ applyTheme();
 // Fetch the API base URL from the Tauri backend before rendering.
 // This ensures JARVIS_PORT is defined in one place (the Rust backend).
 // In non-Tauri environments this is a no-op.
-initApiBase().finally(() => {
+//
+// Then fetch the runtime API key from /v1/config so all subsequent
+// requests can include the Authorization header (fixes Railway deploys
+// where the key is only available at runtime, not build time).
+Promise.all([initApiBase(), initApiKey()]).finally(() => {
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <ErrorBoundary>

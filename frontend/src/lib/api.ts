@@ -4,10 +4,51 @@ import type { ModelInfo, SavingsData, ServerInfo } from '../types';
 // Auth helpers
 // ---------------------------------------------------------------------------
 
+// Runtime API key fetched from /v1/config on app init.
+// Falls back to the build-time env var for local development convenience.
+let _runtimeApiKey: string | null = null;
+
+/**
+ * Fetch the API key from the backend's /v1/config endpoint and cache it.
+ * Must be called once at app startup (before any authenticated requests).
+ * Safe to call in non-Tauri (web) and Tauri environments alike.
+ */
+export async function initApiKey(): Promise<void> {
+  // Already initialised — skip.
+  if (_runtimeApiKey !== null) return;
+
+  // Build-time env var takes precedence (local dev / Tauri builds that still
+  // embed the key at build time).
+  const buildTimeKey = import.meta.env.VITE_OPENJARVIS_API_KEY;
+  if (buildTimeKey) {
+    _runtimeApiKey = buildTimeKey;
+    return;
+  }
+
+  // In production (Railway) the key is only available at runtime via the
+  // backend.  /v1/config is intentionally exempt from auth so we can
+  // bootstrap without a chicken-and-egg problem.
+  try {
+    const base = getBase();
+    const res = await fetch(`${base}/v1/config`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.apiKey) {
+        _runtimeApiKey = data.apiKey;
+        return;
+      }
+    }
+  } catch {
+    // Network error — fall through; requests will proceed without auth.
+  }
+
+  // No key available — set to empty string so we don't retry on every call.
+  _runtimeApiKey = '';
+}
+
 export function getAuthHeaders(): Record<string, string> {
-  const apiKey = import.meta.env.VITE_OPENJARVIS_API_KEY;
+  const apiKey = _runtimeApiKey ?? import.meta.env.VITE_OPENJARVIS_API_KEY;
   if (!apiKey) {
-    console.warn('VITE_OPENJARVIS_API_KEY not set; API requests may fail with 401');
     return {};
   }
   return {

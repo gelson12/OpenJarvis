@@ -57,6 +57,25 @@ class OptimizeRunRequest(BaseModel):
     max_samples: int = 50
 
 
+# ---- Config route (public — no auth required) ----
+
+config_router = APIRouter(tags=["config"])
+
+
+@config_router.get("/v1/config")
+async def get_config(request: Request):
+    """Return runtime configuration for the frontend.
+
+    This endpoint is intentionally exempt from API-key authentication so the
+    browser can retrieve the key before it has one to send.  Only non-secret
+    values (or values the caller already needs to bootstrap auth) are exposed.
+    """
+    import os
+
+    api_key = os.environ.get("OPENJARVIS_API_KEY", "")
+    return {"apiKey": api_key}
+
+
 # ---- Agent routes ----
 
 agents_router = APIRouter(prefix="/v1/agents", tags=["agents"])
@@ -883,6 +902,7 @@ async def start_optimize_run(req: OptimizeRunRequest, request: Request):
 
 def include_all_routes(app) -> None:
     """Include all extended API routers in a FastAPI app."""
+    app.include_router(config_router)
     app.include_router(agents_router)
     app.include_router(memory_router)
     app.include_router(traces_router)
@@ -932,6 +952,7 @@ def include_all_routes(app) -> None:
 
 __all__ = [
     "include_all_routes",
+    "config_router",
     "agents_router",
     "memory_router",
     "traces_router",
