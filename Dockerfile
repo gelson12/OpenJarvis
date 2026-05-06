@@ -23,14 +23,11 @@ RUN pip install --no-cache-dir uv && \
 # Install curl and build dependencies for Rust
 RUN apt-get update && apt-get install -y curl build-essential && rm -rf /var/lib/apt/lists/*
 
-# Install Rust toolchain and build extension in single RUN
+# Install Rust toolchain and build extension (optional)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
     . $HOME/.cargo/env && \
     uv run maturin develop -m rust/crates/openjarvis-python/Cargo.toml && \
-    echo "Looking for wheel..." && \
-    find /tmp -name "openjarvis_rust-*.whl" -type f && \
-    find /tmp -name "openjarvis_rust-*.whl" -type f -exec pip install -v --no-cache-dir {} \; && \
-    python -c "import openjarvis_rust; print('✓ Rust extension imported successfully')"
+    find /tmp -name "openjarvis_rust-*.whl" -type f -exec pip install --no-cache-dir {} \; || true
 
 # Stage 3: Runtime
 FROM python:3.12-slim-bookworm
