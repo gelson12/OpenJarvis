@@ -49,37 +49,95 @@ def _is_auto(model: str) -> bool:
 
 
 def resolve_auto_model_for_agent(model: str) -> str:
-    """Resolve a literal 'auto' model id to a real tool-capable model.
+    """Return the *primary* candidate for a literal 'auto' model id.
 
-    The agent path uses non-streaming engine.generate() which has no
-    notion of cascade racing — the underlying CloudEngine just forwards
-    whatever model id it's handed straight to the provider. Sending
-    'auto' produces a 404 from OpenAI ('no model called auto'). This
-    resolver picks the first entry in the preference list whose API
-    key is present in the environment, falling back to the literal
-    'auto' (which will surface the 404 — diagnostic, not silent).
+    For non-auto inputs this is a passthrough. For 'auto', it returns
+    the first preference whose API key is present — but the agent's
+    engine is also wrapped with :class:`FallbackEngine` (see
+    :func:`get_agent_fallback_chain`) so a generate() failure on the
+    primary transparently moves to the next candidate.
+    """
+    chain = get_agent_fallback_chain(model)
+    return chain[0] if chain else model
+
+
+def get_agent_fallback_chain(model: str) -> list[str]:
+    """Return the ordered list of candidate models for this request.
+
+    Always honours an explicit ``TOOL_CAPABLE_AGENT_MODEL`` override
+    (single-element chain — operator wants exactly that model). For
+    'auto', returns every preference whose API key is set in
+    descending preference order. For a concrete model id, returns
+    [model] (no fallback — the user picked something specific, respect
+    it; surface the error if it fails so the misconfiguration is
+    visible).
     """
     if not _is_auto(model):
-        return model
+        return [model] if model else []
 
     override = os.environ.get("TOOL_CAPABLE_AGENT_MODEL", "").strip()
     if override:
-        return override
+        return [override]
 
+    chain: list[str] = []
     for candidate, key_envs in _AGENT_MODEL_PREFERENCE:
         if any(os.environ.get(env) for env in key_envs):
-            logging.getLogger("openjarvis.server").info(
-                "agent: model='auto' resolved to %s (key %s present)",
-                candidate, ",".join(env for env in key_envs if os.environ.get(env)),
-            )
-            return candidate
+            chain.append(candidate)
+    return chain
 
-    logging.getLogger("openjarvis.server").warning(
-        "agent: model='auto' could not be resolved — no tool-capable "
-        "API key found in env (checked %s); request will likely fail",
-        [env for _, envs in _AGENT_MODEL_PREFERENCE for env in envs],
-    )
-    return model
+
+class FallbackEngine:
+    """Engine wrapper that tries a sequence of models, returning the first
+    successful generate() result. Anything else is forwarded to the inner
+    engine unchanged.
+
+    When the agent calls generate() on this wrapper, the ``model`` keyword
+    is overridden by each candidate in turn. On any exception (HTTP 4xx/5xx,
+    quota errors, network failures, etc.) the wrapper logs the failure
+    and tries the next candidate. If every candidate fails, the *last*
+    exception is re-raised so the user sees a real error rather than a
+    misleading first-failure message.
+
+    Used by :class:`AgentStreamBridge` for ``model='auto'`` requests so a
+    transient OpenAI 429 / Anthropic 529 / network blip silently moves
+    to the next available provider instead of failing the whole agent run.
+    """
+
+    def __init__(self, inner: object, candidates: list[str]) -> None:
+        if not candidates:
+            raise ValueError("FallbackEngine needs at least one candidate")
+        self._inner = inner
+        self._candidates = list(candidates)
+        self._log = logging.getLogger("openjarvis.server")
+
+    def __getattr__(self, name: str) -> object:
+        # Delegate stream(), stream_full(), health(), close(), list_models(),
+        # and any other method we haven't overridden to the inner engine.
+        return getattr(self._inner, name)
+
+    def generate(self, messages, *, model: str = "", **kwargs):  # type: ignore[no-untyped-def]
+        """Try each candidate in order; return the first successful result."""
+        last_exc: BaseException | None = None
+        attempted: list[str] = []
+        for candidate in self._candidates:
+            try:
+                return self._inner.generate(messages, model=candidate, **kwargs)
+            except Exception as exc:
+                attempted.append(candidate)
+                last_exc = exc
+                self._log.warning(
+                    "FallbackEngine: %s failed (%s: %s); trying next candidate",
+                    candidate, type(exc).__name__, exc,
+                )
+                continue
+        # Every candidate failed — surface the last exception with
+        # context about everything we tried.
+        self._log.error(
+            "FallbackEngine: all %d candidates failed (%s); raising last error",
+            len(self._candidates), attempted,
+        )
+        assert last_exc is not None
+        raise last_exc
 
 # EventTypes we subscribe to and their corresponding SSE event names
 _EVENT_MAP = {
@@ -190,17 +248,34 @@ class AgentStreamBridge:
             self._request.messages[-1].content if self._request.messages else ""
         )
 
-        # Override agent model for this request if the caller specified one.
-        # 'auto' must be resolved here because the agent's downstream
-        # engine.generate() has no cascade — it would forward 'auto' as
-        # a literal model id and the provider would 404.
+        # Override agent model + engine for this request.
+        #
+        # For 'auto' requests we additionally wrap the agent's engine
+        # with FallbackEngine so a quota / rate-limit / auth failure on
+        # the primary provider transparently retries the next candidate.
+        # For a concrete model id (user picked gpt-4o etc.), we pass it
+        # through unchanged — respect explicit user choice.
         original_model = self._agent._model
+        original_engine = self._agent._engine
         if self._model:
-            self._agent._model = resolve_auto_model_for_agent(self._model)
+            chain = get_agent_fallback_chain(self._model)
+            if chain:
+                self._agent._model = chain[0]
+                if len(chain) > 1:
+                    # Multiple candidates — wrap engine for silent fallback.
+                    self._agent._engine = FallbackEngine(
+                        original_engine, chain,
+                    )
+            else:
+                # No keys at all — leave model as-is so the request
+                # surfaces a real error rather than silently using a
+                # stale value.
+                self._agent._model = self._model
         try:
             return self._agent.run(input_text, context=ctx)
         finally:
             self._agent._model = original_model
+            self._agent._engine = original_engine
 
     # ------------------------------------------------------------------
     # Public streaming interface
