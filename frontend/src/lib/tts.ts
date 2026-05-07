@@ -81,9 +81,69 @@ function pickVoice(): SpeechSynthesisVoice | null {
   return voices[0] ?? null;
 }
 
+/**
+ * Strip markdown so the browser TTS doesn't read syntax characters
+ * out loud (e.g. "**Late**" being spoken as "asterisk asterisk Late
+ * asterisk asterisk"). Plain prose comes through unchanged. Used on
+ * everything routed through speak() / onTokenStream().
+ */
+function stripMarkdownForSpeech(text: string): string {
+  let out = text;
+
+  // Code fences ```...``` -> drop entirely (rare in spoken context anyway)
+  out = out.replace(/```[\s\S]*?```/g, '');
+
+  // Inline code `foo` -> foo
+  out = out.replace(/`([^`]+)`/g, '$1');
+
+  // Markdown links [label](url) -> label
+  out = out.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+
+  // Bold **foo** / __foo__ -> foo
+  out = out.replace(/\*\*([^*]+)\*\*/g, '$1');
+  out = out.replace(/__([^_]+)__/g, '$1');
+
+  // Italic *foo* / _foo_ -> foo  (run AFTER bold so we don't eat the **)
+  out = out.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '$1');
+  out = out.replace(/(?<!_)_([^_\n]+)_(?!_)/g, '$1');
+
+  // Strikethrough ~~foo~~ -> foo
+  out = out.replace(/~~([^~]+)~~/g, '$1');
+
+  // Headers: "## Heading" -> "Heading" (one per line)
+  out = out.replace(/^#{1,6}\s+/gm, '');
+
+  // Block quotes: "> quoted" -> "quoted"
+  out = out.replace(/^>\s+/gm, '');
+
+  // Bullet markers at line start: "- foo" / "* foo" / "+ foo" -> "foo"
+  // Requires that the next char is a space so we don't munge math.
+  out = out.replace(/^[-*+]\s+/gm, '');
+
+  // Numbered lists: "1. foo" -> "foo"
+  out = out.replace(/^\d+\.\s+/gm, '');
+
+  // Tables: "|" pipe characters get read as "vertical bar" — strip cell
+  // separators but keep the text. Crude but works for the common case.
+  out = out.replace(/\s*\|\s*/g, ', ');
+
+  // Horizontal rules ---- / ==== / **** on their own line
+  out = out.replace(/^[-=*]{3,}\s*$/gm, '');
+
+  // Collapse newline runs to a single space; TTS handles its own pauses.
+  out = out.replace(/\n+/g, ' ');
+
+  // Tidy whitespace.
+  out = out.replace(/\s{2,}/g, ' ').trim();
+
+  return out;
+}
+
 function enqueue(text: string): void {
-  if (!isSupported() || !text.trim()) return;
-  const u = new SpeechSynthesisUtterance(text);
+  if (!isSupported()) return;
+  const cleaned = stripMarkdownForSpeech(text);
+  if (!cleaned.trim()) return;
+  const u = new SpeechSynthesisUtterance(cleaned);
   const voice = pickVoice();
   if (voice) u.voice = voice;
   u.rate = 1.0;

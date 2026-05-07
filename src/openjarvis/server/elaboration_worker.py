@@ -128,22 +128,51 @@ def _augment_with_spoken_answer(
     """Append the fast-path's answer as an [ASSISTANT] turn AND a final
     [USER] instruction telling Claude-CLI to elaborate on it without
     restating. The instruction is what turns Claude from a duplicate
-    responder into an actual elaborator."""
+    responder into an actual elaborator.
+
+    Tone constraints come from production iteration:
+    - Earlier versions produced 4 numbered sections of generic
+      best-practice advice for a simple 'send an email' prompt. Too
+      verbose, not personalised.
+    - Earlier versions used markdown — bold, bullets, headers — which
+      browser TTS reads literally ("asterisk asterisk Late asterisk
+      asterisk") because there's no markdown→speech parser in
+      window.speechSynthesis.
+
+    The new prompt enforces terse, plain-prose, personally-grounded
+    elaborations that work both as written text AND as spoken audio.
+    """
     augmented = list(messages)
     augmented.append({"role": "assistant", "content": spoken.strip()})
     augmented.append({
         "role": "user",
         "content": (
-            "[ELABORATION TASK] The assistant's answer above is the "
-            "fast-path response from another model. Your job is to "
-            "ELABORATE on it for me, not to restate it. Add depth, "
-            "context, edge cases I should know about, and proactive "
-            "follow-up suggestions that the fast answer missed. If the "
-            "fast answer is already complete and correct, say one short "
-            "line acknowledging that and add ONE thing it didn't cover. "
-            "Do not paraphrase the fast answer back to me. Do not start "
-            "with 'Hello' or any greeting — go straight to the deeper "
-            "content."
+            "[ELABORATION TASK]\n"
+            "Provide a SHORT, sharp follow-up to the assistant's answer "
+            "above. This will be SPOKEN aloud by browser TTS, so:\n"
+            "\n"
+            "VOICE-SAFE OUTPUT — strict:\n"
+            "  - Plain prose only. NO markdown. NO asterisks for bold. "
+            "NO hash-mark headers. NO bullet lists. NO numbered lists. "
+            "NO code fences.\n"
+            "  - Write as if speaking it aloud to a thoughtful colleague.\n"
+            "  - Maximum 2 short paragraphs. Often 1-2 sentences is plenty.\n"
+            "\n"
+            "CONTENT — required:\n"
+            "  - ONE specific observation grounded in this user's actual "
+            "context (their stored conversations, their workflows, the "
+            "tool results above) — NEVER generic best-practice advice "
+            "like 'consider adding an ETA' or 'check your scope'.\n"
+            "  - If the fast answer is already complete and correct, say "
+            "one short line acknowledging that and stop.\n"
+            "  - Do not paraphrase the fast answer back. Do not greet. "
+            "Do not start with 'Hello' or 'Sir' (the polite-prompt "
+            "wrapper handles that).\n"
+            "\n"
+            "Be J.A.R.V.I.S.: dry, brief, demonstrably useful. If you "
+            "have nothing concrete to add beyond what the fast answer "
+            "said, just say 'Nothing further to add, sir.' That's a "
+            "valid response."
         ),
     })
     return augmented
