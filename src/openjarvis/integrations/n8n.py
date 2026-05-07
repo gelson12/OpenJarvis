@@ -128,6 +128,38 @@ class N8NClient:
             params["workflowId"] = workflow_id
         return self._request("GET", "/executions", params=params)
 
+    # -- Credentials ----------------------------------------------------
+    #
+    # n8n stores SaaS credentials (Slack, Gmail, Notion, Google Sheets,
+    # Stripe, etc.) that workflows reference by id. The REST API only
+    # exposes metadata — id, name, type, createdAt, updatedAt — never the
+    # encrypted secret values. That's still enough for the OpenJarvis
+    # agent to KNOW which SaaS services have a credential available so
+    # it can construct or execute a workflow that uses them, instead of
+    # asking the user to re-enter the same key in OpenJarvis env.
+
+    def list_credentials(self, *, limit: int = 100) -> Any:
+        """List credentials stored in n8n (metadata only — no secret values).
+
+        Returns an array of ``{id, name, type, createdAt, updatedAt}``.
+        Use this so the agent knows which SaaS integrations are
+        credentialed inside n8n already (Slack, Gmail OAuth, Stripe,
+        Notion, etc.) — pair with execute_workflow to actually USE them.
+        """
+        return self._request(
+            "GET", "/credentials", params={"limit": limit},
+        )
+
+    def get_credential(self, credential_id: str) -> Any:
+        """Fetch a single credential's metadata by id."""
+        return self._request("GET", f"/credentials/{credential_id}")
+
+    def list_credential_types(self) -> Any:
+        """List the credential schema types n8n knows about (slackApi,
+        gmailOAuth2, stripeApi, ...). Useful to discover what kind of
+        credential to create for a given SaaS service."""
+        return self._request("GET", "/credentials/schema")
+
 
 _default: Optional[N8NClient] = None
 

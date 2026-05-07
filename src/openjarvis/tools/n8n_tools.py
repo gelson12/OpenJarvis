@@ -279,6 +279,106 @@ class N8NListExecutionsTool(_N8NToolBase):
             return _err(self.spec.name, exc)
 
 
+@ToolRegistry.register("n8n_list_credentials")
+class N8NListCredentialsTool(_N8NToolBase):
+    tool_id = "n8n_list_credentials"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="n8n_list_credentials",
+            description=(
+                "List SaaS credentials already stored in n8n — Slack, "
+                "Gmail OAuth, Stripe, Notion, Google Sheets, Postgres, "
+                "etc. Returns metadata only (id, name, type, timestamps; "
+                "no secret values). Use this to discover what services "
+                "are pre-authenticated inside n8n so the agent can "
+                "either execute a workflow that uses one of these "
+                "credentials, or guide the user toward creating one, "
+                "instead of asking them to re-enter the same secret in "
+                "OpenJarvis env vars."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "default": 100},
+                },
+            },
+            category="automation",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        try:
+            return _ok(
+                self.spec.name,
+                self._client.list_credentials(
+                    limit=int(params.get("limit", 100)),
+                ),
+            )
+        except N8NUnavailableError as exc:
+            return _err(self.spec.name, exc)
+
+
+@ToolRegistry.register("n8n_get_credential")
+class N8NGetCredentialTool(_N8NToolBase):
+    tool_id = "n8n_get_credential"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="n8n_get_credential",
+            description=(
+                "Fetch a single n8n credential's metadata by id. "
+                "Returns id, name, type, timestamps — never secret values."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "credential_id": {"type": "string"},
+                },
+                "required": ["credential_id"],
+            },
+            category="automation",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        try:
+            return _ok(
+                self.spec.name,
+                self._client.get_credential(params["credential_id"]),
+            )
+        except N8NUnavailableError as exc:
+            return _err(self.spec.name, exc)
+
+
+@ToolRegistry.register("n8n_list_credential_types")
+class N8NListCredentialTypesTool(_N8NToolBase):
+    tool_id = "n8n_list_credential_types"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="n8n_list_credential_types",
+            description=(
+                "List the credential SCHEMA types n8n knows about "
+                "(slackApi, gmailOAuth2, stripeApi, postgres, etc.). "
+                "Use to learn which credential type to ask the user to "
+                "create for a SaaS service before automating it."
+            ),
+            parameters={"type": "object", "properties": {}},
+            category="automation",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        try:
+            return _ok(
+                self.spec.name,
+                self._client.list_credential_types(),
+            )
+        except N8NUnavailableError as exc:
+            return _err(self.spec.name, exc)
+
+
 __all__ = [
     "N8NActivateWorkflowTool",
     "N8NCreateWorkflowTool",
