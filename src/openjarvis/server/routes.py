@@ -48,6 +48,7 @@ _AUTO_INJECT_PREFIXES = (
     "v0_",
     "stripe_",
     "paypal_",
+    "calendar_",
 )
 _AUTO_INJECT_EXACT = ("email_send",)
 

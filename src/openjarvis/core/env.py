@@ -174,6 +174,29 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
         "paypal",
         secret=False,
     ),
+    # ----- Google APIs (calendar today, gmail next) -------------------
+    "GOOGLE_CLIENT_ID": EnvSpec(
+        "GOOGLE_CLIENT_ID",
+        (),
+        "Google OAuth2 client id (shared by Calendar + Gmail). Create "
+        "in Google Cloud Console -> APIs & Services -> Credentials.",
+        "google",
+        secret=False,
+    ),
+    "GOOGLE_CLIENT_SECRET": EnvSpec(
+        "GOOGLE_CLIENT_SECRET",
+        (),
+        "Google OAuth2 client secret (paired with GOOGLE_CLIENT_ID).",
+        "google",
+    ),
+    "GOOGLE_REFRESH_TOKEN": EnvSpec(
+        "GOOGLE_REFRESH_TOKEN",
+        (),
+        "Long-lived refresh token from a one-time OAuth flow with "
+        "scopes 'calendar' (and later 'gmail.modify'). Exchanged for "
+        "short-lived access tokens on demand.",
+        "google",
+    ),
 }
 
 

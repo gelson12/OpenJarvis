@@ -84,6 +84,24 @@ def _probe(integration: str) -> tuple[Optional[bool], Optional[str]]:
             return True, None
         except Exception as exc:
             return False, f"probe error: {exc}"
+    if integration == "google":
+        try:
+            from openjarvis.integrations.google_calendar import (
+                get_default_client,
+            )
+
+            client = get_default_client()
+            if not client.configured:
+                return False, (
+                    "GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, or "
+                    "GOOGLE_REFRESH_TOKEN missing"
+                )
+            # Token refresh is the cheapest credentials check; doesn't
+            # touch the user's calendar data.
+            client._fetch_access_token()
+            return True, None
+        except Exception as exc:
+            return False, f"probe error: {exc}"
     return None, None  # No probe — caller will mirror configured state.
 
 
