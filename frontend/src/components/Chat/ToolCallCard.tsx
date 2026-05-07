@@ -12,23 +12,45 @@ const statusConfig = {
   error: { icon: XCircle, color: 'var(--color-error)' },
 };
 
-function previewArgs(raw: string): string {
-  if (!raw) return '';
+// Coerce any value (string, object, array, number, bool, null) to a
+// string suitable for rendering as a React child. Without this the
+// agent's tool_results payload (which can arrive as a structured
+// object) crashes the chat with React error #31 — "Objects are not
+// valid as a React child."
+function asRenderable(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean')
+    return String(value);
   try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') {
-      const entries = Object.entries(parsed);
-      if (entries.length === 0) return '';
-      const [k, v] = entries[0];
-      const valStr =
-        typeof v === 'string' ? v : JSON.stringify(v);
-      const trimmed = valStr.length > 40 ? `${valStr.slice(0, 40)}…` : valStr;
-      return entries.length === 1 ? `${k}: ${trimmed}` : `${k}: ${trimmed}, …`;
-    }
+    return JSON.stringify(value, null, 2);
   } catch {
-    /* fall through */
+    return String(value);
   }
-  return raw.length > 60 ? `${raw.slice(0, 60)}…` : raw;
+}
+
+function previewArgs(raw: unknown): string {
+  if (!raw) return '';
+  // raw may already be an object or a JSON string. Normalise to object
+  // first, then build a one-line preview.
+  let parsed: unknown = raw;
+  if (typeof raw === 'string') {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return raw.length > 60 ? `${raw.slice(0, 60)}…` : raw;
+    }
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const entries = Object.entries(parsed as Record<string, unknown>);
+    if (entries.length === 0) return '';
+    const [k, v] = entries[0];
+    const valStr = typeof v === 'string' ? v : JSON.stringify(v);
+    const trimmed = valStr.length > 40 ? `${valStr.slice(0, 40)}…` : valStr;
+    return entries.length === 1 ? `${k}: ${trimmed}` : `${k}: ${trimmed}, …`;
+  }
+  const s = asRenderable(parsed);
+  return s.length > 60 ? `${s.slice(0, 60)}…` : s;
 }
 
 export function ToolCallCard({ toolCall }: Props) {
@@ -120,7 +142,7 @@ export function ToolCallCard({ toolCall }: Props) {
                   wordBreak: 'break-all',
                 }}
               >
-                {formatJson(toolCall.arguments)}
+                {formatJson(asRenderable(toolCall.arguments))}
               </pre>
             </div>
           )}
@@ -149,7 +171,7 @@ export function ToolCallCard({ toolCall }: Props) {
                   wordBreak: 'break-word',
                 }}
               >
-                {toolCall.result}
+                {asRenderable(toolCall.result)}
               </pre>
             </div>
           )}
