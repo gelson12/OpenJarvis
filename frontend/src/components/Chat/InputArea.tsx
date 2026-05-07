@@ -1,11 +1,16 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square, Paperclip } from 'lucide-react';
+import { Send, Square, Paperclip, Mic } from 'lucide-react';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat } from '../../lib/sse';
 import { fetchSavings, getBase } from '../../lib/api';
 import { MicButton } from './MicButton';
 import { useSpeech } from '../../hooks/useSpeech';
 import * as tts from '../../lib/tts';
+import {
+  isSpeechRecognitionSupported,
+  useVoiceListener,
+} from '../../lib/useVoiceListener';
+import { classifyIntent, stripWakeWord } from '../../lib/voice_intents';
 import type { ChatMessage, ToolCallInfo, TokenUsage, MessageTelemetry } from '../../types';
 
 export function InputArea() {
@@ -19,6 +24,9 @@ export function InputArea() {
   const streamState = useAppStore((s) => s.streamState);
   const messages = useAppStore((s) => s.messages);
   const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
+  const alwaysListenEnabled = useAppStore(
+    (s) => s.settings.alwaysListenEnabled,
+  );
   const maxTokens = useAppStore((s) => s.settings.maxTokens);
   const temperature = useAppStore((s) => s.settings.temperature);
   const createConversation = useAppStore((s) => s.createConversation);
@@ -67,6 +75,68 @@ export function InputArea() {
       await startRecording();
     }
   }, [speechState, startRecording, stopRecording]);
+
+  // Always-on dashboard listening — separate from the push-to-talk
+  // useSpeech path above. This uses the browser's SpeechRecognition
+  // (free, low-latency, no backend round-trip) so the agent can pick up
+  // voice commands without the user clicking the mic. Yes/no responses
+  // to ElaborationBanner prompts are handled inside that component;
+  // here we only act on wake-word commands and substantive speech that
+  // looks like a chat message.
+  const isPendingElaboration = useAppStore(
+    (s) => s.proposedElaborations.some((p) => p.ui_state === 'proposed'),
+  );
+  const continuousListenActive =
+    alwaysListenEnabled &&
+    speechEnabled &&
+    isSpeechRecognitionSupported() &&
+    !streamState.isStreaming;
+  const [voiceListenError, setVoiceListenError] = useState<string | null>(null);
+
+  useVoiceListener({
+    enabled: continuousListenActive,
+    onTranscript: (transcript) => {
+      const text = transcript.trim();
+      if (!text) return;
+      const intent = classifyIntent(text);
+
+      // ElaborationBanner owns yes/no while a proposal is pending.
+      // Don't double-handle by stuffing it into the chat input.
+      if (
+        isPendingElaboration &&
+        (intent === 'affirmative' || intent === 'negative' || intent === 'stop')
+      ) {
+        return;
+      }
+
+      // Wake word: "Jarvis, what's on my calendar?" -> drop the
+      // wake word and treat the rest as a chat message.
+      if (intent === 'wake') {
+        const command = stripWakeWord(text);
+        if (command) {
+          setInput(command);
+          // Auto-submit isn't done here — let the user see what was
+          // heard and hit send. Reduces false-fire risk from
+          // mic-pickup of nearby conversations.
+        }
+        return;
+      }
+
+      // Plain speech. If the input is empty, populate it as a draft
+      // the user can review + send. If the input already has content,
+      // append (so two utterances form one message).
+      if (intent === 'speech') {
+        setInput((prev) =>
+          prev.trim() ? `${prev} ${text}` : text,
+        );
+      }
+    },
+    onError: (errorCode) => {
+      // 'not-allowed' = user denied mic permission. Surface so the UI
+      // can show a hint instead of silently being deaf.
+      setVoiceListenError(errorCode);
+    },
+  });
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -385,11 +455,33 @@ export function InputArea() {
           </div>
         )}
       </div>
-      <div className="flex items-center justify-center mt-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+      <div
+        className="flex items-center justify-center gap-3 mt-2 text-[11px]"
+        style={{ color: 'var(--color-text-tertiary)' }}
+      >
         <span>
           <kbd className="font-mono">Enter</kbd> to send &middot;{' '}
           <kbd className="font-mono">Shift+Enter</kbd> for new line
         </span>
+        {continuousListenActive && !voiceListenError && (
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              color: 'var(--color-accent)',
+            }}
+            title='Listening for "Jarvis, ..." commands. Costs no tokens — recognition runs in your browser.'
+          >
+            <Mic size={11} style={{ animation: 'pulse 1.4s ease-in-out infinite' }} />
+            Listening
+          </span>
+        )}
+        {voiceListenError === 'not-allowed' && (
+          <span style={{ color: 'var(--color-error)' }}>
+            Mic blocked — grant permission in browser to enable always-listening
+          </span>
+        )}
       </div>
     </div>
   );

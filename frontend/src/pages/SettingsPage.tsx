@@ -485,6 +485,30 @@ export function SettingsPage() {
                 />
               </button>
             </SettingRow>
+            <SettingRow
+              label="Always-on listening"
+              description={
+                'Continuously listen for "Jarvis, …" commands and yes/no '
+                + 'replies to elaboration prompts. Browser-side recognition '
+                + '— costs no tokens.'
+              }
+            >
+              <button
+                onClick={() => { updateSettings({ alwaysListenEnabled: !settings.alwaysListenEnabled }); showSaved(); }}
+                className="relative w-11 h-6 rounded-full transition-colors cursor-pointer"
+                style={{
+                  background: settings.alwaysListenEnabled ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
+                }}
+              >
+                <span
+                  className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform bg-white"
+                  style={{
+                    transform: settings.alwaysListenEnabled ? 'translateX(20px)' : 'translateX(0)',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                  }}
+                />
+              </button>
+            </SettingRow>
             <SettingRow label="Backend status" description="Requires Whisper, Deepgram, or another speech backend">
               <div className="flex items-center gap-2">
                 <span

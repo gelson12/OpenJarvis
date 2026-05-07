@@ -73,6 +73,15 @@ interface Settings {
   temperature: number;
   maxTokens: number;
   speechEnabled: boolean;
+  // When true, the dashboard runs continuous SpeechRecognition. Voice
+  // is routed through classifyIntent() so:
+  //   - "yes/go ahead/please" responses to elaboration prompts auto-accept
+  //   - "no/not now/cancel" auto-dismiss
+  //   - "Jarvis, ..." commands populate the chat input
+  //   - ordinary background speech is ignored
+  // Off by default so first-load doesn't surprise users with a mic
+  // permission prompt; we recommend turning it on in Settings.
+  alwaysListenEnabled: boolean;
 }
 
 function loadSettings(): Settings {
@@ -80,7 +89,12 @@ function loadSettings(): Settings {
     theme: 'system',
     apiUrl: '',
     fontSize: 'default',
-    defaultModel: '',
+    // 'auto' = the OpenJarvis cascade. Routes tool-using requests to
+    // the first reachable tool-capable provider (Claude / DeepSeek /
+    // Gemini / GPT-4o), with silent fallback if any 429s. This is the
+    // sensible default — single-model picks (gpt-4o, claude-...) are
+    // for users who explicitly want one provider's voice.
+    defaultModel: 'auto',
     defaultAgent: '',
     temperature: 0.7,
     maxTokens: 4096,
@@ -89,6 +103,11 @@ function loadSettings(): Settings {
     // route through tts.ts which is gated on this flag. Users can
     // toggle off in Settings if they prefer text-only.
     speechEnabled: true,
+    // Off by default — the browser will pop up a mic permission prompt
+    // the first time the listener starts, which would surprise a fresh
+    // user. They can enable it in Settings (and on this user's request,
+    // we surface it prominently next to the chat input too).
+    alwaysListenEnabled: false,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -246,6 +265,7 @@ export const useAppStore = create<AppState>((set, get) => {
   const convList = Object.values(initial.conversations).sort(
     (a, b) => b.updatedAt - a.updatedAt,
   );
+  const initialSettings = loadSettings();
 
   return {
     conversations: convList,
@@ -258,11 +278,14 @@ export const useAppStore = create<AppState>((set, get) => {
 
     models: [],
     modelsLoading: true,
-    selectedModel: '',
+    // Hydrate selectedModel from settings.defaultModel so users land on
+    // 'auto' (or whatever they pinned) without having to re-pick after
+    // every reload. The user can override per-session via the dropdown.
+    selectedModel: initialSettings.defaultModel || '',
     serverInfo: null,
     savings: null,
 
-    settings: loadSettings(),
+    settings: initialSettings,
 
     commandPaletteOpen: false,
     sidebarOpen: true,
