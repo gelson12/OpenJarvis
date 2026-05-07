@@ -28,3 +28,11 @@ def test_kokoro_keeps_existing_american_voices():
     voices = set(KokoroTTSBackend().available_voices())
     for legacy in ("af_heart", "af_bella", "am_adam", "am_michael"):
         assert legacy in voices, f"legacy voice {legacy} was removed"
+
+
+def test_kokoro_default_voice_is_jarvis():
+    """Empty voice_id should resolve to the Jarvis-adjacent British male."""
+    backend = KokoroTTSBackend()
+    assert backend.DEFAULT_VOICE_ID == "bm_george"
+    # The default must be in the exposed voice list so it's actually loadable.
+    assert backend.DEFAULT_VOICE_ID in backend.available_voices()

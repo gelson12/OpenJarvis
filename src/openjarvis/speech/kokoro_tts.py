@@ -36,14 +36,23 @@ class KokoroTTSBackend(TTSBackend):
                 "kokoro package not installed. Install with: pip install kokoro"
             )
 
+    # Default Jarvis voice — calm British male butler. Callers can
+    # override per request via voice_id, or globally via config.toml.
+    DEFAULT_VOICE_ID: str = "bm_george"
+
     def synthesize(
         self,
         text: str,
         *,
-        voice_id: str = "af_heart",
+        voice_id: str = "",
         speed: float = 1.0,
         output_format: str = "wav",
     ) -> TTSResult:
+        # Empty/missing voice_id falls back to the class default so a
+        # blank ``voice_id`` field in config.toml still picks up the
+        # Jarvis voice rather than the legacy American-female default.
+        if not voice_id:
+            voice_id = self.DEFAULT_VOICE_ID
         self._ensure_pipeline()
         import numpy as np
         import soundfile as sf
