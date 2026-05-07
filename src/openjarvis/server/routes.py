@@ -27,6 +27,59 @@ from openjarvis.server.models import (
 router = APIRouter()
 
 
+# ---------------------------------------------------------------------------
+# Auto-inject integration tools when the frontend doesn't send any
+# ---------------------------------------------------------------------------
+
+# Tools whose names start with these prefixes (or match these exact names)
+# get auto-injected into chat completion requests when req.tools is empty.
+# This covers the user-facing integrations (n8n, Obsidian vault, GitHub,
+# Railway, Cloudinary, V0, SMTP) — the ones a model would actually want
+# to call from a "list my workflows / make me a thing" prompt. Internal
+# tools (calculator, file_read, retrieval) are left out to keep the
+# system prompt small and the model focused.
+_AUTO_INJECT_PREFIXES = (
+    "vault_",
+    "obsidian_",
+    "n8n_",
+    "gh_",
+    "railway_",
+    "cloudinary_",
+    "v0_",
+)
+_AUTO_INJECT_EXACT = ("email_send",)
+
+_AUTO_INJECT_TOOLS_CACHE: list[dict] | None = None
+
+
+def _get_auto_inject_tools() -> list[dict]:
+    """Return integration tools as OpenAI function-calling specs (cached).
+
+    Each entry has shape ``{"type": "function", "function": {...}}`` and is
+    safe to drop directly into a ChatCompletionRequest.tools list.
+    """
+    global _AUTO_INJECT_TOOLS_CACHE
+    if _AUTO_INJECT_TOOLS_CACHE is not None:
+        return _AUTO_INJECT_TOOLS_CACHE
+    from openjarvis.core.registry import ToolRegistry
+
+    out: list[dict] = []
+    for name, tool_cls in ToolRegistry.items():
+        if not (
+            name.startswith(_AUTO_INJECT_PREFIXES)
+            or name in _AUTO_INJECT_EXACT
+        ):
+            continue
+        try:
+            instance = tool_cls()
+            out.append(instance.to_openai_function())
+        except Exception:
+            # Tools requiring non-default constructor args are skipped.
+            continue
+    _AUTO_INJECT_TOOLS_CACHE = out
+    return out
+
+
 def _to_messages(chat_messages) -> list[Message]:
     """Convert Pydantic ChatMessage objects to core Message objects."""
     messages = []
@@ -100,6 +153,31 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         except Exception:
             logging.getLogger("openjarvis.server").debug(
                 "Memory context injection failed",
+                exc_info=True,
+            )
+
+    # Auto-inject integration tools when the frontend didn't send any.
+    # The chat UI's request body (InputArea.tsx) currently omits the
+    # tools field entirely — without this hook, every "use the n8n
+    # tools" / "list my repos" / "search the vault" prompt would land
+    # on a tool-blind cascade and the model would hallucinate prose
+    # about the API instead of calling registered tools. With this
+    # block, requests pick up the curated integration tool catalog
+    # automatically, and the agent-stream bridge (line ~158) engages
+    # so tool calls execute server-side in a multi-turn loop.
+    if not request_body.tools:
+        try:
+            auto_tools = _get_auto_inject_tools()
+            if auto_tools:
+                request_body.tools = auto_tools
+                logging.getLogger("openjarvis.server").info(
+                    "auto-injected %d integration tools into request "
+                    "(frontend did not supply tools)",
+                    len(auto_tools),
+                )
+        except Exception:
+            logging.getLogger("openjarvis.server").debug(
+                "auto-inject of integration tools failed",
                 exc_info=True,
             )
 

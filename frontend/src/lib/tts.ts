@@ -19,21 +19,65 @@ export function isSupported(): boolean {
   return typeof window !== 'undefined' && 'speechSynthesis' in window;
 }
 
+// Score a voice by how close it gets to a "Jarvis" vibe — calm British
+// male, ideally a higher-quality "Natural"/"Neural"/"Online" model the
+// OS installed. Higher score = preferred. The chat UI uses
+// window.speechSynthesis (browser-native), so the available voices
+// depend on the user's OS + browser; we just bias selection toward the
+// best one available.
+function scoreVoice(v: SpeechSynthesisVoice): number {
+  const name = v.name.toLowerCase();
+  const lang = v.lang.toLowerCase();
+  let score = 0;
+
+  // Heavy bias toward British English.
+  if (lang.startsWith('en-gb')) score += 100;
+  else if (lang.startsWith('en')) score += 30;
+
+  // Modern high-quality TTS engines mark their voices with these tags.
+  // Edge ships "Microsoft <Name> Online (Natural)" which is markedly
+  // better than the legacy SAPI voices.
+  if (/(natural|neural|online|premium|enhanced)/i.test(name)) score += 50;
+
+  // British male names commonly shipped on Windows / Edge / macOS.
+  // "Mark", "Daniel", "Ryan", "George", "Harry", "James", "Oliver",
+  // "Thomas" — all calm masculine English voices.
+  if (
+    /\b(mark|daniel|ryan|george|harry|james|oliver|thomas|arthur|tony)\b/i.test(
+      name,
+    )
+  ) {
+    score += 25;
+  }
+
+  // Prefer local voices when quality is otherwise tied (no network
+  // round-trip, more privacy).
+  if (v.localService) score += 5;
+
+  return score;
+}
+
 function pickVoice(): SpeechSynthesisVoice | null {
   if (!isSupported()) return null;
   const voices = window.speechSynthesis.getVoices();
   if (!voices.length) return null;
+
+  // Sort by Jarvis-affinity score (descending). Highest scorer wins.
+  const ranked = [...voices].sort((a, b) => scoreVoice(b) - scoreVoice(a));
+  const best = ranked[0];
+  if (best && scoreVoice(best) > 0) return best;
+
+  // Defensive fallback: original "any voice in user's language" logic.
   const lang = (navigator.language || 'en-US').toLowerCase();
   const langPrefix = lang.split('-')[0];
-  // Prefer local voices in the user's language
   const local = voices.find(
     (v) => v.localService && v.lang.toLowerCase().startsWith(langPrefix),
   );
   if (local) return local;
-  // Fallback: any voice in the user's language
-  const anyLang = voices.find((v) => v.lang.toLowerCase().startsWith(langPrefix));
+  const anyLang = voices.find((v) =>
+    v.lang.toLowerCase().startsWith(langPrefix),
+  );
   if (anyLang) return anyLang;
-  // Last resort: first available
   return voices[0] ?? null;
 }
 
