@@ -61,29 +61,66 @@ def resolve_auto_model_for_agent(model: str) -> str:
     return chain[0] if chain else model
 
 
-def get_agent_fallback_chain(model: str) -> list[str]:
-    """Return the ordered list of candidate models for this request.
-
-    Always honours an explicit ``TOOL_CAPABLE_AGENT_MODEL`` override
-    (single-element chain — operator wants exactly that model). For
-    'auto', returns every preference whose API key is set in
-    descending preference order. For a concrete model id, returns
-    [model] (no fallback — the user picked something specific, respect
-    it; surface the error if it fails so the misconfiguration is
-    visible).
-    """
-    if not _is_auto(model):
-        return [model] if model else []
-
-    override = os.environ.get("TOOL_CAPABLE_AGENT_MODEL", "").strip()
-    if override:
-        return [override]
-
+def _tool_capable_chain_from_env() -> list[str]:
+    """Return the full preference list, filtered to providers whose key
+    is set in env. Used as the fallback tail for any tool-capable pick."""
     chain: list[str] = []
     for candidate, key_envs in _AGENT_MODEL_PREFERENCE:
         if any(os.environ.get(env) for env in key_envs):
             chain.append(candidate)
     return chain
+
+
+def _is_tool_capable(model: str) -> bool:
+    """True if model id is in the curated tool-capable preference list."""
+    return any(model == candidate for candidate, _ in _AGENT_MODEL_PREFERENCE)
+
+
+def get_agent_fallback_chain(model: str) -> list[str]:
+    """Return the ordered candidate-model list for this request.
+
+    Three cases:
+
+    1. ``TOOL_CAPABLE_AGENT_MODEL`` env override → single-element chain.
+       Operator pinned an exact model; respect that without fallback.
+
+    2. ``model='auto'`` → full preference order, filtered to providers
+       whose API key is set. Default for hands-off chat.
+
+    3. Concrete model id (``gpt-4o``, ``claude-sonnet-4-6``, etc.) →
+       chosen model FIRST, then every other tool-capable provider with
+       a key in env. So a quota / 429 / billing failure on the user's
+       pick silently falls through to the next provider instead of
+       crashing the whole request. This is the universal-fallback
+       behaviour the user asked for — explicit picks are still honoured
+       (chosen model is tried first), but a hard provider failure no
+       longer terminates the agent run.
+
+       Models outside the preference list (local Ollama, OpenRouter
+       passthroughs, etc.) get a single-element chain. We don't have
+       reason to believe those callers want auto-substitution — and a
+       silent swap from `ollama/llama3.2` to a cloud model would cost
+       the user money they didn't ask for.
+    """
+    override = os.environ.get("TOOL_CAPABLE_AGENT_MODEL", "").strip()
+    if override:
+        return [override]
+
+    if _is_auto(model):
+        return _tool_capable_chain_from_env()
+
+    if not model:
+        return []
+
+    if _is_tool_capable(model):
+        # User picked a specific tool-capable cloud model. Put it
+        # first, then append the rest of the preference list (filtered
+        # by configured keys, deduped) as fallback.
+        rest = [m for m in _tool_capable_chain_from_env() if m != model]
+        return [model, *rest]
+
+    # Local model / unknown model id — no fallback.
+    return [model]
 
 
 class FallbackEngine:

@@ -81,10 +81,31 @@ def test_empty_or_none_passes_through():
 # ---------------------------------------------------------------------------
 
 
-def test_chain_for_concrete_model_is_single_element(monkeypatch):
+def test_chain_for_concrete_tool_capable_model_includes_fallback(monkeypatch):
+    """Picking gpt-4o still gets transparent fallback: chosen model first,
+    then every other tool-capable provider with a configured key."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "x")
     monkeypatch.setenv("OPENAI_API_KEY", "x")
-    # Concrete user choice — no fallback.
+    chain = get_agent_fallback_chain("gpt-4o")
+    # gpt-4o tried first (user's explicit choice).
+    assert chain[0] == "gpt-4o"
+    # Then every other tool-capable provider with a key — order
+    # follows the global preference, gpt-4o de-duped from the tail.
+    assert chain[1:] == ["claude-sonnet-4-6", "deepseek-chat"]
+
+
+def test_chain_for_local_model_has_no_fallback(monkeypatch):
+    """Local / unknown models get a single-element chain. We don't
+    silently swap an ollama pick for a paid cloud call."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    assert get_agent_fallback_chain("ollama/llama3.2") == ["ollama/llama3.2"]
+
+
+def test_chain_for_concrete_model_when_only_its_key_is_set(monkeypatch):
+    """Picking gpt-4o when only OpenAI is configured = single-element
+    chain (no other candidates available to fall back to)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "x")
     assert get_agent_fallback_chain("gpt-4o") == ["gpt-4o"]
 
 
