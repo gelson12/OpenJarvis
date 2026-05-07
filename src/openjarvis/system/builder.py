@@ -395,7 +395,22 @@ class SystemBuilder:
             all_tools = {t.spec.name: t for t in internal_server.get_tools()}
             tools = [all_tools[n] for n in tool_names if n in all_tools]
         else:
-            tools = []
+            # No explicit tools.enabled in config → expose every tool the
+            # MCPServer auto-discovered (built-ins + every integration
+            # registered via @ToolRegistry.register: n8n_*, gh_*,
+            # stripe_*, paypal_*, vault_*, railway_*, cloudinary_*, v0_*,
+            # email_send, ...).
+            #
+            # Why this used to be []: the original assumption was
+            # "tools are an opt-in feature, not the default." That
+            # broke the agent for every fresh install where the user
+            # set up the integration env vars but didn't also enumerate
+            # them in tools.enabled — the agent had nothing to call, so
+            # 'create the workflow' produced curl examples instead of
+            # actual workflow creation. Default-on matches user
+            # expectation: if a tool's keys are configured, the agent
+            # can call it.
+            tools = list(internal_server.get_tools())
 
         if config.tools.mcp.servers:
             try:
