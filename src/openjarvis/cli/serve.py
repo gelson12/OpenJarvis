@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Optional
 
 import click
 from rich.console import Console
@@ -198,8 +199,16 @@ def serve(
                     from openjarvis.core.registry import ToolRegistry
                     from openjarvis.tools._stubs import BaseTool
 
-                    _DEFAULT_TOOLS = {"think", "calculator", "web_search"}
+                    # When the user hasn't explicitly listed tools, default
+                    # to EVERY tool registered in ToolRegistry. The previous
+                    # 3-tool default ({"think","calculator","web_search"})
+                    # was the root cause of "Jarvis describes instead of
+                    # does" — n8n / github / vault / stripe / etc. tools
+                    # were registered but the agent was never built with
+                    # them, so it had nothing to call. If a user wants the
+                    # old narrow set, they list it in config.agent.tools.
                     configured = config.agent.tools
+                    allowed: Optional[set[str]] = None
                     if configured:
                         if isinstance(configured, list):
                             allowed = {
@@ -211,20 +220,24 @@ def serve(
                             allowed = {
                                 t.strip() for t in configured.split(",") if t.strip()
                             }
-                    else:
-                        allowed = _DEFAULT_TOOLS
 
                     tools = []
                     for name in ToolRegistry.keys():
-                        if name not in allowed:
+                        if allowed is not None and name not in allowed:
                             continue
                         tool_cls = ToolRegistry.get(name)
-                        if isinstance(tool_cls, type) and issubclass(
-                            tool_cls, BaseTool
-                        ):
-                            tools.append(tool_cls())
-                        elif isinstance(tool_cls, BaseTool):
-                            tools.append(tool_cls)
+                        try:
+                            if isinstance(tool_cls, type) and issubclass(
+                                tool_cls, BaseTool
+                            ):
+                                tools.append(tool_cls())
+                            elif isinstance(tool_cls, BaseTool):
+                                tools.append(tool_cls)
+                        except Exception:
+                            # Some tools require non-default constructor
+                            # args (e.g. backend handles); skip rather
+                            # than fail the whole agent build.
+                            continue
                     if tools:
                         agent_kwargs["tools"] = tools
 
