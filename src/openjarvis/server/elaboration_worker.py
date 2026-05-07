@@ -96,11 +96,96 @@ def _is_materially_different(spoken: str, claude: str) -> bool:
     return materially
 
 
-async def _run(elab_id: str, messages: list[dict[str, Any]]) -> None:
-    """The actual background coroutine."""
-    store = get_store()
+def _spoken_wait_seconds() -> float:
+    """How long to wait for the fast-path's answer before submitting to
+    Claude-CLI without it. Default 15s; the fast-path usually settles in
+    2-5s. Configurable via env so ops can tune for slow agent runs."""
     try:
-        task_id = await claude_cli_client.submit(messages)
+        return float(os.environ.get("ELABORATION_SPOKEN_WAIT_S", "15"))
+    except ValueError:
+        return 15.0
+
+
+async def _wait_for_spoken_answer(
+    elab_id: str, *, timeout_s: float,
+) -> Optional[str]:
+    """Poll the elaboration store until ``spoken_answer`` is non-None or
+    ``timeout_s`` elapses. Returns the answer text, or None if we time out
+    (so Claude-CLI still runs — just without the fast-path context)."""
+    store = get_store()
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        elab = await store.get(elab_id)
+        if elab is not None and elab.spoken_answer is not None:
+            return elab.spoken_answer
+        await asyncio.sleep(0.5)
+    return None
+
+
+def _augment_with_spoken_answer(
+    messages: list[dict[str, Any]], spoken: str,
+) -> list[dict[str, Any]]:
+    """Append the fast-path's answer as an [ASSISTANT] turn AND a final
+    [USER] instruction telling Claude-CLI to elaborate on it without
+    restating. The instruction is what turns Claude from a duplicate
+    responder into an actual elaborator."""
+    augmented = list(messages)
+    augmented.append({"role": "assistant", "content": spoken.strip()})
+    augmented.append({
+        "role": "user",
+        "content": (
+            "[ELABORATION TASK] The assistant's answer above is the "
+            "fast-path response from another model. Your job is to "
+            "ELABORATE on it for me, not to restate it. Add depth, "
+            "context, edge cases I should know about, and proactive "
+            "follow-up suggestions that the fast answer missed. If the "
+            "fast answer is already complete and correct, say one short "
+            "line acknowledging that and add ONE thing it didn't cover. "
+            "Do not paraphrase the fast answer back to me. Do not start "
+            "with 'Hello' or any greeting — go straight to the deeper "
+            "content."
+        ),
+    })
+    return augmented
+
+
+async def _run(elab_id: str, messages: list[dict[str, Any]]) -> None:
+    """The actual background coroutine.
+
+    Order matters: we wait briefly for the fast-path's spoken_answer
+    BEFORE submitting to Claude-CLI, so the elaboration prompt includes
+    what was already said. Without this, Claude-CLI sees only the user's
+    question and answers it from scratch — producing duplicates of the
+    fast response. With it, Claude-CLI's job is explicitly to extend
+    rather than restate.
+    """
+    store = get_store()
+
+    # Step 1: wait for the fast-path responder to finish. Soft timeout —
+    # if the fast-path is taking longer than expected (or errored), we
+    # still submit to Claude-CLI so the user gets *something* deeper.
+    spoken_answer = await _wait_for_spoken_answer(
+        elab_id, timeout_s=_spoken_wait_seconds(),
+    )
+
+    # Step 2: build the prompt that goes to Claude-CLI. If we have the
+    # fast-path answer, append it + an explicit elaboration instruction.
+    if spoken_answer:
+        elab_messages = _augment_with_spoken_answer(messages, spoken_answer)
+        logger.info(
+            "Elaboration %s: submitting with fast-path context (%d chars)",
+            elab_id, len(spoken_answer),
+        )
+    else:
+        elab_messages = messages
+        logger.info(
+            "Elaboration %s: fast-path didn't settle within %ss; "
+            "submitting bare prompt",
+            elab_id, _spoken_wait_seconds(),
+        )
+
+    try:
+        task_id = await claude_cli_client.submit(elab_messages)
     except Exception as exc:
         logger.warning("Claude-CLI submit failed for %s: %s", elab_id, exc)
         await store.mark_failed(elab_id, error=f"submit failed: {exc}")
@@ -127,17 +212,6 @@ async def _run(elab_id: str, messages: list[dict[str, Any]]) -> None:
         return
 
     claude_text = result.result.strip()
-
-    # Wait briefly for the immediate stream to finish writing the spoken_answer.
-    # In practice the stream finishes within ~1-2s; we wait up to 10s so the
-    # diff has a real comparison target.
-    spoken_answer: Optional[str] = None
-    for _ in range(20):
-        elab = await store.get(elab_id)
-        if elab is not None and elab.spoken_answer is not None:
-            spoken_answer = elab.spoken_answer
-            break
-        await asyncio.sleep(0.5)
 
     if _always_surface() or _is_materially_different(spoken_answer or "", claude_text):
         await store.mark_proposed(elab_id, claude_answer=claude_text)
