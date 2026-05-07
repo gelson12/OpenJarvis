@@ -149,7 +149,13 @@ def _augment_with_spoken_answer(
     return augmented
 
 
-async def _run(elab_id: str, messages: list[dict[str, Any]]) -> None:
+async def _run(
+    elab_id: str,
+    messages: list[dict[str, Any]],
+    *,
+    memory_backend: Any = None,
+    original_question: str = "",
+) -> None:
     """The actual background coroutine.
 
     Order matters: we wait briefly for the fast-path's spoken_answer
@@ -218,17 +224,41 @@ async def _run(elab_id: str, messages: list[dict[str, Any]]) -> None:
     else:
         await store.mark_discarded(elab_id, claude_answer=claude_text)
 
+    # Auto-store the elaboration into long-term memory so it can be
+    # retrieved in future conversations. Source-tagged 'elaboration'
+    # so future retrieves can distinguish the deeper Claude answer
+    # from the fast-path response stored under 'fast_path' / 'agent'.
+    if memory_backend is not None and original_question:
+        try:
+            from openjarvis.server.memory_writeback import store_qa
+
+            store_qa(
+                backend=memory_backend,
+                question=original_question,
+                answer=claude_text,
+                source="elaboration",
+                model="claude-cli",
+            )
+        except Exception:
+            pass
+
 
 async def spawn_elaboration(
     *,
     messages: list[dict[str, Any]],
     original_question: str,
     conversation_id: Optional[str] = None,
+    memory_backend: Any = None,
 ) -> Optional[Elaboration]:
     """Create an Elaboration record + launch the background worker.
 
     Returns the Elaboration so the caller (chat handler) can later write
     spoken_answer back into it. Returns None if elaboration is disabled.
+
+    ``memory_backend`` is an optional reference to the configured
+    memory layer; when provided, the resolved Claude-CLI answer is
+    auto-stored alongside the original question so future retrievals
+    benefit from the deeper analysis.
     """
     if not is_enabled():
         return None
@@ -241,7 +271,14 @@ async def spawn_elaboration(
 
     # Fire-and-forget the worker. asyncio holds a strong reference for as long
     # as the task is running.
-    asyncio.create_task(_run(elab.id, messages))
+    asyncio.create_task(
+        _run(
+            elab.id,
+            messages,
+            memory_backend=memory_backend,
+            original_question=original_question,
+        )
+    )
     return elab
 
 

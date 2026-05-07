@@ -225,11 +225,14 @@ class AgentStreamBridge:
         bus: EventBus,
         model: str,
         request: ChatCompletionRequest,
+        *,
+        memory_backend: object | None = None,
     ) -> None:
         self._agent = agent
         self._bus = bus
         self._model = model
         self._request = request
+        self._memory_backend = memory_backend
         self._chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         self._queue: asyncio.Queue = asyncio.Queue()
         self._callbacks: dict[EventType, object] = {}
@@ -348,6 +351,7 @@ class AgentStreamBridge:
                 messages=messages_json,
                 original_question=original_question,
                 conversation_id=None,
+                memory_backend=self._memory_backend,
             )
         except Exception as exc:
             logging.getLogger("openjarvis.server").debug(
@@ -563,6 +567,27 @@ class AgentStreamBridge:
                         "set_spoken_answer failed (non-fatal): %s", exc,
                     )
 
+            # Auto-store the Q&A pair into long-term memory so future
+            # conversations can retrieve it via inject_context.
+            if self._memory_backend is not None:
+                try:
+                    from openjarvis.server.memory_writeback import store_qa
+
+                    user_question = ""
+                    for m in reversed(self._request.messages):
+                        if m.role == "user" and m.content:
+                            user_question = m.content
+                            break
+                    store_qa(
+                        backend=self._memory_backend,
+                        question=user_question,
+                        answer=content,
+                        source="agent",
+                        model=self._model,
+                    )
+                except Exception:
+                    pass
+
         except Exception:
             # On error, cancel the agent task if still running
             if not agent_task.done():
@@ -577,9 +602,13 @@ async def create_agent_stream(
     bus: EventBus,
     model: str,
     request: ChatCompletionRequest,
+    *,
+    memory_backend: object | None = None,
 ) -> StreamingResponse:
     """Create an AgentStreamBridge and return a FastAPI StreamingResponse."""
-    bridge = AgentStreamBridge(agent, bus, model, request)
+    bridge = AgentStreamBridge(
+        agent, bus, model, request, memory_backend=memory_backend,
+    )
     return StreamingResponse(
         bridge.stream(),
         media_type="text/event-stream",
