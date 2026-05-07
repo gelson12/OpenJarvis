@@ -82,10 +82,17 @@ function pickVoice(): SpeechSynthesisVoice | null {
 }
 
 /**
- * Strip markdown so the browser TTS doesn't read syntax characters
- * out loud (e.g. "**Late**" being spoken as "asterisk asterisk Late
- * asterisk asterisk"). Plain prose comes through unchanged. Used on
- * everything routed through speak() / onTokenStream().
+ * Strip markdown AND emoji so browser TTS doesn't read syntax/symbols
+ * out loud. Without this:
+ *   - "**Late**" is read as "asterisk asterisk Late asterisk asterisk"
+ *   - "🎉" is read as "party popper"
+ *   - "🔍" is read as "left pointing magnifying glass"
+ *   - "📝" is read as "memo"
+ *   - "## Header" is read as "hash hash Header"
+ * All of which is unbearable to hear and obscures the actual message.
+ *
+ * Plain prose comes through unchanged. Applied to every utterance
+ * routed through speak() / onTokenStream().
  */
 function stripMarkdownForSpeech(text: string): string {
   let out = text;
@@ -132,6 +139,26 @@ function stripMarkdownForSpeech(text: string): string {
 
   // Collapse newline runs to a single space; TTS handles its own pauses.
   out = out.replace(/\n+/g, ' ');
+
+  // Strip emoji & misc symbols. Browser TTS reads them aloud as their
+  // unicode CLDR names (🎉 → "party popper"). Use the Unicode property
+  // \p{Extended_Pictographic} which covers every codepoint Unicode
+  // classifies as a pictograph — broader than \p{Emoji} which misses
+  // some compound sequences. Also drop the ZWJ and variation selectors
+  // that bind multi-codepoint emoji together.
+  try {
+    out = out.replace(/\p{Extended_Pictographic}/gu, '');
+    out = out.replace(/[‍️]/g, '');
+  } catch {
+    // Older browsers without Unicode property escapes — fall back to
+    // explicit ranges covering the most common emoji blocks.
+    out = out
+      .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')   // misc pictographs
+      .replace(/[\u{2600}-\u{27BF}]/gu, '')     // dingbats
+      .replace(/[\u{1F000}-\u{1F2FF}]/gu, '')   // mahjong / cards / enclosed
+      .replace(/[\u{1FA00}-\u{1FAFF}]/gu, '')   // newer additions
+      .replace(/[‍️]/g, '');
+  }
 
   // Tidy whitespace.
   out = out.replace(/\s{2,}/g, ' ').trim();
