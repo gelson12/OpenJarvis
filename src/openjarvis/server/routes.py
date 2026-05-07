@@ -51,6 +51,7 @@ _AUTO_INJECT_PREFIXES = (
     "calendar_",
     "gmail_",
     "outlook_",
+    "browser_",
 )
 _AUTO_INJECT_EXACT = ("email_send",)
 

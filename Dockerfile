@@ -18,7 +18,7 @@ COPY rust/ rust/
 COPY --from=frontend /app/src/openjarvis/server/static src/openjarvis/server/static/
 
 RUN pip install --no-cache-dir uv && \
-    uv pip install --system ".[server,memory-obsidian,inference-cloud]"
+    uv pip install --system ".[server,memory-obsidian,inference-cloud,browser]"
 
 # Stage 3: Runtime
 FROM python:3.12-slim-bookworm
@@ -26,6 +26,15 @@ FROM python:3.12-slim-bookworm
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /app /app
 WORKDIR /app
+
+# Install Chromium + the system libraries Playwright needs at runtime.
+# Adds ~250 MB to the image but means browser_* tools work out-of-box —
+# no separate playwright-server container required. Skip-on-failure so a
+# transient apt issue doesn't block the whole deploy; the browser tools
+# will surface a clear "Playwright not installed" error if Chromium is
+# missing, which is recoverable on next rebuild.
+RUN python -m playwright install chromium --with-deps 2>&1 | tail -20 || \
+    echo "Playwright Chromium install failed; browser_* tools will be unavailable until next rebuild"
 
 # Placeholder for future auth re-enablement; override at runtime if needed.
 # All provider API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.) are read
