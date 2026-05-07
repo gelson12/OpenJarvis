@@ -207,6 +207,42 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
         "short-lived access tokens on demand.",
         "google",
     ),
+    # ----- BRIDGE Google account (second Gmail/Calendar) -------------
+    # Multi-account: gmail_*/calendar_* tools accept account='bridge'
+    # to act on these creds instead of the primary GOOGLE_* set.
+    # Aliases include the user's existing Railway naming
+    # (BRIDGE_GMAIL_Client_ID etc.) so it works without renaming.
+    "BRIDGE_GOOGLE_CLIENT_ID": EnvSpec(
+        "BRIDGE_GOOGLE_CLIENT_ID",
+        (
+            "BRIDGE_GMAIL_Client_ID",
+            "BRIDGE_GMAIL_CLIENT_ID",
+        ),
+        "BRIDGE Google OAuth2 client id — second Google account, used "
+        "when tools are called with account='bridge'.",
+        "google_bridge",
+        secret=False,
+    ),
+    "BRIDGE_GOOGLE_CLIENT_SECRET": EnvSpec(
+        "BRIDGE_GOOGLE_CLIENT_SECRET",
+        (
+            "BRIDGE_GMAIL_Client_secret",
+            "BRIDGE_GMAIL_Client_Secret",
+            "BRIDGE_GMAIL_CLIENT_SECRET",
+        ),
+        "BRIDGE Google OAuth2 client secret.",
+        "google_bridge",
+    ),
+    "BRIDGE_GOOGLE_REFRESH_TOKEN": EnvSpec(
+        "BRIDGE_GOOGLE_REFRESH_TOKEN",
+        (
+            "BRIDGE_GMAIL_Refresh_Token",
+            "BRIDGE_GMAIL_REFRESH_TOKEN",
+        ),
+        "BRIDGE Google long-lived refresh token. Capture via "
+        "scripts/oauth_setup.py google --account=bridge.",
+        "google_bridge",
+    ),
     # ----- Microsoft Outlook (Microsoft Graph mail) -----------------
     # Aliases tolerate the space-separated names the user already
     # entered in Railway (e.g. "OUTLOOK_Client ID").

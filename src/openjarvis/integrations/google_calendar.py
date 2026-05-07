@@ -42,7 +42,14 @@ class GoogleCalendarUnavailableError(RuntimeError):
 
 
 class GoogleCalendarClient:
-    """Synchronous httpx-based client for the Calendar REST API v3."""
+    """Synchronous httpx-based client for the Calendar REST API v3.
+
+    Multi-account: pass ``account="bridge"`` to act on the
+    BRIDGE_GOOGLE_* credential set instead of canonical primary
+    GOOGLE_*. The ``client_id``/``client_secret``/``refresh_token``
+    constructor args (legacy) still work for one-off injection in
+    tests but are no longer the production path.
+    """
 
     def __init__(
         self,
@@ -51,7 +58,9 @@ class GoogleCalendarClient:
         client_secret: Optional[str] = None,
         refresh_token: Optional[str] = None,
         timeout: float = 15.0,
+        account: str = "primary",
     ) -> None:
+        # Legacy direct-injection path (used by old tests).
         self._client_id = client_id or os.environ.get("GOOGLE_CLIENT_ID", "")
         self._client_secret = (
             client_secret or os.environ.get("GOOGLE_CLIENT_SECRET", "")
@@ -60,20 +69,46 @@ class GoogleCalendarClient:
             refresh_token or os.environ.get("GOOGLE_REFRESH_TOKEN", "")
         )
         self._timeout = timeout
+        self._account = account
+        # Whether to bypass the shared _google_oauth helper (for legacy
+        # tests that inject credentials via constructor args).
+        self._use_direct_injection = bool(
+            client_id and client_secret and refresh_token
+        )
         self._access_token: Optional[str] = None
         self._access_expires_at: float = 0.0
 
     @property
     def configured(self) -> bool:
-        return bool(
-            self._client_id and self._client_secret and self._refresh_token
-        )
+        if self._use_direct_injection:
+            return bool(
+                self._client_id and self._client_secret and self._refresh_token
+            )
+        # Production path: ask the shared helper for this account.
+        from openjarvis.integrations._google_oauth import is_configured
+
+        return is_configured(self._account)
 
     # ------------------------------------------------------------------
     # OAuth refresh + token caching
     # ------------------------------------------------------------------
 
     def _fetch_access_token(self) -> str:
+        # Production path: delegate to the shared per-account helper so
+        # multiple accounts share the same token-cache infra.
+        if not self._use_direct_injection:
+            from openjarvis.integrations._google_oauth import (
+                GoogleOAuthError,
+                get_access_token,
+            )
+
+            try:
+                return get_access_token(self._account, timeout=self._timeout)
+            except GoogleOAuthError as exc:
+                raise GoogleCalendarUnavailableError(str(exc)) from exc
+
+        # Legacy path: client_id/secret/refresh_token were injected via
+        # constructor (kept for backwards-compatible test fixtures).
         if not self.configured:
             raise GoogleCalendarUnavailableError(
                 "Google Calendar not configured — set GOOGLE_CLIENT_ID, "
@@ -108,6 +143,10 @@ class GoogleCalendarClient:
         return token
 
     def _bearer(self) -> str:
+        # Production path: helper handles caching per-account, just fetch.
+        if not self._use_direct_injection:
+            return self._fetch_access_token()
+        # Legacy direct-injection path uses local cache.
         if self._access_token and time.time() < self._access_expires_at:
             return self._access_token
         return self._fetch_access_token()
@@ -272,14 +311,14 @@ class GoogleCalendarClient:
         return self._request("POST", "/freeBusy", json_body=body)
 
 
-_default: Optional[GoogleCalendarClient] = None
+_clients: dict[str, GoogleCalendarClient] = {}
 
 
-def get_default_client() -> GoogleCalendarClient:
-    global _default
-    if _default is None:
-        _default = GoogleCalendarClient()
-    return _default
+def get_default_client(account: str = "primary") -> GoogleCalendarClient:
+    """Return the cached GoogleCalendarClient for ``account``."""
+    if account not in _clients:
+        _clients[account] = GoogleCalendarClient(account=account)
+    return _clients[account]
 
 
 __all__ = [

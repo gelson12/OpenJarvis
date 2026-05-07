@@ -171,6 +171,16 @@ def main() -> int:
     parser.add_argument("--client-id", required=True)
     parser.add_argument("--client-secret", required=True)
     parser.add_argument(
+        "--account",
+        default="primary",
+        help=(
+            "Account name (e.g. 'primary', 'bridge'). Determines the env "
+            "var the script tells you to set: GOOGLE_REFRESH_TOKEN for "
+            "primary, <ACCOUNT>_GOOGLE_REFRESH_TOKEN for any other. "
+            "Outlook ignores this — it's single-account today."
+        ),
+    )
+    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="Don't auto-open the browser; just print the auth URL.",
@@ -233,11 +243,24 @@ def main() -> int:
             )
             return 1
 
+        # Compute the right env-var name for this account. Primary uses
+        # the canonical names (GOOGLE_REFRESH_TOKEN). Any other account
+        # gets a prefix (e.g. BRIDGE_GOOGLE_REFRESH_TOKEN). Outlook is
+        # single-account so always uses OUTLOOK_REFRESH_TOKEN.
+        env_var = provider["env_var"]
+        if args.provider == "google" and args.account != "primary":
+            env_var = f"{args.account.upper()}_GOOGLE_REFRESH_TOKEN"
+
         print("\n" + "=" * 70)
-        print(f"✅ SUCCESS — set this in Railway:")
+        print("✅ SUCCESS — set this in Railway:")
         print()
-        print(f"  {provider['env_var']} = {refresh_token}")
+        print(f"  {env_var} = {refresh_token}")
         print()
+        if args.provider == "google" and args.account != "primary":
+            print(
+                f"Account: {args.account!r} (call gmail_*/calendar_* tools "
+                f"with account='{args.account}' to use this)"
+            )
         print(f"Token type: {payload.get('token_type', '?')}")
         print(f"Access token expires in: {payload.get('expires_in', '?')} s")
         scopes = payload.get("scope", "")

@@ -46,12 +46,12 @@ def _patch_token(monkeypatch, token: str = "ACCESS"):
     """Stub get_access_token() so we don't need to mock Google's token endpoint."""
     monkeypatch.setattr(
         "openjarvis.integrations.gmail.get_access_token",
-        lambda **_: token,
+        lambda *a, **kw: token,
     )
     # configured() reads is_configured(); make it report True.
     monkeypatch.setattr(
         "openjarvis.integrations.gmail.is_configured",
-        lambda: True,
+        lambda *a, **kw: True,
     )
 
 

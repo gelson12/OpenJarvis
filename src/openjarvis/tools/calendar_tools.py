@@ -37,7 +37,28 @@ class _CalendarToolBase(BaseTool):
     is_local = False
 
     def __init__(self, client: Optional[GoogleCalendarClient] = None) -> None:
-        self._client = client or get_default_client()
+        # Test fixtures inject `client` directly. Production calls leave
+        # it None and resolve per-execute via _client_for() so the same
+        # tool instance can act on multiple Google accounts.
+        self._injected_client = client
+
+    def _client_for(self, account: str = "primary") -> GoogleCalendarClient:
+        if self._injected_client is not None:
+            return self._injected_client
+        return get_default_client(account)
+
+
+_ACCOUNT_PARAM = {
+    "account": {
+        "type": "string",
+        "default": "primary",
+        "description": (
+            "Which Google account to act on. 'primary' uses GOOGLE_* "
+            "env credentials; 'bridge' uses BRIDGE_GOOGLE_* (or the "
+            "BRIDGE_GMAIL_* aliases the user set in Railway)."
+        ),
+    },
+}
 
 
 @ToolRegistry.register("calendar_list_calendars")
@@ -49,13 +70,13 @@ class CalendarListCalendarsTool(_CalendarToolBase):
         return ToolSpec(
             name="calendar_list_calendars",
             description="List Google calendars on the authorized account.",
-            parameters={"type": "object", "properties": {}},
+            parameters={"type": "object", "properties": dict(_ACCOUNT_PARAM)},
             category="calendar",
         )
 
     def execute(self, **params: Any) -> ToolResult:
         try:
-            return _ok(self.spec.name, self._client.list_calendars())
+            return _ok(self.spec.name, self._client_for(str(params.get("account", "primary"))).list_calendars())
         except GoogleCalendarUnavailableError as exc:
             return _err(self.spec.name, exc)
 
@@ -90,6 +111,7 @@ class CalendarListEventsTool(_CalendarToolBase):
                         "type": "string",
                         "description": "Free-text search across event fields.",
                     },
+                    **_ACCOUNT_PARAM,
                 },
             },
             category="calendar",
@@ -99,7 +121,7 @@ class CalendarListEventsTool(_CalendarToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.list_events(
+                self._client_for(str(params.get("account", "primary"))).list_events(
                     calendar_id=str(params.get("calendar_id", "primary")),
                     time_min=params.get("time_min"),
                     time_max=params.get("time_max"),
@@ -125,6 +147,7 @@ class CalendarGetEventTool(_CalendarToolBase):
                 "properties": {
                     "event_id": {"type": "string"},
                     "calendar_id": {"type": "string", "default": "primary"},
+                    **_ACCOUNT_PARAM,
                 },
                 "required": ["event_id"],
             },
@@ -135,7 +158,7 @@ class CalendarGetEventTool(_CalendarToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.get_event(
+                self._client_for(str(params.get("account", "primary"))).get_event(
                     params["event_id"],
                     calendar_id=str(params.get("calendar_id", "primary")),
                 ),
@@ -172,6 +195,7 @@ class CalendarFreeBusyTool(_CalendarToolBase):
                         "items": {"type": "string"},
                         "description": "Defaults to ['primary'] if omitted.",
                     },
+                    **_ACCOUNT_PARAM,
                 },
                 "required": ["time_min", "time_max"],
             },
@@ -182,7 +206,7 @@ class CalendarFreeBusyTool(_CalendarToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.freebusy_query(
+                self._client_for(str(params.get("account", "primary"))).freebusy_query(
                     time_min=params["time_min"],
                     time_max=params["time_max"],
                     calendar_ids=params.get("calendar_ids"),
@@ -236,6 +260,7 @@ class CalendarCreateEventTool(_CalendarToolBase):
                         "enum": ["none", "all", "externalOnly"],
                         "default": "none",
                     },
+                    **_ACCOUNT_PARAM,
                 },
                 "required": ["summary", "start", "end"],
             },
@@ -247,7 +272,7 @@ class CalendarCreateEventTool(_CalendarToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.create_event(
+                self._client_for(str(params.get("account", "primary"))).create_event(
                     summary=str(params["summary"]),
                     start=params["start"],
                     end=params["end"],
@@ -289,6 +314,7 @@ class CalendarUpdateEventTool(_CalendarToolBase):
                         "enum": ["none", "all", "externalOnly"],
                         "default": "none",
                     },
+                    **_ACCOUNT_PARAM,
                 },
                 "required": ["event_id", "patch"],
             },
@@ -300,7 +326,7 @@ class CalendarUpdateEventTool(_CalendarToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.update_event(
+                self._client_for(str(params.get("account", "primary"))).update_event(
                     str(params["event_id"]),
                     params["patch"],
                     calendar_id=str(params.get("calendar_id", "primary")),
@@ -330,6 +356,7 @@ class CalendarDeleteEventTool(_CalendarToolBase):
                         "enum": ["none", "all", "externalOnly"],
                         "default": "none",
                     },
+                    **_ACCOUNT_PARAM,
                 },
                 "required": ["event_id"],
             },
@@ -339,7 +366,7 @@ class CalendarDeleteEventTool(_CalendarToolBase):
 
     def execute(self, **params: Any) -> ToolResult:
         try:
-            self._client.delete_event(
+            self._client_for(str(params.get("account", "primary"))).delete_event(
                 str(params["event_id"]),
                 calendar_id=str(params.get("calendar_id", "primary")),
                 send_updates=str(params.get("send_updates", "none")),

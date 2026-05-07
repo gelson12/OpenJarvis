@@ -24,6 +24,7 @@ from typing import Any, Optional
 import httpx
 
 from openjarvis.integrations._google_oauth import (
+    DEFAULT_ACCOUNT,
     GoogleOAuthError,
     get_access_token,
     is_configured,
@@ -41,17 +42,26 @@ class GmailUnavailableError(RuntimeError):
 class GmailClient:
     """Synchronous httpx-based client for the Gmail REST API v1.
 
-    All endpoints scoped to ``users/me`` — i.e. the OAuth-authorized
-    account. Multi-account support would need a per-call user override,
-    which we don't need yet.
+    All endpoints scoped to ``users/me`` (the OAuth-authorized account
+    for the chosen credential set). Multi-account: instantiate with
+    ``account="bridge"`` to act on the BRIDGE_GOOGLE_* credentials
+    instead of the canonical primary GOOGLE_* set. Per-account access-
+    token caches live in :mod:`_google_oauth` so each account refreshes
+    independently.
     """
 
-    def __init__(self, *, timeout: float = 15.0) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = 15.0,
+        account: str = DEFAULT_ACCOUNT,
+    ) -> None:
         self._timeout = timeout
+        self._account = account
 
     @property
     def configured(self) -> bool:
-        return is_configured()
+        return is_configured(self._account)
 
     def _request(
         self,
@@ -62,7 +72,7 @@ class GmailClient:
         json_body: Optional[dict[str, Any]] = None,
     ) -> Any:
         try:
-            token = get_access_token(timeout=self._timeout)
+            token = get_access_token(self._account, timeout=self._timeout)
         except GoogleOAuthError as exc:
             raise GmailUnavailableError(str(exc)) from exc
         url = f"{_GMAIL_API_BASE}{path}"
@@ -207,14 +217,18 @@ class GmailClient:
         return self._request("GET", f"/users/me/threads/{thread_id}")
 
 
-_default: Optional[GmailClient] = None
+# Per-account client cache so we don't rebuild GmailClient for every
+# tool call but still keep separate auth contexts per account.
+_clients: dict[str, GmailClient] = {}
 
 
-def get_default_client() -> GmailClient:
-    global _default
-    if _default is None:
-        _default = GmailClient()
-    return _default
+def get_default_client(account: str = DEFAULT_ACCOUNT) -> GmailClient:
+    """Return the cached GmailClient for ``account``, creating it on
+    first use. Multiple accounts share the GoogleOAuth token cache
+    keyed by account name."""
+    if account not in _clients:
+        _clients[account] = GmailClient(account=account)
+    return _clients[account]
 
 
 __all__ = [

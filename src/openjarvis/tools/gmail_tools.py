@@ -42,7 +42,30 @@ class _GmailToolBase(BaseTool):
     is_local = False
 
     def __init__(self, client: Optional[GmailClient] = None) -> None:
-        self._client = client or get_default_client()
+        # Test fixtures inject ``client`` directly. Production calls
+        # leave it None and we resolve per-execute via _client_for so
+        # the same tool instance can act on multiple accounts.
+        self._injected_client = client
+
+    def _client_for(self, account: str = "primary") -> GmailClient:
+        if self._injected_client is not None:
+            return self._injected_client
+        return get_default_client(account)
+
+
+# JSON-schema fragment shared by every gmail_* tool's parameters.
+# Dropped into each spec via dict-merge so we don't restate it.
+_ACCOUNT_PARAM = {
+    "account": {
+        "type": "string",
+        "default": "primary",
+        "description": (
+            "Which Google account to act on. 'primary' uses the "
+            "GOOGLE_* env credentials; 'bridge' uses BRIDGE_GOOGLE_* "
+            "(or the BRIDGE_GMAIL_* aliases the user set)."
+        ),
+    },
+}
 
 
 @ToolRegistry.register("gmail_get_profile")
@@ -57,13 +80,14 @@ class GmailGetProfileTool(_GmailToolBase):
                 "Return the authorized user's Gmail profile — email "
                 "address, total messages/threads. Cheap auth probe."
             ),
-            parameters={"type": "object", "properties": {}},
+            parameters={"type": "object", "properties": dict(_ACCOUNT_PARAM)},
             category="email",
         )
 
     def execute(self, **params: Any) -> ToolResult:
         try:
-            return _ok(self.spec.name, self._client.get_profile())
+            client = self._client_for(str(params.get("account", "primary")))
+            return _ok(self.spec.name, client.get_profile())
         except GmailUnavailableError as exc:
             return _err(self.spec.name, exc)
 
@@ -80,13 +104,13 @@ class GmailListLabelsTool(_GmailToolBase):
                 "List all labels on the account (system labels like "
                 "INBOX/UNREAD/SENT plus user-defined ones)."
             ),
-            parameters={"type": "object", "properties": {}},
+            parameters={"type": "object", "properties": dict(_ACCOUNT_PARAM)},
             category="email",
         )
 
     def execute(self, **params: Any) -> ToolResult:
         try:
-            return _ok(self.spec.name, self._client.list_labels())
+            return _ok(self.spec.name, self._client_for(str(params.get("account", "primary"))).list_labels())
         except GmailUnavailableError as exc:
             return _err(self.spec.name, exc)
 
@@ -126,6 +150,7 @@ class GmailListMessagesTool(_GmailToolBase):
                     },
                     "max_results": {"type": "integer", "default": 25},
                     "include_spam_trash": {"type": "boolean", "default": False},
+                    **_ACCOUNT_PARAM,
                 },
             },
             category="email",
@@ -135,7 +160,7 @@ class GmailListMessagesTool(_GmailToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.list_messages(
+                self._client_for(str(params.get("account", "primary"))).list_messages(
                     q=params.get("q"),
                     label_ids=params.get("label_ids"),
                     max_results=int(params.get("max_results", 25)),
@@ -167,6 +192,7 @@ class GmailGetMessageTool(_GmailToolBase):
                         "enum": ["full", "metadata", "minimal", "raw"],
                         "default": "full",
                     },
+                    **_ACCOUNT_PARAM,
                 },
                 "required": ["message_id"],
             },
@@ -177,7 +203,7 @@ class GmailGetMessageTool(_GmailToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.get_message(
+                self._client_for(str(params.get("account", "primary"))).get_message(
                     str(params["message_id"]),
                     format=str(params.get("format", "full")),
                 ),
@@ -197,7 +223,10 @@ class GmailGetThreadTool(_GmailToolBase):
             description="Fetch an entire Gmail thread (conversation) by id.",
             parameters={
                 "type": "object",
-                "properties": {"thread_id": {"type": "string"}},
+                "properties": {
+                    "thread_id": {"type": "string"},
+                    **_ACCOUNT_PARAM,
+                },
                 "required": ["thread_id"],
             },
             category="email",
@@ -207,7 +236,7 @@ class GmailGetThreadTool(_GmailToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.get_thread(str(params["thread_id"])),
+                self._client_for(str(params.get("account", "primary"))).get_thread(str(params["thread_id"])),
             )
         except GmailUnavailableError as exc:
             return _err(self.spec.name, exc)
@@ -238,6 +267,7 @@ class GmailModifyMessageTool(_GmailToolBase):
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                    **_ACCOUNT_PARAM,
                 },
                 "required": ["message_id"],
             },
@@ -249,7 +279,7 @@ class GmailModifyMessageTool(_GmailToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.modify_message(
+                self._client_for(str(params.get("account", "primary"))).modify_message(
                     str(params["message_id"]),
                     add_label_ids=params.get("add_label_ids"),
                     remove_label_ids=params.get("remove_label_ids"),
@@ -272,7 +302,10 @@ class GmailTrashMessageTool(_GmailToolBase):
             ),
             parameters={
                 "type": "object",
-                "properties": {"message_id": {"type": "string"}},
+                "properties": {
+                    "message_id": {"type": "string"},
+                    **_ACCOUNT_PARAM,
+                },
                 "required": ["message_id"],
             },
             category="email",
@@ -283,7 +316,7 @@ class GmailTrashMessageTool(_GmailToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.trash_message(str(params["message_id"])),
+                self._client_for(str(params.get("account", "primary"))).trash_message(str(params["message_id"])),
             )
         except GmailUnavailableError as exc:
             return _err(self.spec.name, exc)
@@ -323,6 +356,7 @@ class GmailSendMessageTool(_GmailToolBase):
                         "default": False,
                         "description": "Send as HTML (default plain text).",
                     },
+                    **_ACCOUNT_PARAM,
                 },
                 "required": ["to", "subject", "body"],
             },
@@ -334,7 +368,7 @@ class GmailSendMessageTool(_GmailToolBase):
         try:
             return _ok(
                 self.spec.name,
-                self._client.send_message(
+                self._client_for(str(params.get("account", "primary"))).send_message(
                     to=str(params["to"]),
                     subject=str(params["subject"]),
                     body=str(params["body"]),
