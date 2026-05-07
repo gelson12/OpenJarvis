@@ -174,19 +174,29 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
         "paypal",
         secret=False,
     ),
-    # ----- Google APIs (calendar today, gmail next) -------------------
+    # ----- Google APIs (Calendar + Gmail share one OAuth client) -----
+    # Calendar and Gmail are scopes on a SINGLE Google Cloud OAuth
+    # client — the user does the OAuth dance once asking for both
+    # calendar + gmail.modify scopes, captures one refresh_token, and
+    # both connectors work. Aliases tolerate users who entered the
+    # credentials under GMAIL_* (since they're enabling Gmail first):
+    # those values flow through to GOOGLE_* via the alias pass on
+    # startup, so no code change is needed elsewhere.
     "GOOGLE_CLIENT_ID": EnvSpec(
         "GOOGLE_CLIENT_ID",
-        (),
-        "Google OAuth2 client id (shared by Calendar + Gmail). Create "
-        "in Google Cloud Console -> APIs & Services -> Credentials.",
+        ("GMAIL_Client_ID", "GMAIL_CLIENT_ID"),
+        "Google OAuth2 client id — shared by Calendar + Gmail. "
+        "Create in Google Cloud Console -> APIs & Services -> "
+        "Credentials. If you set GMAIL_Client_ID instead, it's read "
+        "as an alias so the same value drives both connectors.",
         "google",
         secret=False,
     ),
     "GOOGLE_CLIENT_SECRET": EnvSpec(
         "GOOGLE_CLIENT_SECRET",
-        (),
-        "Google OAuth2 client secret (paired with GOOGLE_CLIENT_ID).",
+        ("GMAIL_Client_Secret", "GMAIL_CLIENT_SECRET"),
+        "Google OAuth2 client secret (paired with GOOGLE_CLIENT_ID). "
+        "GMAIL_Client_Secret resolves here via the alias pass.",
         "google",
     ),
     "GOOGLE_REFRESH_TOKEN": EnvSpec(
@@ -210,8 +220,20 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
     "OUTLOOK_CLIENT_SECRET": EnvSpec(
         "OUTLOOK_CLIENT_SECRET",
         ("OUTLOOK_Client_Secret",),
-        "Microsoft / Azure AD app client secret.",
+        "Microsoft / Azure AD app client secret (the VALUE column in "
+        "Azure portal, not the Secret ID).",
         "outlook",
+    ),
+    "OUTLOOK_SECRET_ID": EnvSpec(
+        "OUTLOOK_SECRET_ID",
+        (),
+        "Azure-side UUID identifying the client-secret object. "
+        "Informational only — the OAuth runtime uses CLIENT_SECRET "
+        "(the secret VALUE), not this id. Stored here so /v1/integrations/"
+        "status can show whether you've recorded both fields from the "
+        "Azure portal screen.",
+        "outlook",
+        secret=False,
     ),
     "OUTLOOK_REFRESH_TOKEN": EnvSpec(
         "OUTLOOK_REFRESH_TOKEN",

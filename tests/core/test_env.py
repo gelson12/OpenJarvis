@@ -85,6 +85,36 @@ def test_github_pat_falls_back_to_github_token(monkeypatch):
     assert os.environ.get("GITHUB_PAT") == "ghp-fallback"
 
 
+def test_gmail_client_id_aliases_to_google_client_id(monkeypatch):
+    """Calendar + Gmail share one Google OAuth client. Users who
+    enter credentials under GMAIL_* (because they're enabling Gmail
+    first) should have those values flow through to the canonical
+    GOOGLE_* names."""
+    for k in ("GOOGLE_CLIENT_ID", "GMAIL_Client_ID", "GMAIL_CLIENT_ID"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GMAIL_Client_ID", "gmail-client-id-value")
+    apply_aliases()
+    assert os.environ.get("GOOGLE_CLIENT_ID") == "gmail-client-id-value"
+
+
+def test_gmail_client_secret_aliases_to_google_client_secret(monkeypatch):
+    for k in ("GOOGLE_CLIENT_SECRET", "GMAIL_Client_Secret", "GMAIL_CLIENT_SECRET"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GMAIL_Client_Secret", "gmail-secret")
+    apply_aliases()
+    assert os.environ.get("GOOGLE_CLIENT_SECRET") == "gmail-secret"
+
+
+def test_outlook_secret_id_registered_but_not_used():
+    """OUTLOOK_SECRET_ID is informational — registered for visibility
+    in /v1/integrations/status but the OAuth runtime uses CLIENT_SECRET
+    (the secret VALUE, not the secret's UUID)."""
+    assert "OUTLOOK_SECRET_ID" in ENV_REGISTRY
+    spec = ENV_REGISTRY["OUTLOOK_SECRET_ID"]
+    assert spec.integration == "outlook"
+    assert spec.secret is False  # it's a UUID, not a secret value
+
+
 def test_is_configured_checks_aliases(monkeypatch):
     monkeypatch.setenv("OpenAI_API", "sk-alias-only")
     # Even before apply_aliases, is_configured should detect it via the alias chain.
