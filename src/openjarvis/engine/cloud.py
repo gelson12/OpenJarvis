@@ -715,6 +715,19 @@ class CloudEngine(InferenceEngine):
                 # Raw dict pass-through for backward compatibility
                 create_kwargs["response_format"] = response_format
 
+        # Diagnostic: log how many tools made it into the actual
+        # OpenAI request body. If this is 0 but the agent claimed to
+        # have tools, something between agent.run() and here stripped
+        # them.
+        import logging as _eng_log
+
+        _eng_log.getLogger("openjarvis.engine.cloud").info(
+            "_generate_openai: model=%s, tools_in_request=%d, message_count=%d",
+            create_kwargs.get("model"),
+            len(create_kwargs.get("tools") or []),
+            len(create_kwargs.get("messages") or []),
+        )
+
         t0 = time.monotonic()
         resp = self._openai_client.chat.completions.create(**create_kwargs)
         elapsed = time.monotonic() - t0

@@ -318,6 +318,17 @@ class ToolUsingAgent(BaseAgent):
         from openjarvis.tools._stubs import ToolExecutor
 
         self._tools = tools or []
+        # Diagnostic: how many tools the agent was constructed with.
+        # If this is 0 in Railway logs, builder._resolve_tools fell
+        # through to the empty-list branch — agent literally cannot
+        # call anything, will only generate prose.
+        import logging as _agent_log
+
+        _agent_log.getLogger("openjarvis.agents").info(
+            "BaseAgent.__init__: agent built with %d tools — first 5: %s",
+            len(self._tools),
+            [getattr(t, "spec", None) and t.spec.name for t in self._tools[:5]],
+        )
         # Plan 2B I3: store optimized few-shot examples for agents to inject
         # into their own system prompt templates as appropriate.
         self._skill_few_shot_examples = list(skill_few_shot_examples or [])
