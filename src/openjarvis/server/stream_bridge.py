@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import uuid
 from typing import AsyncGenerator
 
@@ -23,6 +25,61 @@ from openjarvis.server.models import (
     StreamChoice,
     UsageInfo,
 )
+
+
+# Order is intentional: prefer tool-reliable models with healthy keys.
+# OpenAI is LAST because users frequently land here with broken billing /
+# exhausted free tiers, and a 429-or-quota failure on the agent path is
+# unrecoverable mid-run (no streaming-style fallback). Override the order
+# at runtime via TOOL_CAPABLE_AGENT_MODELS=anthropic,deepseek,google,openai
+# or by explicitly picking a single model in the chat dropdown.
+_AGENT_MODEL_PREFERENCE: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("claude-sonnet-4-6", ("ANTHROPIC_API_KEY",)),
+    ("deepseek-chat", ("DEEPSEEK_API_KEY",)),
+    ("gemini-2.5-flash", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
+    ("gpt-4o", ("OPENAI_API_KEY",)),
+)
+
+
+def _is_auto(model: str) -> bool:
+    """Match the same set of aliases tier_cascade.is_auto_model() accepts."""
+    if not model:
+        return False
+    return model.strip().lower() in ("auto", "openjarvis-auto", "openjarvis/auto")
+
+
+def resolve_auto_model_for_agent(model: str) -> str:
+    """Resolve a literal 'auto' model id to a real tool-capable model.
+
+    The agent path uses non-streaming engine.generate() which has no
+    notion of cascade racing — the underlying CloudEngine just forwards
+    whatever model id it's handed straight to the provider. Sending
+    'auto' produces a 404 from OpenAI ('no model called auto'). This
+    resolver picks the first entry in the preference list whose API
+    key is present in the environment, falling back to the literal
+    'auto' (which will surface the 404 — diagnostic, not silent).
+    """
+    if not _is_auto(model):
+        return model
+
+    override = os.environ.get("TOOL_CAPABLE_AGENT_MODEL", "").strip()
+    if override:
+        return override
+
+    for candidate, key_envs in _AGENT_MODEL_PREFERENCE:
+        if any(os.environ.get(env) for env in key_envs):
+            logging.getLogger("openjarvis.server").info(
+                "agent: model='auto' resolved to %s (key %s present)",
+                candidate, ",".join(env for env in key_envs if os.environ.get(env)),
+            )
+            return candidate
+
+    logging.getLogger("openjarvis.server").warning(
+        "agent: model='auto' could not be resolved — no tool-capable "
+        "API key found in env (checked %s); request will likely fail",
+        [env for _, envs in _AGENT_MODEL_PREFERENCE for env in envs],
+    )
+    return model
 
 # EventTypes we subscribe to and their corresponding SSE event names
 _EVENT_MAP = {
@@ -133,10 +190,13 @@ class AgentStreamBridge:
             self._request.messages[-1].content if self._request.messages else ""
         )
 
-        # Override agent model for this request if the caller specified one
+        # Override agent model for this request if the caller specified one.
+        # 'auto' must be resolved here because the agent's downstream
+        # engine.generate() has no cascade — it would forward 'auto' as
+        # a literal model id and the provider would 404.
         original_model = self._agent._model
         if self._model:
-            self._agent._model = self._model
+            self._agent._model = resolve_auto_model_for_agent(self._model)
         try:
             return self._agent.run(input_text, context=ctx)
         finally:
