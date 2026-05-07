@@ -55,6 +55,18 @@ def is_enabled() -> bool:
     )
 
 
+def _always_surface() -> bool:
+    """When true (the default), every Claude-CLI elaboration is marked
+    PROPOSED and broadcast over SSE regardless of similarity to the spoken
+    answer. The original heuristic — surface only when materially
+    different — left the user thinking Claude-CLI never ran. Set
+    ELABORATION_ALWAYS_SURFACE=false to opt back into the diff heuristic.
+    """
+    return os.environ.get("ELABORATION_ALWAYS_SURFACE", "true").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+
+
 def _is_materially_different(spoken: str, claude: str) -> bool:
     """Heuristic: claude answer is meaningfully different from the spoken one.
 
@@ -127,7 +139,7 @@ async def _run(elab_id: str, messages: list[dict[str, Any]]) -> None:
             break
         await asyncio.sleep(0.5)
 
-    if _is_materially_different(spoken_answer or "", claude_text):
+    if _always_surface() or _is_materially_different(spoken_answer or "", claude_text):
         await store.mark_proposed(elab_id, claude_answer=claude_text)
     else:
         await store.mark_discarded(elab_id, claude_answer=claude_text)

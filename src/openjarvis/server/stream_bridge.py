@@ -196,6 +196,10 @@ class AgentStreamBridge:
         self._chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         self._queue: asyncio.Queue = asyncio.Queue()
         self._callbacks: dict[EventType, object] = {}
+        # Holder for the in-flight Claude-CLI elaboration record so we
+        # can write the spoken_answer back to the store after agent.run()
+        # finishes. Set in stream(); consumed in the finally block.
+        self._elaboration: object | None = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -284,6 +288,34 @@ class AgentStreamBridge:
     async def stream(self) -> AsyncGenerator[str, None]:
         """Async generator that yields SSE-formatted strings."""
         self._subscribe_all()
+
+        # Spawn the Claude-CLI elaboration in parallel — Inspiring-Cat
+        # processes the prompt independently of the fast-path agent so
+        # the user always gets a deeper, more deliberate answer surfaced
+        # via the elaboration SSE channel. This used to only run on the
+        # cascade path; now the agent path engages it too so tool-using
+        # requests are not invisible to Claude-CLI.
+        try:
+            from openjarvis.server import elaboration_worker
+
+            original_question = ""
+            for m in reversed(self._request.messages):
+                if m.role == "user" and m.content:
+                    original_question = m.content
+                    break
+            messages_json = [
+                {"role": m.role, "content": m.content or ""}
+                for m in self._request.messages
+            ]
+            self._elaboration = await elaboration_worker.spawn_elaboration(
+                messages=messages_json,
+                original_question=original_question,
+                conversation_id=None,
+            )
+        except Exception as exc:
+            logging.getLogger("openjarvis.server").debug(
+                "Elaboration spawn failed in agent path (non-fatal): %s", exc,
+            )
 
         # Kick off agent.run() in a background thread
         loop = asyncio.get_event_loop()
@@ -475,6 +507,24 @@ class AgentStreamBridge:
             yield f"data: {json.dumps(final_data)}\n\n"
 
             yield "data: [DONE]\n\n"
+
+            # Write the agent's final answer back into the elaboration
+            # record so the Claude-CLI worker has something to diff
+            # against (and so the elaboration store knows the
+            # conversation actually had a spoken answer to surface
+            # alongside).
+            if self._elaboration is not None:
+                try:
+                    from openjarvis.server.elaboration_store import (
+                        get_store as _elab_store,
+                    )
+                    await _elab_store().set_spoken_answer(
+                        self._elaboration.id, content,
+                    )
+                except Exception as exc:
+                    logging.getLogger("openjarvis.server").debug(
+                        "set_spoken_answer failed (non-fatal): %s", exc,
+                    )
 
         except Exception:
             # On error, cancel the agent task if still running
