@@ -84,7 +84,11 @@ function loadSettings(): Settings {
     defaultAgent: '',
     temperature: 0.7,
     maxTokens: 4096,
-    speechEnabled: false,
+    // Voice on by default — Jarvis is meant to be heard. Streaming
+    // chat replies, elaboration banners, and the morning digest all
+    // route through tts.ts which is gated on this flag. Users can
+    // toggle off in Settings if they prefer text-only.
+    speechEnabled: true,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
