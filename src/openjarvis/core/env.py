@@ -143,6 +143,37 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
         "obsidian",
         secret=False,
     ),
+    # ----- Payment processors -----------------------------------------
+    "STRIPE_SECRET_KEY": EnvSpec(
+        "STRIPE_SECRET_KEY",
+        (),
+        "Stripe API secret key (sk_live_... or sk_test_...). Read-only "
+        "tools query revenue, charges, subscriptions, refunds; writes "
+        "(create_refund) require model-side confirmation.",
+        "stripe",
+    ),
+    "PAYPAL_CLIENT_ID": EnvSpec(
+        "PAYPAL_CLIENT_ID",
+        (),
+        "PayPal REST app client id (paired with PAYPAL_CLIENT_SECRET).",
+        "paypal",
+        secret=False,
+    ),
+    "PAYPAL_CLIENT_SECRET": EnvSpec(
+        "PAYPAL_CLIENT_SECRET",
+        (),
+        "PayPal REST app client secret. OAuth2 client-credentials flow "
+        "exchanges this for a short-lived bearer token.",
+        "paypal",
+    ),
+    "PAYPAL_API_BASE": EnvSpec(
+        "PAYPAL_API_BASE",
+        (),
+        "PayPal API base URL — set to https://api-m.sandbox.paypal.com "
+        "for sandbox testing. Defaults to live.",
+        "paypal",
+        secret=False,
+    ),
 }
 
 

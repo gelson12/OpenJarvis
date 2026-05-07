@@ -180,4 +180,14 @@ try:
 except ImportError:
     pass
 
+try:
+    import openjarvis.tools.stripe_tools  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.paypal_tools  # noqa: F401
+except ImportError:
+    pass
+
 __all__ = ["BaseTool", "ToolExecutor", "ToolSpec"]

@@ -46,6 +46,8 @@ _AUTO_INJECT_PREFIXES = (
     "railway_",
     "cloudinary_",
     "v0_",
+    "stripe_",
+    "paypal_",
 )
 _AUTO_INJECT_EXACT = ("email_send",)
 

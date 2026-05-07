@@ -59,6 +59,31 @@ def _probe(integration: str) -> tuple[Optional[bool], Optional[str]]:
             return True, None
         except Exception as exc:
             return False, f"probe error: {exc}"
+    if integration == "stripe":
+        try:
+            from openjarvis.integrations.stripe import get_default_client
+
+            client = get_default_client()
+            if not client.configured:
+                return False, "STRIPE_SECRET_KEY missing"
+            # /balance is a cheap idempotent read that exercises auth
+            # without listing customer data.
+            client.get_balance()
+            return True, None
+        except Exception as exc:
+            return False, f"probe error: {exc}"
+    if integration == "paypal":
+        try:
+            from openjarvis.integrations.paypal import get_default_client
+
+            client = get_default_client()
+            if not client.configured:
+                return False, "PAYPAL_CLIENT_ID or PAYPAL_CLIENT_SECRET missing"
+            # OAuth token fetch is the cheapest way to verify credentials.
+            client._fetch_token()
+            return True, None
+        except Exception as exc:
+            return False, f"probe error: {exc}"
     return None, None  # No probe — caller will mirror configured state.
 
 
