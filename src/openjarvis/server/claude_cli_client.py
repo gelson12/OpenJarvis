@@ -60,13 +60,83 @@ def _auth_headers() -> dict[str, str]:
     return {}
 
 
+def _jarvis_context_note() -> str:
+    """Build a system note describing OpenJarvis's already-active integrations.
+
+    Inspiring-Cat (Claude-CLI) runs in a separate container with its own
+    MCP server config — including some that target the wrong accounts
+    (e.g. a `claude.ai n8n` MCP pointing at vistaltura.app.n8n.cloud while
+    the user's actual self-hosted n8n is reached via OpenJarvis's
+    N8N_BASE_URL on a completely different host).
+
+    Without this note, Claude-CLI sees its own (misconfigured) MCPs and
+    keeps telling the user "the n8n MCP needs auth" or pasting curl
+    examples for the wrong server. Prepending the note tells Claude-CLI:
+    OpenJarvis already has these integrations live — don't try to
+    re-authenticate, don't paste curl examples, and don't reference any
+    MCP-server endpoints; just elaborate on what the user actually
+    asked, deferring to OpenJarvis's tool answers when relevant.
+    """
+    n8n_base = os.environ.get("N8N_BASE_URL", "").rstrip("/")
+    bits: list[str] = [
+        "[JARVIS-CONTEXT]",
+        "You are providing a deeper elaboration to a question already "
+        "being answered by OpenJarvis (the calling system). OpenJarvis "
+        "has the following integrations LIVE and authenticated server-"
+        "side via env-vars — do not suggest re-authenticating any of "
+        "them, do not paste curl/bash examples for them, do not reference "
+        "any MCP server endpoints (those target different accounts and "
+        "are not what the user is using):",
+    ]
+    if n8n_base:
+        bits.append(
+            f"  - n8n: connected directly to {n8n_base} via N8N_API_KEY. "
+            "Tools n8n_list_workflows / n8n_create_workflow / "
+            "n8n_update_workflow / n8n_activate_workflow / "
+            "n8n_execute_workflow / n8n_get_workflow / "
+            "n8n_list_executions / n8n_list_credentials / "
+            "n8n_get_credential / n8n_list_credential_types are callable "
+            "by the OpenJarvis agent. The credentials API exposes "
+            "metadata for SaaS services already auth'd inside n8n "
+            "(Slack, Gmail OAuth, Stripe, Notion, etc.) — pair "
+            "n8n_list_credentials with n8n_execute_workflow to USE those "
+            "credentials without the user re-entering them. "
+            "If the user mentions n8n, this is the only n8n that matters."
+        )
+    if os.environ.get("STRIPE_SECRET_KEY"):
+        bits.append("  - stripe: live (revenue / charges / subscriptions / refunds)")
+    if os.environ.get("PAYPAL_CLIENT_ID") and os.environ.get("PAYPAL_CLIENT_SECRET"):
+        bits.append("  - paypal: live (transactions / subscriptions / refunds)")
+    if os.environ.get("GOOGLE_REFRESH_TOKEN"):
+        bits.append("  - google calendar: live (list / freebusy / create / update / delete)")
+    if os.environ.get("GITHUB_PAT") or os.environ.get("GITHUB_TOKEN"):
+        bits.append("  - github: live (repos / issues / PRs / actions)")
+    if os.environ.get("OBSIDIAN_VAULT_URL"):
+        bits.append("  - obsidian vault: live (read / write / search / backlinks)")
+    if os.environ.get("CLOUDINARY_API_KEY"):
+        bits.append("  - cloudinary: live")
+    if os.environ.get("V0_API_KEY"):
+        bits.append("  - v0: live")
+    bits.append(
+        "Your job is to give a deeper, more deliberate answer to the "
+        "user's question — not to re-do the work OpenJarvis already did. "
+        "If a tool call result isn't shown to you, assume the OpenJarvis "
+        "agent will handle it. Focus on insight, edge cases, and follow-"
+        "up suggestions, not on infrastructure plumbing."
+    )
+    return "\n".join(bits)
+
+
 def _build_prompt(messages: list[dict[str, Any]]) -> str:
     """Flatten an OpenAI-style messages list into a single prompt string.
 
     inspiring-cat expects a string `prompt` in the payload, not a messages
     array — so we render the conversation as plain text with role tags.
+    A JARVIS-CONTEXT block is prepended on every call so Claude-CLI
+    knows which integrations are already live in OpenJarvis and stops
+    referencing the wrong (out-of-band) MCP servers.
     """
-    parts: list[str] = []
+    parts: list[str] = [_jarvis_context_note()]
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "") or ""
