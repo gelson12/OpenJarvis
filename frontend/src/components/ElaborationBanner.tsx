@@ -1,42 +1,48 @@
 // Renders the queued proactive elaborations from Claude-CLI.
-// Each item shows: "Sir, regarding earlier — '<question excerpt>' —
-// may I elaborate?" with [Yes] / [Not now] buttons. Once accepted, the
-// claude_answer arrives via SSE and is displayed inline + spoken.
+// Voice-first flow: every 'proposed' elaboration is auto-accepted on
+// arrival. The banner shows "Elaborating…" while the worker resolves,
+// then displays + speaks the claude_answer when it arrives. No
+// "Yes please / Not now" gating — Jarvis just speaks when ready.
 
 import { useEffect, useRef } from 'react';
 import { Sparkles, X } from 'lucide-react';
 import { useAppStore } from '../lib/store';
-import {
-  acceptElaboration,
-  dismissElaboration,
-} from '../lib/elaborations';
+import { acceptElaboration } from '../lib/elaborations';
 import { speak as ttsSpeak, isSupported as ttsSupported } from '../lib/tts';
 
 export function ElaborationBanner() {
   const proposals = useAppStore((s) => s.proposedElaborations);
   const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
   const removeElaboration = useAppStore((s) => s.removeElaboration);
-  const announcedRef = useRef<Set<string>>(new Set());
+  const autoAcceptedRef = useRef<Set<string>>(new Set());
+  const resolvedAnnouncedRef = useRef<Set<string>>(new Set());
 
-  // Speak the "may I elaborate?" prompt once per proposal.
+  // Voice-first behaviour: every elaboration that lands in 'proposed'
+  // state is auto-accepted. We don't ask the user to click "Yes, please"
+  // — we just kick off the acceptance immediately so the actual
+  // claude_answer arrives and gets spoken without friction. The
+  // banner still shows the question excerpt while we wait, and the
+  // user can still dismiss the whole thing if they don't want it.
   useEffect(() => {
-    if (!speechEnabled || !ttsSupported()) return;
     for (const p of proposals) {
-      if (p.ui_state === 'proposed' && !announcedRef.current.has(p.id)) {
-        announcedRef.current.add(p.id);
-        const excerpt =
-          p.original_question_excerpt.length > 60
-            ? p.original_question_excerpt.slice(0, 60) + '...'
-            : p.original_question_excerpt;
-        ttsSpeak(
-          `Sir, regarding your earlier question — ${excerpt} — may I elaborate?`,
-        );
+      if (p.ui_state === 'proposed' && !autoAcceptedRef.current.has(p.id)) {
+        autoAcceptedRef.current.add(p.id);
+        // Optimistically transition local state to 'accepting' so the
+        // UI shows the elaborating indicator while the network call
+        // and the worker pipeline run.
+        useAppStore.setState((s) => ({
+          proposedElaborations: s.proposedElaborations.map((e) =>
+            e.id === p.id ? { ...e, ui_state: 'accepting' } : e,
+          ),
+        }));
+        acceptElaboration(p.id).catch((exc) => {
+          console.warn('[elaborations] auto-accept failed', exc);
+        });
       }
     }
-  }, [proposals, speechEnabled]);
+  }, [proposals]);
 
   // Speak the elaboration text once it resolves.
-  const resolvedAnnouncedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!speechEnabled || !ttsSupported()) return;
     for (const p of proposals) {
@@ -52,27 +58,6 @@ export function ElaborationBanner() {
   }, [proposals, speechEnabled]);
 
   if (!proposals.length) return null;
-
-  const handleAccept = async (id: string) => {
-    // Local optimistic state
-    useAppStore.setState((s) => ({
-      proposedElaborations: s.proposedElaborations.map((e) =>
-        e.id === id ? { ...e, ui_state: 'accepting' } : e,
-      ),
-    }));
-    try {
-      await acceptElaboration(id);
-    } catch (exc) {
-      console.warn('[elaborations] accept failed', exc);
-    }
-  };
-
-  const handleDismiss = async (id: string) => {
-    removeElaboration(id);
-    try {
-      await dismissElaboration(id);
-    } catch {}
-  };
 
   return (
     <div
@@ -130,48 +115,21 @@ export function ElaborationBanner() {
               <>
                 <div
                   style={{
-                    fontSize: 13,
-                    color: 'var(--color-text)',
-                    marginBottom: 8,
+                    fontSize: 11,
+                    color: 'var(--color-text-tertiary)',
+                    marginBottom: 4,
                   }}
                 >
-                  Sir, regarding your earlier question — "
-                  <em>{p.original_question_excerpt}</em>" — may I elaborate?
+                  Claude elaborates on: "{p.original_question_excerpt}"
                 </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <button
-                    onClick={() => handleAccept(p.id)}
-                    disabled={p.ui_state === 'accepting'}
-                    style={{
-                      padding: '4px 12px',
-                      borderRadius: 6,
-                      background: 'var(--color-accent)',
-                      color: 'var(--color-on-accent)',
-                      border: 'none',
-                      fontSize: 12,
-                      cursor:
-                        p.ui_state === 'accepting' ? 'wait' : 'pointer',
-                      opacity: p.ui_state === 'accepting' ? 0.7 : 1,
-                    }}
-                  >
-                    {p.ui_state === 'accepting'
-                      ? 'Elaborating…'
-                      : 'Yes, please'}
-                  </button>
-                  <button
-                    onClick={() => handleDismiss(p.id)}
-                    style={{
-                      padding: '4px 12px',
-                      borderRadius: 6,
-                      background: 'transparent',
-                      color: 'var(--color-text-tertiary)',
-                      border: '1px solid var(--color-border)',
-                      fontSize: 12,
-                      cursor: 'pointer',
-                    }}
-                  >
-                    Not now
-                  </button>
+                <div
+                  style={{
+                    fontSize: 13,
+                    color: 'var(--color-text-tertiary)',
+                    fontStyle: 'italic',
+                  }}
+                >
+                  Elaborating…
                 </div>
               </>
             )}
