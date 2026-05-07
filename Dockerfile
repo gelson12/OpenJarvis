@@ -33,6 +33,15 @@ WORKDIR /app
 # they are never stomped by empty Dockerfile values.
 ENV OPENJARVIS_API_KEY=default-key-change-me
 
+# Build-time provenance — exposed via GET /v1/version so we can verify
+# what commit is actually live without digging through Railway logs.
+# Railway sets RAILWAY_GIT_COMMIT_SHA automatically; we rename to the
+# OPENJARVIS_* namespace so the endpoint can read either source.
+ARG RAILWAY_GIT_COMMIT_SHA=unknown
+ARG BUILD_TIME=unknown
+ENV OPENJARVIS_GIT_COMMIT=${RAILWAY_GIT_COMMIT_SHA}
+ENV OPENJARVIS_BUILD_TIME=${BUILD_TIME}
+
 EXPOSE 8000
 
 CMD exec jarvis serve --host 0.0.0.0 --port ${PORT:-8000}

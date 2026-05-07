@@ -889,6 +889,23 @@ async def server_info(request: Request):
     }
 
 
+@router.get("/v1/version")
+async def server_version() -> dict:
+    """Return the deployed git commit + build time.
+
+    Lets you confirm Railway is running the code you pushed without
+    digging through dashboards. The git_commit value is read from
+    OPENJARVIS_GIT_COMMIT (set by the build pipeline) or "unknown" if
+    running from a checkout where the commit isn't recorded.
+    """
+    import os as _os
+    return {
+        "git_commit": _os.environ.get("OPENJARVIS_GIT_COMMIT", "unknown"),
+        "build_time": _os.environ.get("OPENJARVIS_BUILD_TIME", "unknown"),
+        "deployment": _os.environ.get("RAILWAY_DEPLOYMENT_ID", "local"),
+    }
+
+
 @router.get("/health")
 async def health(request: Request):
     """Health check endpoint."""
