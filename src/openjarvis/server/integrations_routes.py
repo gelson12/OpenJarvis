@@ -102,6 +102,21 @@ def _probe(integration: str) -> tuple[Optional[bool], Optional[str]]:
             return True, None
         except Exception as exc:
             return False, f"probe error: {exc}"
+    if integration == "outlook":
+        try:
+            from openjarvis.integrations.outlook import get_default_client
+
+            client = get_default_client()
+            if not client.configured:
+                return False, (
+                    "OUTLOOK_CLIENT_ID, OUTLOOK_CLIENT_SECRET, or "
+                    "OUTLOOK_REFRESH_TOKEN missing"
+                )
+            # Token refresh is the cheapest credentials check.
+            client._fetch_access_token()
+            return True, None
+        except Exception as exc:
+            return False, f"probe error: {exc}"
     return None, None  # No probe — caller will mirror configured state.
 
 

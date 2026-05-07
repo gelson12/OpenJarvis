@@ -50,6 +50,7 @@ _AUTO_INJECT_PREFIXES = (
     "paypal_",
     "calendar_",
     "gmail_",
+    "outlook_",
 )
 _AUTO_INJECT_EXACT = ("email_send",)
 
@@ -226,8 +227,13 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         # so it can't stream tokens in real-time).  For plain chat, stream
         # directly from the engine for true token-by-token output.
         if agent is not None and bus is not None and request_body.tools:
-            return await _handle_agent_stream(agent, bus, model, request_body)
-        return await _handle_stream(engine, model, request_body, complexity_info)
+            return await _handle_agent_stream(
+                agent, bus, model, request_body, memory_backend=memory_backend,
+            )
+        return await _handle_stream(
+            engine, model, request_body, complexity_info,
+            memory_backend=memory_backend,
+        )
 
     # Non-streaming: use agent if available, otherwise direct engine call
     if agent is not None:
@@ -373,11 +379,13 @@ def _handle_agent(
     )
 
 
-async def _handle_agent_stream(agent, bus, model, req):
+async def _handle_agent_stream(agent, bus, model, req, *, memory_backend=None):
     """Stream agent response with EventBus events via SSE."""
     from openjarvis.server.stream_bridge import create_agent_stream
 
-    return await create_agent_stream(agent, bus, model, req)
+    return await create_agent_stream(
+        agent, bus, model, req, memory_backend=memory_backend,
+    )
 
 
 async def _handle_stream(
@@ -385,6 +393,8 @@ async def _handle_stream(
     model: str,
     req: ChatCompletionRequest,
     complexity_info=None,
+    *,
+    memory_backend=None,
 ):
     """Stream response using SSE format."""
     from openjarvis.server.cloud_router import (
@@ -423,6 +433,7 @@ async def _handle_stream(
                 messages=messages_json,
                 original_question=original_question,
                 conversation_id=None,
+                memory_backend=memory_backend,
             )
         except Exception as exc:
             import logging as _logging
@@ -630,10 +641,33 @@ async def _handle_stream(
 
         # Write the spoken text into the elaboration record so the worker
         # can compare it against Claude-CLI's eventual answer.
+        full_spoken = "".join(spoken_buffer)
         if elaboration is not None:
             try:
                 await _elab_store().set_spoken_answer(
-                    elaboration.id, "".join(spoken_buffer),
+                    elaboration.id, full_spoken,
+                )
+            except Exception:
+                pass
+
+        # Auto-store the Q&A pair into long-term memory so future
+        # conversations can retrieve it via inject_context. Skips
+        # trivial / error-shaped responses; non-fatal on failure.
+        if memory_backend is not None:
+            try:
+                from openjarvis.server.memory_writeback import store_qa
+
+                user_question = ""
+                for m in reversed(req.messages):
+                    if m.role == "user" and m.content:
+                        user_question = m.content
+                        break
+                store_qa(
+                    backend=memory_backend,
+                    question=user_question,
+                    answer=full_spoken,
+                    source="fast_path",
+                    model=model,
                 )
             except Exception:
                 pass

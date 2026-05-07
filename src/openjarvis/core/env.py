@@ -197,6 +197,45 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
         "short-lived access tokens on demand.",
         "google",
     ),
+    # ----- Microsoft Outlook (Microsoft Graph mail) -----------------
+    # Aliases tolerate the space-separated names the user already
+    # entered in Railway (e.g. "OUTLOOK_Client ID").
+    "OUTLOOK_CLIENT_ID": EnvSpec(
+        "OUTLOOK_CLIENT_ID",
+        ("OUTLOOK_Client_ID", "OUTLOOK_Client ID"),
+        "Microsoft / Azure AD app client id (Outlook OAuth2).",
+        "outlook",
+        secret=False,
+    ),
+    "OUTLOOK_CLIENT_SECRET": EnvSpec(
+        "OUTLOOK_CLIENT_SECRET",
+        ("OUTLOOK_Client_Secret",),
+        "Microsoft / Azure AD app client secret.",
+        "outlook",
+    ),
+    "OUTLOOK_REFRESH_TOKEN": EnvSpec(
+        "OUTLOOK_REFRESH_TOKEN",
+        ("OUTLOOK_Refresh_Token", "OUTLOOK_Refresh Token"),
+        "Long-lived refresh token from a one-time Outlook OAuth flow "
+        "with scopes Mail.ReadWrite + Mail.Send + offline_access.",
+        "outlook",
+    ),
+    "OUTLOOK_TOKEN_URL": EnvSpec(
+        "OUTLOOK_TOKEN_URL",
+        ("OUTLOOK_Access_Token_URL", "OUTLOOK_Access Token URL"),
+        "OAuth2 token endpoint. Defaults to Microsoft's common "
+        "endpoint if unset.",
+        "outlook",
+        secret=False,
+    ),
+    "OUTLOOK_AUTH_URL": EnvSpec(
+        "OUTLOOK_AUTH_URL",
+        ("OUTLOOK_Authorization_URL",),
+        "OAuth2 authorization endpoint (only needed when running the "
+        "one-time browser OAuth flow).",
+        "outlook",
+        secret=False,
+    ),
 }
 
 
