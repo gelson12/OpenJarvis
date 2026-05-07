@@ -82,6 +82,14 @@ interface Settings {
   // Off by default so first-load doesn't surprise users with a mic
   // permission prompt; we recommend turning it on in Settings.
   alwaysListenEnabled: boolean;
+  // Hands-free mode (driving etc.): once a wake-word command is
+  // started, auto-submit when SpeechRecognition flags a final
+  // transcript AND a brief silence elapses, OR when the user closes
+  // with "over / send it / go". Saying "wait / cancel / scratch that"
+  // within ~1.5s aborts a pending auto-submit. Off by default — only
+  // makes sense once the user has tested wake-word capture and trusts
+  // the recognition for their environment.
+  handsFreeMode: boolean;
 }
 
 function loadSettings(): Settings {
@@ -108,6 +116,7 @@ function loadSettings(): Settings {
     // user. They can enable it in Settings (and on this user's request,
     // we surface it prominently next to the chat input too).
     alwaysListenEnabled: false,
+    handsFreeMode: false,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);

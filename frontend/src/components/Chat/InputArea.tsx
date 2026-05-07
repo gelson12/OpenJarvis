@@ -10,7 +10,13 @@ import {
   isSpeechRecognitionSupported,
   useVoiceListener,
 } from '../../lib/useVoiceListener';
-import { classifyIntent, stripWakeWord } from '../../lib/voice_intents';
+import {
+  classifyIntent,
+  endsWithSendTrigger,
+  isAbort,
+  stripCloseTrigger,
+  stripWakeWord,
+} from '../../lib/voice_intents';
 import type { ChatMessage, ToolCallInfo, TokenUsage, MessageTelemetry } from '../../types';
 
 export function InputArea() {
@@ -27,6 +33,7 @@ export function InputArea() {
   const alwaysListenEnabled = useAppStore(
     (s) => s.settings.alwaysListenEnabled,
   );
+  const handsFreeMode = useAppStore((s) => s.settings.handsFreeMode);
   const maxTokens = useAppStore((s) => s.settings.maxTokens);
   const temperature = useAppStore((s) => s.settings.temperature);
   const createConversation = useAppStore((s) => s.createConversation);
@@ -93,15 +100,38 @@ export function InputArea() {
     !streamState.isStreaming;
   const [voiceListenError, setVoiceListenError] = useState<string | null>(null);
 
+  // Hands-free auto-submit timer. Cleared if the user says "wait /
+  // cancel / scratch that" within ~1.5s, OR if a new transcript
+  // arrives (means the user is still speaking).
+  const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelAutoSubmit = useCallback(() => {
+    if (autoSubmitTimerRef.current) {
+      clearTimeout(autoSubmitTimerRef.current);
+      autoSubmitTimerRef.current = null;
+    }
+  }, []);
+  const [pendingAutoSubmit, setPendingAutoSubmit] = useState(false);
+
   useVoiceListener({
     enabled: continuousListenActive,
     onTranscript: (transcript) => {
       const text = transcript.trim();
       if (!text) return;
+
+      // ABORT path — user retracts a pending auto-submit, or stops a
+      // current command before it submits. Highest priority.
+      if (isAbort(text)) {
+        cancelAutoSubmit();
+        setPendingAutoSubmit(false);
+        // If they're aborting, also clear what's in the input box so
+        // we don't accidentally submit half a thought.
+        setInput('');
+        return;
+      }
+
       const intent = classifyIntent(text);
 
       // ElaborationBanner owns yes/no while a proposal is pending.
-      // Don't double-handle by stuffing it into the chat input.
       if (
         isPendingElaboration &&
         (intent === 'affirmative' || intent === 'negative' || intent === 'stop')
@@ -109,34 +139,72 @@ export function InputArea() {
         return;
       }
 
-      // Wake word: "Jarvis, what's on my calendar?" -> drop the
-      // wake word and treat the rest as a chat message.
+      // Decide whether THIS transcript should populate the input box.
+      let toAppend = '';
+      let cameFromWakeWord = false;
       if (intent === 'wake') {
         const command = stripWakeWord(text);
         if (command) {
-          setInput(command);
-          // Auto-submit isn't done here — let the user see what was
-          // heard and hit send. Reduces false-fire risk from
-          // mic-pickup of nearby conversations.
+          toAppend = command;
+          cameFromWakeWord = true;
         }
-        return;
+      } else if (intent === 'speech') {
+        toAppend = text;
+      }
+      if (!toAppend) return;
+
+      // Strip a trailing "over / send it / go" if present — that's
+      // the submission cue, not part of the message.
+      const hasSendTrigger = endsWithSendTrigger(toAppend);
+      if (hasSendTrigger) {
+        toAppend = stripCloseTrigger(toAppend);
       }
 
-      // Plain speech. If the input is empty, populate it as a draft
-      // the user can review + send. If the input already has content,
-      // append (so two utterances form one message).
-      if (intent === 'speech') {
-        setInput((prev) =>
-          prev.trim() ? `${prev} ${text}` : text,
-        );
-      }
+      // Append to existing input (so two utterances combine), or
+      // populate fresh if empty.
+      setInput((prev) => {
+        const next = prev.trim() ? `${prev} ${toAppend}` : toAppend;
+
+        // SUBMIT TRIGGER 1 — explicit close phrase, fire immediately.
+        if (hasSendTrigger && next.trim()) {
+          cancelAutoSubmit();
+          // Defer one tick so React state settles before submit reads it.
+          setTimeout(() => sendMessage(), 0);
+          return next;
+        }
+
+        // SUBMIT TRIGGER 2 — hands-free mode + wake-word command +
+        // substantial content + silence. Schedule a delayed submit.
+        // A new transcript will reset this; abort phrase will cancel.
+        if (
+          handsFreeMode
+          && cameFromWakeWord
+          && next.trim().split(/\s+/).length >= 3
+        ) {
+          cancelAutoSubmit();
+          setPendingAutoSubmit(true);
+          autoSubmitTimerRef.current = setTimeout(() => {
+            autoSubmitTimerRef.current = null;
+            setPendingAutoSubmit(false);
+            sendMessage();
+          }, 1500);
+        } else {
+          // New incoming speech that isn't a wake-word command — reset
+          // any pending auto-submit (the user is still speaking).
+          cancelAutoSubmit();
+          setPendingAutoSubmit(false);
+        }
+
+        return next;
+      });
     },
     onError: (errorCode) => {
-      // 'not-allowed' = user denied mic permission. Surface so the UI
-      // can show a hint instead of silently being deaf.
       setVoiceListenError(errorCode);
     },
   });
+
+  // Clean up the auto-submit timer on unmount.
+  useEffect(() => () => cancelAutoSubmit(), [cancelAutoSubmit]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -463,7 +531,7 @@ export function InputArea() {
           <kbd className="font-mono">Enter</kbd> to send &middot;{' '}
           <kbd className="font-mono">Shift+Enter</kbd> for new line
         </span>
-        {continuousListenActive && !voiceListenError && (
+        {continuousListenActive && !voiceListenError && !pendingAutoSubmit && (
           <span
             style={{
               display: 'inline-flex',
@@ -471,10 +539,32 @@ export function InputArea() {
               gap: 4,
               color: 'var(--color-accent)',
             }}
-            title='Listening for "Jarvis, ..." commands. Costs no tokens — recognition runs in your browser.'
+            title={
+              handsFreeMode
+                ? 'Hands-free: speak after "Jarvis"; auto-submits after a pause OR say "over". "Wait" cancels.'
+                : 'Listening for "Jarvis, ..." commands. End with "send it" / "over" to fire without clicking. Costs no tokens.'
+            }
           >
-            <Mic size={11} style={{ animation: 'pulse 1.4s ease-in-out infinite' }} />
-            Listening
+            <Mic
+              size={11}
+              style={{ animation: 'pulse 1.4s ease-in-out infinite' }}
+            />
+            {handsFreeMode ? 'Hands-free' : 'Listening'}
+          </span>
+        )}
+        {pendingAutoSubmit && (
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              color: 'var(--color-warning, var(--color-accent))',
+              fontWeight: 600,
+            }}
+            title='Auto-submitting in 1.5s. Say "wait" or "cancel" to abort.'
+          >
+            <Mic size={11} style={{ animation: 'pulse 0.5s ease-in-out infinite' }} />
+            Submitting… (say "wait" to cancel)
           </span>
         )}
         {voiceListenError === 'not-allowed' && (

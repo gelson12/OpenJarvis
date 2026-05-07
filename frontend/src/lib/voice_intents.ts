@@ -121,3 +121,52 @@ export function stripWakeWord(transcript: string): string {
   );
   return stripped.trim();
 }
+
+// Verbal "send" trigger phrases — radio-comms style. When the user ends
+// a command with one of these, we auto-submit the buffered input
+// regardless of hands-free mode. Cheap & explicit; works in noisy
+// environments where silence-detection can't fire.
+const CLOSE_PHRASES = [
+  /\b(over)\s*$/i,
+  /\b(send it)\s*$/i,
+  /\b(send that)\s*$/i,
+  /\b(do it)\s*$/i,
+  /\b(go)\s*$/i,
+  /\b(fire it)\s*$/i,
+  /\b(go ahead)\s*$/i,
+  /\b(make it so)\s*$/i,  // Star Trek bonus
+];
+
+/** True when the transcript ends with an explicit submission cue. */
+export function endsWithSendTrigger(transcript: string): boolean {
+  const text = transcript.trim().toLowerCase();
+  return CLOSE_PHRASES.some((p) => p.test(text));
+}
+
+/** Strip the trailing close phrase so the actual command is clean. */
+export function stripCloseTrigger(transcript: string): string {
+  let text = transcript.trim();
+  for (const p of CLOSE_PHRASES) {
+    text = text.replace(p, '');
+  }
+  // Tidy up trailing punctuation/whitespace.
+  return text.replace(/[\s,.;:!?]+$/, '').trim();
+}
+
+// Abort phrases — said within ~1s before an auto-submit fires, they
+// cancel the pending submission. "Wait" / "cancel" / "hold on" / "scratch that".
+const ABORT_PATTERNS = [
+  /\bwait\b/,
+  /\bhold on\b/,
+  /\bscratch that\b/,
+  /\bnever mind\b/,
+  /\bnevermind\b/,
+  /\bcancel\b/,
+  /\bactually\s+no\b/,
+];
+
+/** True when speech is asking us to back out of an in-flight command. */
+export function isAbort(transcript: string): boolean {
+  const text = transcript.trim().toLowerCase();
+  return ABORT_PATTERNS.some((p) => p.test(text));
+}
