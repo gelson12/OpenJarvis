@@ -219,16 +219,13 @@ class OrchestratorAgent(ToolUsingAgent):
         # Get OpenAI-format tool definitions
         openai_tools = self._executor.get_openai_tools() if self._tools else []
 
-        # Diagnostic: surface in Railway logs whether tools actually
-        # reach the LLM. If self._tools is empty here, the agent was
-        # constructed without integration tools (builder._resolve_tools
-        # bug). If openai_tools is empty but self._tools isn't, the
-        # executor is mis-flattening. If both are populated but the
-        # model still answers in prose, the model itself ignored them.
+        # Diagnostic at WARNING (default openjarvis log level is
+        # WARNING; INFO is filtered out). Surfaces whether tools
+        # actually reach the LLM at the agent layer.
         import logging as _orch_log
 
-        _orch_log.getLogger("openjarvis.agents.orchestrator").info(
-            "agent.run: self._tools=%d, openai_tools=%d, first_3_names=%s",
+        _orch_log.getLogger("openjarvis.agents.orchestrator").warning(
+            "DIAG agent.run: self._tools=%d, openai_tools=%d, first_3_names=%s",
             len(self._tools or []),
             len(openai_tools),
             [t.get("function", {}).get("name") for t in openai_tools[:3]],

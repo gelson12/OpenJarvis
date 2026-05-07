@@ -318,14 +318,13 @@ class ToolUsingAgent(BaseAgent):
         from openjarvis.tools._stubs import ToolExecutor
 
         self._tools = tools or []
-        # Diagnostic: how many tools the agent was constructed with.
-        # If this is 0 in Railway logs, builder._resolve_tools fell
-        # through to the empty-list branch — agent literally cannot
-        # call anything, will only generate prose.
+        # Diagnostic at WARNING so it survives the default openjarvis
+        # logger level. If this prints "0 tools", builder._resolve_tools
+        # fell through and the agent has nothing to call.
         import logging as _agent_log
 
-        _agent_log.getLogger("openjarvis.agents").info(
-            "BaseAgent.__init__: agent built with %d tools — first 5: %s",
+        _agent_log.getLogger("openjarvis.agents").warning(
+            "DIAG BaseAgent.__init__: agent built with %d tools — first 5: %s",
             len(self._tools),
             [getattr(t, "spec", None) and t.spec.name for t in self._tools[:5]],
         )
