@@ -33,7 +33,7 @@ def test_augment_appends_assistant_turn_and_instruction():
     assert out[2]["role"] == "user"
     instruction = out[2]["content"]
     assert "[ELABORATION TASK]" in instruction
-    assert "ELABORATE" in instruction
+    assert "follow-up" in instruction.lower()
     assert "not to restate" in instruction.lower() or "do not paraphrase" in instruction.lower()
 
 
