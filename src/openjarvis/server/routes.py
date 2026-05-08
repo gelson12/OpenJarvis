@@ -259,7 +259,18 @@ def _get_always_on_tools() -> list[dict]:
     from openjarvis.core.registry import ToolRegistry
 
     out: list[dict] = []
-    for name in ("integrations_check",):
+    for name in (
+        "integrations_check",
+        # Self-introspection: lets the agent investigate its own service
+        # (env vars, source tree, source files) instead of assuming
+        # what's set or how it's wired. Without these, the agent's
+        # default failure mode for any "why doesn't X work?" question
+        # is a generic walkthrough; with them, it can grep its own code
+        # and check its own env to give a precise answer.
+        "env_introspect",
+        "source_grep",
+        "source_read",
+    ):
         tool_cls = ToolRegistry.get(name)
         if tool_cls is None:
             continue
