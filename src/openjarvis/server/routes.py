@@ -246,6 +246,30 @@ def _detect_groups_from_history(messages, name_to_group: dict[str, str]) -> set[
     return hits
 
 
+def _get_always_on_tools() -> list[dict]:
+    """Tools that the agent should ALWAYS see, regardless of relevance.
+
+    Currently just ``integrations_check`` — a zero-cost env-introspection
+    tool that lets the agent answer "is integration X configured?"
+    without bothering the user. Critical because without it, the agent's
+    default failure mode is "please set OUTLOOK_CLIENT_ID..." even when
+    the variable is already set in production. Adds ~300 tokens to the
+    request, prevents far worse generic responses.
+    """
+    from openjarvis.core.registry import ToolRegistry
+
+    out: list[dict] = []
+    for name in ("integrations_check",):
+        tool_cls = ToolRegistry.get(name)
+        if tool_cls is None:
+            continue
+        try:
+            out.append(tool_cls().to_openai_function())
+        except Exception:
+            continue
+    return out
+
+
 def _select_relevant_tools(query_text: str, messages) -> tuple[list[dict], list[str]]:
     """Pick the auto-inject tools relevant to this turn.
 
@@ -254,13 +278,15 @@ def _select_relevant_tools(query_text: str, messages) -> tuple[list[dict], list[
     keywords against real traffic.
 
     Selection rules:
+      - Always include the always-on set (currently:
+        integrations_check). The agent uses these to introspect its
+        own service env BEFORE telling the user to set up vars.
       - Match keywords from the latest user message → enable groups.
       - Add any group whose tools were invoked in the last N turns
         (sticky: avoids yanking tools mid-multi-step flow).
       - If nothing matched (single-word "hello", math question, etc.),
-        return an empty list — internal tools (calculator, retrieval,
-        think) the agent already loaded handle these cases without
-        auto-inject.
+        return ONLY the always-on tools — internal tools (calculator,
+        retrieval, think) the agent already loaded handle these cases.
       - Cap the final list at _RELEVANCE_CAP. Trailing groups (in
         _TOOL_GROUP_TRIGGERS dict order) get dropped first.
     """
@@ -269,11 +295,15 @@ def _select_relevant_tools(query_text: str, messages) -> tuple[list[dict], list[
     enabled: set[str] = _detect_groups_from_text(query_text)
     enabled |= _detect_groups_from_history(messages, name_to_group)
 
-    if not enabled:
-        return [], []
+    always_on = _get_always_on_tools()
 
-    out: list[dict] = []
-    enabled_ordered: list[str] = []
+    if not enabled:
+        return always_on, ["always_on_only"] if always_on else []
+
+    # Start with the always-on set (integrations_check, etc.) so the
+    # agent can introspect its own env before claiming setup is needed.
+    out: list[dict] = list(always_on)
+    enabled_ordered: list[str] = ["always_on"] if always_on else []
     for gid in _TOOL_GROUP_TRIGGERS:
         if gid not in enabled:
             continue

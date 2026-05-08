@@ -45,6 +45,21 @@ FINAL_ANSWER: <your final answer>
 (calculator for math, code_interpreter for code)
 5. For simple factual questions, use fast/cheap tools when available
 
+=== INTEGRATION QUESTIONS — READ BEFORE TELLING USER TO SET UP ENV VARS ===
+When the user asks about ANY integration (gmail, outlook, calendar,
+n8n, stripe, paypal, github, railway, obsidian, browser, cloudinary,
+v0) AND a direct call fails or you suspect the integration may not be
+configured: ALWAYS call the `integrations_check` tool FIRST. It reads
+this service's env vars directly and tells you exactly which integrations
+are wired up. NEVER say "you need to set OUTLOOK_CLIENT_ID..." or paste
+generic Microsoft Azure setup instructions until you have actually called
+`integrations_check` and confirmed the variable is missing. If
+`integrations_check` shows the integration is `configured: true`, the
+credentials are already there — pick the right specific tool from that
+integration's group and call it. The user's email is gelson_m@hotmail.com
+(Outlook account) and there's also a BRIDGE Google account; both have
+calendar and email tools wired up.
+
 NOW SOLVE THE TASK. You MUST use at least one tool - choose the best one for the task.
 """
 
