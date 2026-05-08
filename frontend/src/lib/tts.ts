@@ -19,6 +19,51 @@ export function isSupported(): boolean {
   return typeof window !== 'undefined' && 'speechSynthesis' in window;
 }
 
+// Chrome / Edge populate window.speechSynthesis.getVoices() asynchronously —
+// on a fresh page load the call returns [] for ~50–500 ms until the engine
+// has loaded its voice manifest, then fires the `voiceschanged` event.
+// Without waiting for that, the FIRST utterance after page load picks
+// voices[0] (the platform's default robotic voice) before the British male
+// "Jarvis" voices are even visible. Subsequent utterances pick correctly
+// because voices are populated by then. This produced the user-visible
+// regression where the fast-path "Hello! How can I help today?" was robotic
+// while the elaboration moments later sounded right.
+//
+// We resolve the issue by gating the first utterance on a one-shot promise
+// that resolves on `voiceschanged` (or after a 1s timeout, so a browser
+// missing the event still moves forward). enqueue() / speakAsync() await
+// it once; subsequent calls fall through immediately because the promise
+// is already settled.
+let voicesReady: Promise<void> | null = null;
+function awaitVoices(): Promise<void> {
+  if (voicesReady) return voicesReady;
+  voicesReady = new Promise((resolve) => {
+    if (!isSupported()) {
+      resolve();
+      return;
+    }
+    const synth = window.speechSynthesis;
+    if (synth.getVoices().length > 0) {
+      resolve();
+      return;
+    }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      synth.removeEventListener('voiceschanged', onChange);
+      resolve();
+    };
+    const onChange = () => finish();
+    synth.addEventListener('voiceschanged', onChange);
+    // Hard deadline — some browsers (older Safari, some embedded webviews)
+    // never fire voiceschanged. 1 s keeps us within human-perceptible
+    // first-token latency budgets.
+    setTimeout(finish, 1000);
+  });
+  return voicesReady;
+}
+
 // Score a voice by how close it gets to a "Jarvis" vibe — calm British
 // male, ideally a higher-quality "Natural"/"Neural"/"Online" model the
 // OS installed. Higher score = preferred. The chat UI uses
@@ -166,10 +211,13 @@ function stripMarkdownForSpeech(text: string): string {
   return out;
 }
 
-function enqueue(text: string): void {
+async function enqueue(text: string): Promise<void> {
   if (!isSupported()) return;
   const cleaned = stripMarkdownForSpeech(text);
   if (!cleaned.trim()) return;
+  // Block the first call until voices are populated so pickVoice() doesn't
+  // fall through to the robotic default. Subsequent calls resolve instantly.
+  await awaitVoices();
   const u = new SpeechSynthesisUtterance(cleaned);
   const voice = pickVoice();
   if (voice) u.voice = voice;
@@ -192,17 +240,15 @@ export function speak(text: string): void {
  * start while Jarvis is still speaking (the mic picks up its own voice
  * and confuses the recogniser).
  */
-export function speakAsync(text: string): Promise<void> {
+export async function speakAsync(text: string): Promise<void> {
+  if (!isSupported()) return;
+  const cleaned = stripMarkdownForSpeech(text);
+  if (!cleaned.trim()) return;
+  // Same first-utterance gating as enqueue() — without this, ElaborationBanner's
+  // chained polite prompt would also land on the robotic default if it happened
+  // to be the first thing spoken on the page.
+  await awaitVoices();
   return new Promise((resolve) => {
-    if (!isSupported()) {
-      resolve();
-      return;
-    }
-    const cleaned = stripMarkdownForSpeech(text);
-    if (!cleaned.trim()) {
-      resolve();
-      return;
-    }
     const u = new SpeechSynthesisUtterance(cleaned);
     const voice = pickVoice();
     if (voice) u.voice = voice;
