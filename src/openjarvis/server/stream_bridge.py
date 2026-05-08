@@ -307,6 +307,8 @@ class AgentStreamBridge:
         # through unchanged — respect explicit user choice.
         original_model = self._agent._model
         original_engine = self._agent._engine
+        original_tools = self._agent._tools
+        original_executor = self._agent._executor
         if self._model:
             chain = get_agent_fallback_chain(self._model)
             if chain:
@@ -321,11 +323,77 @@ class AgentStreamBridge:
                 # surfaces a real error rather than silently using a
                 # stale value.
                 self._agent._model = self._model
+
+        # Per-request tool filter.
+        #
+        # The auto-inject path in routes.py picks a relevance-filtered
+        # subset (~5–15 tools out of ~120) and stuffs it into
+        # `request_body.tools`. The agent normally ignores that field
+        # — it builds its OpenAI tool list from `self._executor.get_openai_tools()`
+        # which reflects `self._tools` (the full registry loaded at
+        # boot). Without this override the relevance filter is decorative:
+        # the diag log "tools_in_request=122" stays at 122 regardless of
+        # how many tools the request actually needs.
+        #
+        # Here we narrow `self._tools` to the names the request actually
+        # wants and rebuild the executor so its `get_openai_tools()`
+        # matches. Restored in the finally block so subsequent requests
+        # see the unfiltered set.
+        request_tools = self._request.tools or []
+        if request_tools:
+            wanted_names = {
+                (t.get("function") or {}).get("name") for t in request_tools
+            }
+            wanted_names.discard(None)
+            wanted_names.discard("")
+            if wanted_names:
+                filtered = [
+                    t for t in original_tools
+                    if getattr(getattr(t, "spec", None), "name", "") in wanted_names
+                ]
+                if filtered:
+                    self._agent._tools = filtered
+                    # Rebuild executor with the filtered tool list. We
+                    # mirror the kwargs BaseAgent.__init__ uses so
+                    # capability policy / interactivity / confirm_callback
+                    # behaviour is preserved. ToolExecutor only reads its
+                    # tools at construction (via get_openai_tools), so a
+                    # rebuild is the cleanest way to swap.
+                    try:
+                        from openjarvis.tools._stubs import ToolExecutor
+
+                        self._agent._executor = ToolExecutor(
+                            filtered,
+                            bus=getattr(original_executor, "_bus", None),
+                            interactive=getattr(
+                                original_executor, "_interactive", False,
+                            ),
+                            confirm_callback=getattr(
+                                original_executor, "_confirm_callback", None,
+                            ),
+                            default_timeout=getattr(
+                                original_executor, "_default_timeout", 30.0,
+                            ),
+                            capability_policy=getattr(
+                                original_executor, "_capability_policy", None,
+                            ),
+                            agent_id=getattr(original_executor, "_agent_id", ""),
+                            boundary_guard=getattr(
+                                original_executor, "_boundary_guard", None,
+                            ),
+                        )
+                    except Exception:
+                        # If executor construction fails for any reason,
+                        # fall back to the unfiltered executor — the
+                        # request still works, just costs more tokens.
+                        self._agent._tools = original_tools
         try:
             return self._agent.run(input_text, context=ctx)
         finally:
             self._agent._model = original_model
             self._agent._engine = original_engine
+            self._agent._tools = original_tools
+            self._agent._executor = original_executor
 
     # ------------------------------------------------------------------
     # Public streaming interface
