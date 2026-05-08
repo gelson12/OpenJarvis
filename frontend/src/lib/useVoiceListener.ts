@@ -108,9 +108,21 @@ export function useVoiceListener({
         const result = ev.results[i];
         if (result.isFinal) {
           const transcript = result[0]?.transcript ?? '';
-          if (transcript.trim()) {
-            onTranscriptRef.current(transcript);
+          if (!transcript.trim()) continue;
+          // Echo guard: if browser TTS is currently speaking (or just
+          // about to), the mic is almost certainly picking up Jarvis's
+          // own voice and SpeechRecognition is treating it as user
+          // input. Drop these transcripts to avoid feedback loops
+          // where the assistant's own utterance becomes the next user
+          // message. The ElaborationBanner's chained prompt-then-listen
+          // flow already minimises overlap, but background utterances
+          // (digest, elaboration mid-stream) can still collide.
+          const synth =
+            typeof window !== 'undefined' ? window.speechSynthesis : null;
+          if (synth && (synth.speaking || synth.pending)) {
+            continue;
           }
+          onTranscriptRef.current(transcript);
         }
       }
     };

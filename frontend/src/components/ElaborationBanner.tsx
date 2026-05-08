@@ -24,7 +24,12 @@ import { useEffect, useRef, useState } from 'react';
 import { Sparkles, Mic, X } from 'lucide-react';
 import { useAppStore } from '../lib/store';
 import { acceptElaboration, dismissElaboration } from '../lib/elaborations';
-import { speak as ttsSpeak, isSupported as ttsSupported } from '../lib/tts';
+import {
+  speak as ttsSpeak,
+  speakAsync as ttsSpeakAsync,
+  waitUntilQuiet as ttsWaitUntilQuiet,
+  isSupported as ttsSupported,
+} from '../lib/tts';
 import { classifyIntent } from '../lib/voice_intents';
 import {
   isSpeechRecognitionSupported,
@@ -61,6 +66,11 @@ export function ElaborationBanner() {
   // prompt for) and which we've already spoken the resolved answer of.
   const announcedRef = useRef<Set<string>>(new Set());
   const resolvedAnnouncedRef = useRef<Set<string>>(new Set());
+  // Tracks WHICH proposal is ready to listen on (i.e. polite prompt
+  // has finished speaking). Listener stays disabled until then so
+  // Jarvis's own voice doesn't echo into the mic and trip the
+  // recognizer.
+  const [readyToListenFor, setReadyToListenFor] = useState<string | null>(null);
   // Per-proposal auto-dismiss timers so we clear them if the user
   // responds before 30s.
   const timeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
@@ -71,24 +81,59 @@ export function ElaborationBanner() {
   // Only one at a time — if a second elaboration lands while we're
   // listening for the first, it queues silently until the first resolves.
   const pendingProposal = proposals.find((p) => p.ui_state === 'proposed');
+  // Listener is only enabled AFTER the polite prompt finishes speaking
+  // (readyToListenFor === pendingProposal.id). Without this gate, the
+  // mic picks up Jarvis's own "may I elaborate?" voice as user input.
   const listenForProposal =
     pendingProposal &&
     speechEnabled &&
-    isSpeechRecognitionSupported()
+    isSpeechRecognitionSupported() &&
+    readyToListenFor === pendingProposal.id
       ? pendingProposal.id
       : null;
   const [listening, setListening] = useState(false);
 
-  // Speak the polite prompt once per proposal.
+  // Speak the polite prompt once per proposal — chained so we don't
+  // overlap the fast-path's TTS, and the listener doesn't enable until
+  // the prompt finishes speaking.
   useEffect(() => {
     if (!speechEnabled || !ttsSupported()) return;
     for (const p of proposals) {
       if (p.ui_state === 'proposed' && !announcedRef.current.has(p.id)) {
         announcedRef.current.add(p.id);
-        ttsSpeak(pickPrompt(p.original_question_excerpt));
+        const prompt = pickPrompt(p.original_question_excerpt);
+        // 1) Wait for fast-path TTS to drain
+        // 2) Speak the polite prompt and wait for IT to finish
+        // 3) Flip the listener-ready flag so useVoiceListener engages
+        ttsWaitUntilQuiet(20_000)
+          .then(() => ttsSpeakAsync(prompt))
+          .then(() => {
+            // Small grace pause so any tail-end audio/reverb doesn't
+            // immediately get re-captured by the mic.
+            setTimeout(() => setReadyToListenFor(p.id), 250);
+          })
+          .catch(() => {
+            // Even on failure, fall through to listening so the user
+            // isn't stuck without a way to respond. The click buttons
+            // remain available regardless.
+            setReadyToListenFor(p.id);
+          });
       }
     }
   }, [proposals, speechEnabled]);
+
+  // Clear the ready-to-listen flag whenever the proposal it points at
+  // resolves or vanishes — otherwise a stale id stays in state.
+  useEffect(() => {
+    if (
+      readyToListenFor !== null &&
+      !proposals.some(
+        (p) => p.id === readyToListenFor && p.ui_state === 'proposed',
+      )
+    ) {
+      setReadyToListenFor(null);
+    }
+  }, [proposals, readyToListenFor]);
 
   // Auto-dismiss any proposal we've been listening to for 30s with no
   // response. Without this, an unanswered prompt sits forever.

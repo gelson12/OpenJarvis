@@ -184,6 +184,73 @@ export function speak(text: string): void {
   enqueue(text);
 }
 
+/**
+ * Speak ``text`` and resolve when the utterance finishes (or rejects-as-resolves
+ * on error). Used by ElaborationBanner to chain prompts in a defined
+ * order — we don't want the polite "may I elaborate?" overlapping the
+ * fast-path's spoken answer, and we don't want the voice listener to
+ * start while Jarvis is still speaking (the mic picks up its own voice
+ * and confuses the recogniser).
+ */
+export function speakAsync(text: string): Promise<void> {
+  return new Promise((resolve) => {
+    if (!isSupported()) {
+      resolve();
+      return;
+    }
+    const cleaned = stripMarkdownForSpeech(text);
+    if (!cleaned.trim()) {
+      resolve();
+      return;
+    }
+    const u = new SpeechSynthesisUtterance(cleaned);
+    const voice = pickVoice();
+    if (voice) u.voice = voice;
+    u.rate = 1.0;
+    u.pitch = 1.0;
+    u.volume = 1.0;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    u.onend = finish;
+    u.onerror = finish;
+    window.speechSynthesis.speak(u);
+  });
+}
+
+/**
+ * Wait until the synthesizer is idle (no utterance speaking and none
+ * pending). Bounded by ``maxWaitMs`` so a misbehaving utterance can't
+ * hang the caller forever. Polls every 100ms — cheap, no event API
+ * exists for "all speech done" so polling is the simplest reliable
+ * approach.
+ */
+export function waitUntilQuiet(maxWaitMs = 60_000): Promise<void> {
+  return new Promise((resolve) => {
+    if (!isSupported()) {
+      resolve();
+      return;
+    }
+    const start = Date.now();
+    const tick = () => {
+      const synth = window.speechSynthesis;
+      if (!synth.speaking && !synth.pending) {
+        resolve();
+        return;
+      }
+      if (Date.now() - start > maxWaitMs) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 100);
+    };
+    tick();
+  });
+}
+
 export function onTokenStream(delta: string): void {
   if (!isSupported() || !delta) return;
   buffer += delta;
