@@ -56,32 +56,260 @@ _AUTO_INJECT_PREFIXES = (
 _AUTO_INJECT_EXACT = ("email_send",)
 
 _AUTO_INJECT_TOOLS_CACHE: list[dict] | None = None
+# Per-group cache: group_id -> list of OpenAI function specs. Built lazily
+# on first request so we don't pay the registry-walk cost at import time.
+_AUTO_INJECT_TOOLS_BY_GROUP: dict[str, list[dict]] | None = None
+
+
+# Tool groups and their trigger keywords. A user message that contains any
+# of a group's keywords (case-insensitive substring match) enables that
+# group's tools for the request. The substring check is intentionally loose
+# — if the model needs the tool and the keyword check missed, the recent-
+# tool stickiness window catches it on the next turn. False positives are
+# cheap (a few extra tools in the spec) compared to false negatives
+# (model can't see the tool it actually needs).
+#
+# Order matters only for the cap-truncation step at the end: groups are
+# enabled in dict-insertion order, and if the resulting tool list exceeds
+# _RELEVANCE_CAP the trailing groups get dropped first.
+_TOOL_GROUP_TRIGGERS: dict[str, tuple[str, ...]] = {
+    # Email — gmail and outlook share most generic mail keywords on
+    # purpose. The user has both accounts wired up; the model picks the
+    # right tool based on whichever account the message references.
+    "gmail": (
+        "gmail", "google mail", "@gmail",
+        "email", "mail", "inbox", "draft", "compose", "subject",
+        "send a message", "reply to", "forward",
+    ),
+    "outlook": (
+        "outlook", "office 365", "office365", "ms graph", "microsoft 365",
+        "@hotmail", "@outlook", "@live",
+        "email", "mail", "inbox", "draft", "compose", "subject",
+        "send a message", "reply to", "forward",
+    ),
+    "calendar": (
+        "calendar", "schedule", "meeting", "appointment", "event",
+        "agenda", "free/busy", "freebusy", "availability",
+        "what's on my", "what is on my", "today's", "tomorrow's",
+        "this week", "next week",
+    ),
+    "n8n": (
+        "n8n", "workflow", "workflows", "automation", "automate",
+        "trigger", "webhook", "cron", "wire up", "every time",
+        "credential", "credentials",
+    ),
+    "browser": (
+        "browser", "navigate", "scrape", "open the website",
+        "open page", "click on", "fill in", "screenshot", "web page",
+        "url", "headless",
+    ),
+    "github": (
+        "github", "pull request", " pr ", " pr.", "issue", "issues",
+        "repo", "repos", "repository", "commit", "branch",
+        "actions run", "release", "fork",
+    ),
+    "railway": (
+        "railway", "deploy", "redeploy", "env var", "environment variable",
+        "service logs", "cf 1010",
+    ),
+    "stripe": (
+        "stripe", "charge", "charges", "subscription", "subscriptions",
+        "refund", "revenue", "balance",
+    ),
+    "paypal": (
+        "paypal", "payout", "payouts",
+    ),
+    "cloudinary": (
+        "cloudinary", "upload an image", "image upload", "cdn",
+    ),
+    "v0": (
+        "v0", "vercel preview", "design a ui", "generate a website",
+        "build a landing page",
+    ),
+    "vault": (
+        "vault", "obsidian", "my notes", "search the notes",
+        "knowledge base", "second brain", "backlinks",
+    ),
+}
+
+# Map tool name → group_id. Built once on first request from the registry.
+_TOOL_NAME_TO_GROUP: dict[str, str] | None = None
+
+# Maximum tools sent in a single request. The auto-inject catalog is 100+
+# tools; sending all of them costs ~40 K input tokens per turn AND degrades
+# tool-call accuracy (every major frontier model gets confused past
+# ~20–30 tools). Anthropic / OpenAI guidance lands at 15–25 as the sweet
+# spot; we pick the upper end so multi-domain prompts still fit.
+_RELEVANCE_CAP = 25
+
+# How many recent assistant turns we scan for tool_calls when deciding
+# which groups to keep "sticky". Without this window, the second turn of a
+# multi-step interaction (model called gmail_list_messages, now wants to
+# call gmail_get_message) could lose access to gmail tools if the user's
+# follow-up didn't repeat any keyword.
+_RECENT_TOOL_HISTORY_TURNS = 4
+
+
+def _build_group_caches() -> tuple[dict[str, list[dict]], dict[str, str]]:
+    """Walk ToolRegistry once, build group → specs and name → group maps."""
+    from openjarvis.core.registry import ToolRegistry
+
+    by_group: dict[str, list[dict]] = {g: [] for g in _TOOL_GROUP_TRIGGERS}
+    name_to_group: dict[str, str] = {}
+
+    # Map prefix → group_id so we can route each tool name into the right
+    # bucket. Single-direction map; "vault_" and "obsidian_" both go to
+    # "vault" (they share the Obsidian-vault backend).
+    prefix_to_group: dict[str, str] = {
+        "gmail_": "gmail",
+        "outlook_": "outlook",
+        "calendar_": "calendar",
+        "n8n_": "n8n",
+        "browser_": "browser",
+        "gh_": "github",
+        "railway_": "railway",
+        "stripe_": "stripe",
+        "paypal_": "paypal",
+        "cloudinary_": "cloudinary",
+        "v0_": "v0",
+        "vault_": "vault",
+        "obsidian_": "vault",
+    }
+    exact_to_group: dict[str, str] = {
+        "email_send": "gmail",  # legacy SMTP shim — surface alongside gmail
+    }
+
+    for name, tool_cls in ToolRegistry.items():
+        group: str | None = None
+        for prefix, gid in prefix_to_group.items():
+            if name.startswith(prefix):
+                group = gid
+                break
+        if group is None:
+            group = exact_to_group.get(name)
+        if group is None:
+            continue
+        try:
+            spec = tool_cls().to_openai_function()
+        except Exception:
+            continue
+        by_group[group].append(spec)
+        name_to_group[name] = group
+
+    return by_group, name_to_group
+
+
+def _ensure_caches() -> tuple[dict[str, list[dict]], dict[str, str]]:
+    global _AUTO_INJECT_TOOLS_BY_GROUP, _TOOL_NAME_TO_GROUP
+    if _AUTO_INJECT_TOOLS_BY_GROUP is None or _TOOL_NAME_TO_GROUP is None:
+        by_group, name_to_group = _build_group_caches()
+        _AUTO_INJECT_TOOLS_BY_GROUP = by_group
+        _TOOL_NAME_TO_GROUP = name_to_group
+    return _AUTO_INJECT_TOOLS_BY_GROUP, _TOOL_NAME_TO_GROUP
+
+
+def _detect_groups_from_text(text: str) -> set[str]:
+    """Return the set of group_ids whose triggers match anywhere in text."""
+    if not text:
+        return set()
+    lc = text.lower()
+    hits: set[str] = set()
+    for gid, triggers in _TOOL_GROUP_TRIGGERS.items():
+        for kw in triggers:
+            if kw in lc:
+                hits.add(gid)
+                break
+    return hits
+
+
+def _detect_groups_from_history(messages, name_to_group: dict[str, str]) -> set[str]:
+    """Return groups whose tools were called in the recent history window.
+
+    Looks at the last ``_RECENT_TOOL_HISTORY_TURNS`` messages for any
+    ``tool_calls`` field and pulls the group of each invoked tool. This
+    keeps multi-step interactions working even when the user's latest
+    turn doesn't repeat the trigger keyword.
+    """
+    if not messages:
+        return set()
+    hits: set[str] = set()
+    for m in list(messages)[-_RECENT_TOOL_HISTORY_TURNS:]:
+        tool_calls = getattr(m, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for tc in tool_calls:
+            fn = (tc or {}).get("function") or {}
+            tool_name = fn.get("name") or ""
+            gid = name_to_group.get(tool_name)
+            if gid:
+                hits.add(gid)
+    return hits
+
+
+def _select_relevant_tools(query_text: str, messages) -> tuple[list[dict], list[str]]:
+    """Pick the auto-inject tools relevant to this turn.
+
+    Returns (tools_list, enabled_groups) so the caller can log which
+    groups the relevance filter chose — useful for tuning the trigger
+    keywords against real traffic.
+
+    Selection rules:
+      - Match keywords from the latest user message → enable groups.
+      - Add any group whose tools were invoked in the last N turns
+        (sticky: avoids yanking tools mid-multi-step flow).
+      - If nothing matched (single-word "hello", math question, etc.),
+        return an empty list — internal tools (calculator, retrieval,
+        think) the agent already loaded handle these cases without
+        auto-inject.
+      - Cap the final list at _RELEVANCE_CAP. Trailing groups (in
+        _TOOL_GROUP_TRIGGERS dict order) get dropped first.
+    """
+    by_group, name_to_group = _ensure_caches()
+
+    enabled: set[str] = _detect_groups_from_text(query_text)
+    enabled |= _detect_groups_from_history(messages, name_to_group)
+
+    if not enabled:
+        return [], []
+
+    out: list[dict] = []
+    enabled_ordered: list[str] = []
+    for gid in _TOOL_GROUP_TRIGGERS:
+        if gid not in enabled:
+            continue
+        specs = by_group.get(gid, [])
+        if not specs:
+            continue
+        if len(out) + len(specs) > _RELEVANCE_CAP:
+            # Adding this group would breach the cap — partial-fill what
+            # fits, then stop. Better than dropping the whole group.
+            remaining = _RELEVANCE_CAP - len(out)
+            if remaining <= 0:
+                break
+            out.extend(specs[:remaining])
+            enabled_ordered.append(gid + "(partial)")
+            break
+        out.extend(specs)
+        enabled_ordered.append(gid)
+
+    return out, enabled_ordered
 
 
 def _get_auto_inject_tools() -> list[dict]:
-    """Return integration tools as OpenAI function-calling specs (cached).
+    """Return ALL integration tools as OpenAI function-calling specs (cached).
 
-    Each entry has shape ``{"type": "function", "function": {...}}`` and is
-    safe to drop directly into a ChatCompletionRequest.tools list.
+    Kept for backwards-compat with code paths that still want the full
+    catalog (none in routes.py at present). Production traffic now goes
+    through :func:`_select_relevant_tools` which prunes to the relevant
+    subset per-request.
     """
     global _AUTO_INJECT_TOOLS_CACHE
     if _AUTO_INJECT_TOOLS_CACHE is not None:
         return _AUTO_INJECT_TOOLS_CACHE
-    from openjarvis.core.registry import ToolRegistry
-
+    by_group, _ = _ensure_caches()
     out: list[dict] = []
-    for name, tool_cls in ToolRegistry.items():
-        if not (
-            name.startswith(_AUTO_INJECT_PREFIXES)
-            or name in _AUTO_INJECT_EXACT
-        ):
-            continue
-        try:
-            instance = tool_cls()
-            out.append(instance.to_openai_function())
-        except Exception:
-            # Tools requiring non-default constructor args are skipped.
-            continue
+    for specs in by_group.values():
+        out.extend(specs)
     _AUTO_INJECT_TOOLS_CACHE = out
     return out
 
@@ -162,24 +390,35 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 exc_info=True,
             )
 
-    # Auto-inject integration tools when the frontend didn't send any.
-    # The chat UI's request body (InputArea.tsx) currently omits the
-    # tools field entirely — without this hook, every "use the n8n
-    # tools" / "list my repos" / "search the vault" prompt would land
-    # on a tool-blind cascade and the model would hallucinate prose
-    # about the API instead of calling registered tools. With this
-    # block, requests pick up the curated integration tool catalog
-    # automatically, and the agent-stream bridge (line ~158) engages
-    # so tool calls execute server-side in a multi-turn loop.
+    # Auto-inject integration tools when the frontend didn't send any,
+    # filtered by relevance to the user's latest message.
+    #
+    # The chat UI omits `tools` from its request body. Without this hook,
+    # every "send Pedro an email" / "what's on my calendar" / "list my
+    # workflows" prompt would land on a tool-blind cascade and the model
+    # would hallucinate prose about the API instead of calling registered
+    # tools. The OLD version of this block injected ALL ~100 integration
+    # tools on every request (~40 K input tokens of function specs per
+    # turn). The relevance filter cuts that to a handful of relevant
+    # tools per turn — typical reduction is ~85-90 % input tokens, while
+    # multi-step interactions still work via the recent-tool stickiness
+    # window in :func:`_select_relevant_tools`.
     if not request_body.tools:
         try:
-            auto_tools = _get_auto_inject_tools()
-            if auto_tools:
-                request_body.tools = auto_tools
+            # Latest user message drives the keyword match.
+            latest_user = ""
+            for m in reversed(request_body.messages):
+                if m.role == "user" and m.content:
+                    latest_user = m.content
+                    break
+            relevant_tools, enabled_groups = _select_relevant_tools(
+                latest_user, request_body.messages,
+            )
+            if relevant_tools:
+                request_body.tools = relevant_tools
                 logging.getLogger("openjarvis.server").info(
-                    "auto-injected %d integration tools into request "
-                    "(frontend did not supply tools)",
-                    len(auto_tools),
+                    "auto-injected %d tools (groups=%s) into request",
+                    len(relevant_tools), enabled_groups,
                 )
         except Exception:
             logging.getLogger("openjarvis.server").debug(
