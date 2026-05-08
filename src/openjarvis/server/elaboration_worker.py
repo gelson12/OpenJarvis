@@ -276,6 +276,47 @@ async def _run(
             pass
 
 
+# Trivial messages where elaborating adds zero value — greetings,
+# acknowledgements, single-word affirmations / negations. The agent
+# should NOT propose "may I expand on Hello?" — that's annoying and
+# wastes a Claude-CLI run. Match the user's raw message
+# (case-insensitive, trim whitespace + trailing punctuation) against
+# this set; if it hits, skip elaboration spawn entirely.
+_TRIVIAL_MESSAGES: frozenset[str] = frozenset({
+    "hi", "hello", "hey", "yo", "sup",
+    "thanks", "thank you", "thx", "ty", "cheers",
+    "ok", "okay", "k", "kk",
+    "yes", "yep", "yeah", "yup", "sure",
+    "no", "nope", "nah",
+    "cool", "nice", "great", "awesome", "perfect", "good",
+    "bye", "goodbye", "later", "cya", "see you",
+    "lol", "haha", "hehe",
+    "got it", "understood", "noted",
+})
+
+
+def _is_trivial_question(text: str) -> bool:
+    """True if the user's message is a greeting/ack and elaboration
+    would be noise. Compares lowercased + stripped + punctuation-stripped
+    text against ``_TRIVIAL_MESSAGES``."""
+    if not text:
+        return True
+    cleaned = text.strip().lower()
+    cleaned = cleaned.rstrip("!?.,;:#。！？").strip()
+    if not cleaned:
+        return True
+    if cleaned in _TRIVIAL_MESSAGES:
+        return True
+    # Very short messages (≤ 2 words) that aren't actually questions —
+    # e.g. "ok cool", "yes please", "thank you very much". Word count
+    # under 3 + no question mark in the original = nothing substantive
+    # to elaborate on.
+    word_count = len(cleaned.split())
+    if word_count < 3 and "?" not in text:
+        return True
+    return False
+
+
 async def spawn_elaboration(
     *,
     messages: list[dict[str, Any]],
@@ -286,7 +327,8 @@ async def spawn_elaboration(
     """Create an Elaboration record + launch the background worker.
 
     Returns the Elaboration so the caller (chat handler) can later write
-    spoken_answer back into it. Returns None if elaboration is disabled.
+    spoken_answer back into it. Returns None if elaboration is disabled
+    or the user's message is too trivial to elaborate on.
 
     ``memory_backend`` is an optional reference to the configured
     memory layer; when provided, the resolved Claude-CLI answer is
@@ -294,6 +336,16 @@ async def spawn_elaboration(
     benefit from the deeper analysis.
     """
     if not is_enabled():
+        return None
+
+    # Skip elaboration spawning for trivial messages (greetings, "thanks",
+    # "ok") — there's nothing substantive to elaborate on, and the
+    # "Sir, may I expand on 'Hello?'" prompt is more annoying than
+    # useful. Better to stay quiet on these.
+    if _is_trivial_question(original_question):
+        logger.debug(
+            "Elaboration: skipping trivial question %r", original_question[:60],
+        )
         return None
 
     store = get_store()
