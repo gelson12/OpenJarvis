@@ -109,17 +109,24 @@ export function useVoiceListener({
         if (result.isFinal) {
           const transcript = result[0]?.transcript ?? '';
           if (!transcript.trim()) continue;
-          // Echo guard: if browser TTS is currently speaking (or just
-          // about to), the mic is almost certainly picking up Jarvis's
-          // own voice and SpeechRecognition is treating it as user
-          // input. Drop these transcripts to avoid feedback loops
-          // where the assistant's own utterance becomes the next user
-          // message. The ElaborationBanner's chained prompt-then-listen
-          // flow already minimises overlap, but background utterances
-          // (digest, elaboration mid-stream) can still collide.
+          // Echo guard: if browser TTS is CURRENTLY emitting audio, the
+          // mic is almost certainly picking up Jarvis's own voice and
+          // SpeechRecognition is treating it as user input. Drop those
+          // transcripts to avoid feedback loops where the assistant's
+          // own utterance becomes the next user message.
+          //
+          // Only check `synth.speaking`, NOT `synth.pending`. `pending`
+          // means "an utterance is queued but not yet started" — common
+          // when a second ElaborationBanner stacks while the first is
+          // still awaiting yes/no, leaving `pending` stuck true while
+          // the user is trying to confirm. The original guard checked
+          // both and produced a dead listener that silently swallowed
+          // every "yes". `speaking` alone is the narrow signal that
+          // matters: if Jarvis is audibly talking right now, ignore
+          // the mic; otherwise let transcripts through.
           const synth =
             typeof window !== 'undefined' ? window.speechSynthesis : null;
-          if (synth && (synth.speaking || synth.pending)) {
+          if (synth && synth.speaking) {
             continue;
           }
           onTranscriptRef.current(transcript);
