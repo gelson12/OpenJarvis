@@ -78,7 +78,12 @@ docs/superpowers/
 
 # Claude Code project instructions (per-developer)
 CLAUDE.md
-.claude/
+# Ignore .claude contents per-developer, but track the shared skills sub-tree.
+# Pattern note: must use `.claude/*` (contents) not `.claude/` (the dir itself)
+# so negation rules below can re-include specific paths — git can't re-include
+# children of an ignored parent directory.
+.claude/*
+!.claude/skills/
 
 # Tauri auto-generated schemas
 **/src-tauri/gen/schemas/
