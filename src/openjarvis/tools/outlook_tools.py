@@ -374,6 +374,190 @@ class OutlookReplyToMessageTool(_OutlookToolBase):
             return _err(self.spec.name, exc)
 
 
+# ---------------------------------------------------------------------------
+# Calendar (Outlook calendar via Microsoft Graph)
+# ---------------------------------------------------------------------------
+
+
+@ToolRegistry.register("outlook_list_events")
+class OutlookListEventsTool(_OutlookToolBase):
+    """List Outlook/Hotmail calendar events. Use start+end (ISO 8601) for
+    time-windowed queries — e.g. start='2026-05-08T00:00:00Z' end=
+    '2026-05-08T23:59:59Z' for 'today's events'. Without a window, lists
+    upcoming events ordered by start time."""
+
+    tool_id = "outlook_list_events"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="outlook_list_events",
+            description=(
+                "List events on the authorized user's Outlook / Hotmail "
+                "calendar. For 'what's on my calendar today' style "
+                "queries, pass start + end as ISO 8601 strings with "
+                "timezone (e.g. start='2026-05-08T00:00:00Z' "
+                "end='2026-05-08T23:59:59Z'). Without start/end, returns "
+                "upcoming events ordered by start time."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "start": {
+                        "type": "string",
+                        "description": (
+                            "Window start (ISO 8601 with timezone). "
+                            "Optional. If provided, also pass end."
+                        ),
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "Window end (ISO 8601). Optional.",
+                    },
+                    "top": {
+                        "type": "integer",
+                        "description": "Max events to return (default 25, max 100).",
+                    },
+                },
+            },
+            category="calendar",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        try:
+            return _ok(
+                self.spec.name,
+                self._client.list_events(
+                    start=params.get("start"),
+                    end=params.get("end"),
+                    top=int(params.get("top", 25)),
+                ),
+            )
+        except OutlookUnavailableError as exc:
+            return _err(self.spec.name, exc)
+
+
+@ToolRegistry.register("outlook_get_event")
+class OutlookGetEventTool(_OutlookToolBase):
+    tool_id = "outlook_get_event"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="outlook_get_event",
+            description=(
+                "Fetch the full details of a single Outlook calendar "
+                "event by id. Use after outlook_list_events to inspect a "
+                "specific event."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"event_id": {"type": "string"}},
+                "required": ["event_id"],
+            },
+            category="calendar",
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        try:
+            return _ok(
+                self.spec.name,
+                self._client.get_event(str(params["event_id"])),
+            )
+        except OutlookUnavailableError as exc:
+            return _err(self.spec.name, exc)
+
+
+@ToolRegistry.register("outlook_create_event")
+class OutlookCreateEventTool(_OutlookToolBase):
+    tool_id = "outlook_create_event"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="outlook_create_event",
+            description=(
+                "Create an event on the authorized user's Outlook calendar. "
+                "Times in start/end are interpreted in the given timezone "
+                "(default UTC). Read back subject + start + attendees "
+                "before invoking — irreversible without a delete call."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string"},
+                    "start": {
+                        "type": "string",
+                        "description": "ISO 8601 datetime, e.g. '2026-05-08T14:00:00'.",
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "ISO 8601 datetime.",
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "Timezone (default 'UTC').",
+                    },
+                    "body": {"type": "string", "description": "Event description."},
+                    "location": {"type": "string"},
+                    "attendees": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of email addresses to invite.",
+                    },
+                    "is_all_day": {"type": "boolean"},
+                },
+                "required": ["subject", "start", "end"],
+            },
+            category="calendar",
+            requires_confirmation=True,
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        try:
+            return _ok(
+                self.spec.name,
+                self._client.create_event(
+                    subject=str(params["subject"]),
+                    start=str(params["start"]),
+                    end=str(params["end"]),
+                    timezone=str(params.get("timezone", "UTC")),
+                    body=params.get("body"),
+                    location=params.get("location"),
+                    attendees=params.get("attendees"),
+                    is_all_day=bool(params.get("is_all_day", False)),
+                ),
+            )
+        except OutlookUnavailableError as exc:
+            return _err(self.spec.name, exc)
+
+
+@ToolRegistry.register("outlook_delete_event")
+class OutlookDeleteEventTool(_OutlookToolBase):
+    tool_id = "outlook_delete_event"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="outlook_delete_event",
+            description="Cancel/delete an event from the user's Outlook calendar.",
+            parameters={
+                "type": "object",
+                "properties": {"event_id": {"type": "string"}},
+                "required": ["event_id"],
+            },
+            category="calendar",
+            requires_confirmation=True,
+        )
+
+    def execute(self, **params: Any) -> ToolResult:
+        try:
+            self._client.delete_event(str(params["event_id"]))
+            return _ok(self.spec.name, {"deleted": params["event_id"]})
+        except OutlookUnavailableError as exc:
+            return _err(self.spec.name, exc)
+
+
 __all__ = [
     "OutlookGetProfileTool",
     "OutlookListFoldersTool",
@@ -384,4 +568,8 @@ __all__ = [
     "OutlookDeleteMessageTool",
     "OutlookSendMessageTool",
     "OutlookReplyToMessageTool",
+    "OutlookListEventsTool",
+    "OutlookGetEventTool",
+    "OutlookCreateEventTool",
+    "OutlookDeleteEventTool",
 ]

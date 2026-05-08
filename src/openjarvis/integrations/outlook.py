@@ -316,6 +316,99 @@ class OutlookClient:
             },
         )
 
+    # ------------------------------------------------------------------
+    # Calendar (Microsoft Graph)
+    # ------------------------------------------------------------------
+    #
+    # Same OAuth + Graph plumbing as the mail endpoints. /me/events lists
+    # all events; /me/calendarView is the time-windowed equivalent (better
+    # for "what's on my calendar today" because it expands recurring
+    # events into individual occurrences within the window).
+
+    def list_events(
+        self,
+        *,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        top: int = 25,
+    ) -> Any:
+        """List calendar events.
+
+        If ``start`` and ``end`` are provided (ISO 8601 with timezone, e.g.
+        ``2026-05-08T00:00:00Z``), uses /me/calendarView which expands
+        recurring events. Otherwise falls back to /me/events (no expansion).
+        """
+        if start and end:
+            return self._request(
+                "GET",
+                "/me/calendarView",
+                params={
+                    "startDateTime": start,
+                    "endDateTime": end,
+                    "$top": min(top, 100),
+                    "$orderby": "start/dateTime",
+                    "$select": (
+                        "subject,start,end,location,organizer,"
+                        "attendees,bodyPreview,isAllDay,onlineMeetingUrl"
+                    ),
+                },
+            )
+        return self._request(
+            "GET",
+            "/me/events",
+            params={
+                "$top": min(top, 100),
+                "$orderby": "start/dateTime",
+                "$select": (
+                    "subject,start,end,location,organizer,"
+                    "attendees,bodyPreview,isAllDay,onlineMeetingUrl"
+                ),
+            },
+        )
+
+    def get_event(self, event_id: str) -> Any:
+        """Fetch a single calendar event by id."""
+        return self._request("GET", f"/me/events/{event_id}")
+
+    def create_event(
+        self,
+        *,
+        subject: str,
+        start: str,  # ISO 8601 e.g. "2026-05-08T14:00:00"
+        end: str,
+        timezone: str = "UTC",
+        body: Optional[str] = None,
+        location: Optional[str] = None,
+        attendees: Optional[list[str]] = None,
+        is_all_day: bool = False,
+    ) -> Any:
+        """Create a calendar event. Times in ``start``/``end`` are
+        interpreted in ``timezone``."""
+        payload: dict[str, Any] = {
+            "subject": subject,
+            "start": {"dateTime": start, "timeZone": timezone},
+            "end": {"dateTime": end, "timeZone": timezone},
+        }
+        if body:
+            payload["body"] = {"contentType": "Text", "content": body}
+        if location:
+            payload["location"] = {"displayName": location}
+        if attendees:
+            payload["attendees"] = [
+                {
+                    "emailAddress": {"address": a.strip()},
+                    "type": "required",
+                }
+                for a in attendees if a.strip()
+            ]
+        if is_all_day:
+            payload["isAllDay"] = True
+        return self._request("POST", "/me/events", json_body=payload)
+
+    def delete_event(self, event_id: str) -> Any:
+        """Cancel/delete a calendar event."""
+        return self._request("DELETE", f"/me/events/{event_id}")
+
 
 _default: Optional[OutlookClient] = None
 
