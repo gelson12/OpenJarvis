@@ -41,25 +41,23 @@ class V0Client:
     def configured(self) -> bool:
         return bool(self._key)
 
-    def chat_create(
+    def chat(
         self,
-        prompt: str,
+        messages: list[dict[str, Any]],
         *,
         model: str = "v0-1.5-md",
-        system: Optional[str] = None,
     ) -> Any:
-        """Send a single-turn prompt to V0; return the parsed response.
+        """Send a multi-turn conversation to V0; return the parsed response.
 
+        Generic primitive that backs both chat_create (single-turn) and
+        chat_continue (multi-turn iteration on an existing design).
         V0's response typically embeds a Vercel preview/deploy URL in
         the assistant content; callers extract it as needed.
         """
         if not self.configured:
             raise V0UnavailableError("V0 not configured — set V0_API_KEY")
-
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+        if not messages:
+            raise V0UnavailableError("V0 chat: messages list is empty")
 
         payload = {"model": model, "messages": messages}
         headers = {
@@ -77,6 +75,20 @@ class V0Client:
                 return resp.json()
         except httpx.HTTPError as exc:
             raise V0UnavailableError(f"V0 chat request failed: {exc}") from exc
+
+    def chat_create(
+        self,
+        prompt: str,
+        *,
+        model: str = "v0-1.5-md",
+        system: Optional[str] = None,
+    ) -> Any:
+        """Single-turn prompt to V0. See :meth:`chat` for multi-turn."""
+        msgs: list[dict[str, Any]] = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        return self.chat(msgs, model=model)
 
 
 _default: Optional[V0Client] = None

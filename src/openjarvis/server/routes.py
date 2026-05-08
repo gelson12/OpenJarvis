@@ -130,6 +130,21 @@ _TOOL_GROUP_TRIGGERS: dict[str, tuple[str, ...]] = {
         "vault", "obsidian", "my notes", "search the notes",
         "knowledge base", "second brain", "backlinks",
     ),
+    "weather": (
+        "weather", "temperature", "forecast", "rain", "rainy",
+        "snow", "snowing", "sunny", "cloudy", "humidity", "wind",
+        "is it going to", "what's it like outside", "degrees",
+    ),
+    "location": (
+        "where is", "address", "geocode", "coordinates", "lat",
+        "longitude", "latitude", "find the place", "find a place",
+        "directions", "nearby",
+    ),
+    "web_search": (
+        "search the web", "google", "google it", "look up", "look it up",
+        "what is", "who is", "when did", "find out about",
+        "current news", "latest", "recent", "today's news",
+    ),
 }
 
 # Map tool name → group_id. Built once on first request from the registry.
@@ -174,6 +189,9 @@ def _build_group_caches() -> tuple[dict[str, list[dict]], dict[str, str]]:
         "v0_": "v0",
         "vault_": "vault",
         "obsidian_": "vault",
+        "weather_": "weather",
+        "geocode_": "location",
+        "web_search": "web_search",
     }
     exact_to_group: dict[str, str] = {
         "email_send": "gmail",  # legacy SMTP shim — surface alongside gmail

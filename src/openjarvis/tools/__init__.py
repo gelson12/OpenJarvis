@@ -151,6 +151,21 @@ try:
 except ImportError:
     pass
 
+try:
+    import openjarvis.tools.weather_tools  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.geocode_tools  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.web_search_tools  # noqa: F401
+except ImportError:
+    pass
+
 # Integration tool surfaces (Obsidian vault, n8n, Railway, GitHub,
 # Cloudinary, V0, SMTP). Each registers its BaseTool subclasses via
 # @ToolRegistry.register and is gated on the relevant env-vars +
