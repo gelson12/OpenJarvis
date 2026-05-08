@@ -837,7 +837,13 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     agent: str = "orchestrator"
-    model: str = ""
+    # Default to "auto" so the frontend dropdown lands on the cascade
+    # path (T1 races fast tool-reliable models, falls through on failure)
+    # rather than pinning to a single provider that may be quota-throttled.
+    # User can still pick a specific model in the UI; this only sets the
+    # initial selection on first load + the fallback when no model is
+    # specified by config or CLI.
+    model: str = "auto"
     workers: int = 1
     cors_origins: list = field(
         default_factory=lambda: [

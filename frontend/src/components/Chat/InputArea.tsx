@@ -93,11 +93,25 @@ export function InputArea() {
   const isPendingElaboration = useAppStore(
     (s) => s.proposedElaborations.some((p) => p.ui_state === 'proposed'),
   );
+  // The listener stays on continuously — even during streaming, even
+  // before an ElaborationBanner appears. The user explicitly asked for
+  // "always actively listening", so the only off-switches are:
+  //   - alwaysListenEnabled toggle (Settings)
+  //   - speechEnabled toggle (Settings)
+  //   - missing browser SpeechRecognition support
+  //   - an ElaborationBanner's own listener is active (single
+  //     SpeechRecognition instance constraint — two concurrent
+  //     listeners on the same page collide and silently fail).
+  // Removing the `!isStreaming` predicate that previously turned the
+  // listener off mid-response: there's no functional reason to mute
+  // the mic while the model is streaming, and the echo guard in
+  // useVoiceListener already drops transcripts captured while Jarvis
+  // is audibly speaking.
   const continuousListenActive =
     alwaysListenEnabled &&
     speechEnabled &&
     isSpeechRecognitionSupported() &&
-    !streamState.isStreaming;
+    !isPendingElaboration;
   const [voiceListenError, setVoiceListenError] = useState<string | null>(null);
 
   // Hands-free auto-submit timer. Cleared if the user says "wait /

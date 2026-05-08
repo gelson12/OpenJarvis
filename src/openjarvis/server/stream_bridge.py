@@ -162,14 +162,20 @@ class FallbackEngine:
             except Exception as exc:
                 attempted.append(candidate)
                 last_exc = exc
-                self._log.warning(
+                # Per-candidate failure is expected when a provider is
+                # quota-exhausted or rate-limited. Logged at DEBUG to
+                # keep production logs quiet — operators care about
+                # "did the request eventually succeed", not "which
+                # specific provider got skipped". Only surface a WARNING
+                # when ALL candidates fail (below).
+                self._log.debug(
                     "FallbackEngine: %s failed (%s: %s); trying next candidate",
                     candidate, type(exc).__name__, exc,
                 )
                 continue
         # Every candidate failed — surface the last exception with
         # context about everything we tried.
-        self._log.error(
+        self._log.warning(
             "FallbackEngine: all %d candidates failed (%s); raising last error",
             len(self._candidates), attempted,
         )
@@ -454,49 +460,82 @@ class AgentStreamBridge:
             if engine is not None and hasattr(engine, "stream_full") and content:
                 # Re-stream using the engine for real token delivery.
                 # Build the same messages the agent used for its final turn.
-                try:
-                    from openjarvis.core.types import Message as MsgType
-                    from openjarvis.core.types import Role as RoleType
+                from openjarvis.core.types import Message as MsgType
+                from openjarvis.core.types import Role as RoleType
 
-                    replay_messages = []
-                    for m in self._request.messages:
-                        role = (
-                            RoleType(m.role)
-                            if m.role in {r.value for r in RoleType}
-                            else RoleType.USER
+                replay_messages = []
+                for m in self._request.messages:
+                    role = (
+                        RoleType(m.role)
+                        if m.role in {r.value for r in RoleType}
+                        else RoleType.USER
+                    )
+                    replay_messages.append(
+                        MsgType(
+                            role=role,
+                            content=m.content or "",
+                            name=m.name,
+                            tool_call_id=m.tool_call_id,
                         )
-                        replay_messages.append(
-                            MsgType(
-                                role=role,
-                                content=m.content or "",
-                                name=m.name,
-                                tool_call_id=m.tool_call_id,
-                            )
+                    )
+
+                # Walk the same fallback chain as the agent's generate()
+                # path: chosen model first, then other tool-capable
+                # providers with keys configured. Without this, a user
+                # who pinned gpt-4o while their OpenAI key is quota-dead
+                # would see real LLM streaming fail and degrade to the
+                # synthetic word-replay path. With it, the re-stream
+                # silently moves to the next available provider and the
+                # user keeps real streaming UX. Logged at DEBUG so
+                # production logs stay quiet across recurring quota
+                # blips.
+                import logging as _logging
+
+                _logger = _logging.getLogger("openjarvis.server")
+                stream_chain = get_agent_fallback_chain(self._model) or [self._model]
+                # Unwrap FallbackEngine if present — its stream_full is
+                # delegated to the inner engine via __getattr__ but
+                # that's fine; we drive the model selection ourselves.
+                inner_for_stream = getattr(engine, "_inner", engine)
+
+                last_stream_exc: BaseException | None = None
+                for candidate_model in stream_chain:
+                    try:
+                        async for sc in inner_for_stream.stream_full(
+                            replay_messages,
+                            model=candidate_model,
+                        ):
+                            if sc.content:
+                                chunk = ChatCompletionChunk(
+                                    id=self._chunk_id,
+                                    model=candidate_model,
+                                    choices=[
+                                        StreamChoice(
+                                            delta=DeltaMessage(
+                                                content=sc.content,
+                                            ),
+                                        )
+                                    ],
+                                )
+                                yield f"data: {chunk.model_dump_json()}\n\n"
+                        used_real_streaming = True
+                        break
+                    except Exception as stream_exc:
+                        last_stream_exc = stream_exc
+                        _logger.debug(
+                            "Re-stream failed on %s (%s); trying next "
+                            "candidate in chain",
+                            candidate_model, type(stream_exc).__name__,
                         )
-
-                    async for sc in engine.stream_full(
-                        replay_messages,
-                        model=self._model,
-                    ):
-                        if sc.content:
-                            chunk = ChatCompletionChunk(
-                                id=self._chunk_id,
-                                model=self._model,
-                                choices=[
-                                    StreamChoice(
-                                        delta=DeltaMessage(content=sc.content),
-                                    )
-                                ],
-                            )
-                            yield f"data: {chunk.model_dump_json()}\n\n"
-                    used_real_streaming = True
-                except Exception as stream_exc:
-                    import logging as _logging
-
-                    _logger = _logging.getLogger("openjarvis.server")
+                        continue
+                if not used_real_streaming and last_stream_exc is not None:
+                    # Every candidate failed — fall through to word replay
+                    # below. Single WARNING here so operators see the issue
+                    # without per-candidate noise.
                     _logger.warning(
-                        "Real streaming failed, falling back to word replay: %s",
-                        stream_exc,
+                        "Re-stream: all %d candidates failed; using word "
+                        "replay. Last error: %s",
+                        len(stream_chain), last_stream_exc,
                     )
 
             # Fallback: word-by-word replay if real streaming was not used

@@ -111,11 +111,15 @@ function loadSettings(): Settings {
     // route through tts.ts which is gated on this flag. Users can
     // toggle off in Settings if they prefer text-only.
     speechEnabled: true,
-    // Off by default — the browser will pop up a mic permission prompt
-    // the first time the listener starts, which would surprise a fresh
-    // user. They can enable it in Settings (and on this user's request,
-    // we surface it prominently next to the chat input too).
-    alwaysListenEnabled: false,
+    // ON by default per user's "always listening" requirement — they
+    // want the mic active even before an elaboration banner appears,
+    // so they can say "yes" / "send Pedro the thing" / etc. without
+    // first toggling a setting on every login. The browser still
+    // requires a one-time mic permission grant; after that, listening
+    // resumes automatically every page load. Users who prefer the
+    // listener off can flip this in Settings; their choice persists
+    // via localStorage so they're not re-opted-in on each reload.
+    alwaysListenEnabled: true,
     handsFreeMode: false,
   };
   try {
