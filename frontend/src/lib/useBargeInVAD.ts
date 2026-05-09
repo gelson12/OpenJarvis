@@ -57,7 +57,6 @@ export function useBargeInVAD(opts: UseBargeInVADOptions): void {
   const { enabled, active, onBargeIn, lastTtsActivityAt } = opts;
 
   const vadRef = useRef<VADInstance | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
   const userGestureSeenRef = useRef(false);
   const initInFlightRef = useRef(false);
   const pauseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -103,28 +102,14 @@ export function useBargeInVAD(opts: UseBargeInVADOptions): void {
       if (!userGestureSeenRef.current) return; // wait for gesture
       initInFlightRef.current = true;
       try {
-        // Grab one mic stream and reuse it for VAD's lifetime.
-        // SpeechRecognition opens its own internal mic handle; Chrome
-        // multiplexes the underlying device.
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        streamRef.current = stream;
-
         // Dynamic import keeps the bundle lean — VAD/ONNX assets only
-        // load when the feature is first activated.
+        // load when the feature is first activated. MicVAD manages
+        // getUserMedia + AudioContext + AudioWorklet itself; we only
+        // wire callbacks. SpeechRecognition opens its own mic handle
+        // separately; Chrome multiplexes the underlying device.
         const { MicVAD } = await import('@ricky0123/vad-web');
 
         const vad = await MicVAD.new({
-          stream,
           // Assets shipped to the site root by vite-plugin-static-copy.
           baseAssetPath: '/',
           onnxWASMBasePath: '/',
@@ -133,6 +118,12 @@ export function useBargeInVAD(opts: UseBargeInVADOptions): void {
           minSpeechFrames: MIN_SPEECH_FRAMES,
           positiveSpeechThreshold: POSITIVE_SPEECH_THRESHOLD,
           negativeSpeechThreshold: NEGATIVE_SPEECH_THRESHOLD,
+          // Forwarded to MicVAD's internal getUserMedia call.
+          additionalAudioConstraints: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
           // The library exposes onSpeechStart for the onset event; we
           // ignore onSpeechEnd / onVADMisfire because we delegate
           // transcript capture to SpeechRecognition.
@@ -153,8 +144,6 @@ export function useBargeInVAD(opts: UseBargeInVADOptions): void {
 
         if (cancelled) {
           await vad.destroy();
-          stream.getTracks().forEach((t) => t.stop());
-          streamRef.current = null;
           return;
         }
         vadRef.current = vad;
@@ -169,7 +158,8 @@ export function useBargeInVAD(opts: UseBargeInVADOptions): void {
     }
 
     if (!enabled) {
-      // Fully tear down — user toggled off.
+      // Fully tear down — user toggled off. MicVAD.destroy() releases
+      // its internal mic handle so the indicator turns off.
       if (pauseTimerRef.current) {
         clearTimeout(pauseTimerRef.current);
         pauseTimerRef.current = null;
@@ -178,10 +168,6 @@ export function useBargeInVAD(opts: UseBargeInVADOptions): void {
         const v = vadRef.current;
         vadRef.current = null;
         Promise.resolve(v.destroy()).catch(() => {});
-      }
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
       }
       return;
     }
@@ -233,10 +219,6 @@ export function useBargeInVAD(opts: UseBargeInVADOptions): void {
         const v = vadRef.current;
         vadRef.current = null;
         Promise.resolve(v.destroy()).catch(() => {});
-      }
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
       }
     };
   }, []);
