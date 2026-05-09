@@ -109,7 +109,27 @@ export function useBargeInVAD(opts: UseBargeInVADOptions): void {
         // separately; Chrome multiplexes the underlying device.
         const { MicVAD } = await import('@ricky0123/vad-web');
 
-        const vad = await MicVAD.new({
+        // Cast options to `any` because vad-web's exported
+        // RealTimeVADOptions type is narrower than what MicVAD.new
+        // actually accepts at runtime — it omits frameSamples,
+        // additionalAudioConstraints, and a few model knobs that the
+        // library does support (and the docs document). This keeps
+        // strict TS compilation passing while preserving the
+        // documented runtime behavior.
+        const onSpeechStart = () => {
+          // Self-echo suppression: drop any onset that fires within
+          // COOLDOWN_MS of the most recent TTS activity. The polling
+          // loop in the caller refreshes lastTtsActivityAt while
+          // synth.speaking is true; this catches both mid-utterance
+          // and inter-sentence-gap cases.
+          const lastFn = lastTtsActivityRef.current;
+          if (lastFn) {
+            const since = Date.now() - lastFn();
+            if (since < COOLDOWN_MS) return;
+          }
+          onBargeInRef.current();
+        };
+        const vadOpts: Record<string, unknown> = {
           // Assets shipped to the site root by vite-plugin-static-copy.
           baseAssetPath: '/',
           onnxWASMBasePath: '/',
@@ -118,29 +138,15 @@ export function useBargeInVAD(opts: UseBargeInVADOptions): void {
           minSpeechFrames: MIN_SPEECH_FRAMES,
           positiveSpeechThreshold: POSITIVE_SPEECH_THRESHOLD,
           negativeSpeechThreshold: NEGATIVE_SPEECH_THRESHOLD,
-          // Forwarded to MicVAD's internal getUserMedia call.
           additionalAudioConstraints: {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true,
           },
-          // The library exposes onSpeechStart for the onset event; we
-          // ignore onSpeechEnd / onVADMisfire because we delegate
-          // transcript capture to SpeechRecognition.
-          onSpeechStart: () => {
-            // Self-echo suppression: drop any onset that fires within
-            // COOLDOWN_MS of the most recent TTS activity. The polling
-            // loop in the caller refreshes lastTtsActivityAt while
-            // synth.speaking is true; this catches both mid-utterance
-            // and inter-sentence-gap cases.
-            const lastFn = lastTtsActivityRef.current;
-            if (lastFn) {
-              const since = Date.now() - lastFn();
-              if (since < COOLDOWN_MS) return;
-            }
-            onBargeInRef.current();
-          },
-        }) as unknown as VADInstance;
+          onSpeechStart,
+        };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const vad = await (MicVAD.new as any)(vadOpts) as VADInstance;
 
         if (cancelled) {
           await vad.destroy();
