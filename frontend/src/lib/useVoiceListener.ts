@@ -69,6 +69,10 @@ interface UseVoiceListenerOptions {
   onTranscript: (transcript: string) => void;
   /** Optional — fired on permission denial / hardware errors so UI can react. */
   onError?: (errorCode: string) => void;
+  /** Optional — fired the first time recognition.onstart fires successfully
+   * after enable, so the UI can clear any stale "Mic blocked" toast left
+   * over from a previous session that errored before mic perm was granted. */
+  onStarted?: () => void;
   /** ISO language tag, default 'en-US'. */
   lang?: string;
 }
@@ -81,14 +85,17 @@ export function useVoiceListener({
   enabled,
   onTranscript,
   onError,
+  onStarted,
   lang = 'en-US',
 }: UseVoiceListenerOptions): void {
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   // Capture latest callbacks so the effect doesn't tear down on every render
   const onTranscriptRef = useRef(onTranscript);
   const onErrorRef = useRef(onError);
+  const onStartedRef = useRef(onStarted);
   onTranscriptRef.current = onTranscript;
   onErrorRef.current = onError;
+  onStartedRef.current = onStarted;
 
   useEffect(() => {
     if (!enabled || !isSpeechRecognitionSupported()) return;
@@ -132,6 +139,15 @@ export function useVoiceListener({
           onTranscriptRef.current(transcript);
         }
       }
+    };
+
+    recognition.onstart = () => {
+      // Listener is actually running — clear any sticky 'not-allowed'
+      // toast left over from a prior session that errored before mic
+      // permission was granted. Without this, the user grants perm,
+      // listener starts succeeding, but the red banner persists
+      // indefinitely.
+      onStartedRef.current?.();
     };
 
     recognition.onerror = (ev: SpeechRecognitionErrorEventLike) => {

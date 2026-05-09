@@ -321,6 +321,13 @@ export function InputArea() {
     onError: (errorCode) => {
       setVoiceListenError(errorCode);
     },
+    onStarted: () => {
+      // Listener fired up successfully — clear any stale "Mic blocked"
+      // toast from a previous session where permission hadn't been
+      // granted yet. Otherwise the toast lies indefinitely after the
+      // user grants permission.
+      setVoiceListenError(null);
+    },
   });
 
   // Clean up the auto-submit timer on unmount.
