@@ -3,6 +3,33 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { VitePWA } from 'vite-plugin-pwa';
+import { viteStaticCopy } from 'vite-plugin-static-copy';
+
+// Copy @ricky0123/vad-web's worklet + ONNX models and onnxruntime-web's
+// WASM binaries into the build output so they're served from the same
+// origin at runtime. Without this, MicVAD.new() can't find its assets
+// and barge-in silently never fires. The library expects them at the
+// `baseAssetPath` URL we configure in useBargeInVAD ('/' by default).
+const vadAssets = viteStaticCopy({
+  targets: [
+    {
+      src: 'node_modules/@ricky0123/vad-web/dist/vad.worklet.bundle.min.js',
+      dest: '.',
+    },
+    {
+      src: 'node_modules/@ricky0123/vad-web/dist/silero_vad_legacy.onnx',
+      dest: '.',
+    },
+    {
+      src: 'node_modules/@ricky0123/vad-web/dist/silero_vad_v5.onnx',
+      dest: '.',
+    },
+    {
+      src: 'node_modules/onnxruntime-web/dist/*.wasm',
+      dest: '.',
+    },
+  ],
+});
 
 export default defineConfig({
   resolve: {
@@ -13,6 +40,7 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    vadAssets,
     VitePWA({
       registerType: 'autoUpdate',
       manifest: {

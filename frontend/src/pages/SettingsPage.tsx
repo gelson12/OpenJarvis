@@ -536,6 +536,35 @@ export function SettingsPage() {
                 />
               </button>
             </SettingRow>
+            <SettingRow
+              label="Allow interrupting while speaking"
+              description={
+                'Client-side voice activity detection (Silero ONNX). When '
+                + 'Jarvis is talking and you start speaking, TTS stops and '
+                + 'the in-flight response is cancelled within ~200 ms — '
+                + 'your interruption becomes the next turn. Without this, '
+                + 'verbal "stop" / "wait" during a response is dropped by '
+                + 'the echo guard. Requires Voice (Speech-to-Text) on.'
+              }
+            >
+              <button
+                onClick={() => { updateSettings({ bargeInEnabled: !settings.bargeInEnabled }); showSaved(); }}
+                disabled={!settings.speechEnabled}
+                className="relative w-11 h-6 rounded-full transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{
+                  background: settings.bargeInEnabled ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
+                }}
+                title={!settings.speechEnabled ? 'Enable Voice (Speech-to-Text) first' : ''}
+              >
+                <span
+                  className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform bg-white"
+                  style={{
+                    transform: settings.bargeInEnabled ? 'translateX(20px)' : 'translateX(0)',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                  }}
+                />
+              </button>
+            </SettingRow>
             <SettingRow label="Backend status" description="Requires Whisper, Deepgram, or another speech backend">
               <div className="flex items-center gap-2">
                 <span

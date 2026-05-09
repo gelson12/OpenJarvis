@@ -10,6 +10,7 @@ import {
   isSpeechRecognitionSupported,
   useVoiceListener,
 } from '../../lib/useVoiceListener';
+import { useBargeInVAD } from '../../lib/useBargeInVAD';
 import {
   classifyIntent,
   endsWithSendTrigger,
@@ -34,6 +35,7 @@ export function InputArea() {
     (s) => s.settings.alwaysListenEnabled,
   );
   const handsFreeMode = useAppStore((s) => s.settings.handsFreeMode);
+  const bargeInEnabled = useAppStore((s) => s.settings.bargeInEnabled);
   const maxTokens = useAppStore((s) => s.settings.maxTokens);
   const temperature = useAppStore((s) => s.settings.temperature);
   const createConversation = useAppStore((s) => s.createConversation);
@@ -125,6 +127,78 @@ export function InputArea() {
     }
   }, []);
   const [pendingAutoSubmit, setPendingAutoSubmit] = useState(false);
+
+  // ── Barge-in plumbing ────────────────────────────────────────────
+  // bargedInRef gates token-stream + flush calls so an in-flight SSE
+  // delta that arrives between the moment we trigger barge-in and the
+  // moment AbortError propagates does NOT speak after "cancel". Reset
+  // at the top of sendMessage so each new turn starts clean.
+  const bargedInRef = useRef(false);
+  // Tracks the latest TTS activity timestamp for self-echo suppression
+  // in the VAD hook. Updated on every onTokenStream call AND on each
+  // poll tick where synth.speaking === true.
+  const lastTtsActivityAtRef = useRef(0);
+  const lastTtsActivityAt = useCallback(() => lastTtsActivityAtRef.current, []);
+  // Poll tts.isSpeaking() so we know whether to leave VAD active during
+  // inter-sentence gaps (synth.speaking flips false briefly between
+  // sentence flushes; without polling we'd pause VAD precisely when
+  // the user is most likely to interject).
+  const [ttsSpeaking, setTtsSpeaking] = useState(false);
+  useEffect(() => {
+    if (!bargeInEnabled) return;
+    const id = setInterval(() => {
+      const speaking = tts.isSupported() && tts.isSpeaking();
+      if (speaking) lastTtsActivityAtRef.current = Date.now();
+      setTtsSpeaking((prev) => (prev === speaking ? prev : speaking));
+    }, 100);
+    return () => clearInterval(id);
+  }, [bargeInEnabled]);
+
+  // Transient "Interrupted — listening" badge, shown for 1.5 s after a
+  // barge-in fires. Lives in component state (not a ref) so it
+  // re-renders the badge automatically.
+  const [bargeInBadgeUntil, setBargeInBadgeUntil] = useState(0);
+  const showBargeInBadge = bargeInBadgeUntil > Date.now();
+  useEffect(() => {
+    if (bargeInBadgeUntil <= Date.now()) return;
+    const id = setTimeout(
+      () => setBargeInBadgeUntil(0),
+      Math.max(50, bargeInBadgeUntil - Date.now()),
+    );
+    return () => clearTimeout(id);
+  }, [bargeInBadgeUntil]);
+
+  // VAD active when streaming OR TTS audibly playing. Echo cooldown
+  // (in the hook) handles the self-trigger problem from speakers.
+  const vadActive = streamState.isStreaming || ttsSpeaking;
+  const handleBargeIn = useCallback(() => {
+    // Order matters: set the gate FIRST so any in-flight SSE delta
+    // pushed into the for-await loop doesn't make it into the TTS
+    // buffer between now and AbortError propagation.
+    bargedInRef.current = true;
+    if (tts.isSupported()) tts.cancel();
+    if (streamState.isStreaming) {
+      try {
+        abortRef.current?.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    setBargeInBadgeUntil(Date.now() + 1500);
+    useAppStore.getState().addLogEntry({
+      timestamp: Date.now(),
+      level: 'info',
+      category: 'chat',
+      message: 'Barge-in: user spoke during response (VAD)',
+    });
+  }, [streamState.isStreaming]);
+
+  useBargeInVAD({
+    enabled: bargeInEnabled && speechEnabled,
+    active: vadActive,
+    onBargeIn: handleBargeIn,
+    lastTtsActivityAt,
+  });
 
   useVoiceListener({
     enabled: continuousListenActive,
@@ -272,6 +346,9 @@ export function InputArea() {
     const content = input.trim();
     if (!content || streamState.isStreaming) return;
 
+    // Reset barge-in gate so this new turn's TTS / SSE flow normally.
+    bargedInRef.current = false;
+
     setInput('');
     // Stop any in-flight TTS before starting a new turn so the assistant
     // doesn't keep talking over the user.
@@ -407,7 +484,12 @@ export function InputArea() {
               accumulatedContent += delta.content;
               setStreamState({ content: accumulatedContent, phase: '' });
 
-              if (speechEnabled && tts.isSupported()) {
+              if (
+                speechEnabled
+                && tts.isSupported()
+                && !bargedInRef.current
+              ) {
+                lastTtsActivityAtRef.current = Date.now();
                 tts.onTokenStream(delta.content);
               }
 
@@ -422,7 +504,13 @@ export function InputArea() {
               }
             }
             if (data.choices?.[0]?.finish_reason === 'stop') {
-              if (speechEnabled && tts.isSupported()) tts.flush();
+              if (
+                speechEnabled
+                && tts.isSupported()
+                && !bargedInRef.current
+              ) {
+                tts.flush();
+              }
               break;
             }
           } catch {}
@@ -616,6 +704,21 @@ export function InputArea() {
         {voiceListenError === 'not-allowed' && (
           <span style={{ color: 'var(--color-error)' }}>
             Mic blocked — grant permission in browser to enable always-listening
+          </span>
+        )}
+        {showBargeInBadge && (
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              color: 'var(--color-accent)',
+              fontWeight: 600,
+            }}
+            title="You spoke during Jarvis's response — TTS and the in-flight stream were cancelled."
+          >
+            <Mic size={11} style={{ animation: 'pulse 0.6s ease-in-out infinite' }} />
+            Interrupted — listening
           </span>
         )}
       </div>

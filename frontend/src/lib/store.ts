@@ -90,6 +90,17 @@ interface Settings {
   // makes sense once the user has tested wake-word capture and trusts
   // the recognition for their environment.
   handsFreeMode: boolean;
+  // Barge-in: when true, a client-side VAD (Silero ONNX via
+  // @ricky0123/vad-web) listens during streaming/TTS playback. The
+  // moment the user starts speaking, we cancel TTS and abort the
+  // in-flight LLM stream so the user's interruption becomes the next
+  // turn. ON by default because the existing echo guard in
+  // useVoiceListener drops every transcript while synth.speaking is
+  // true — meaning verbal "stop" / "wait" was previously broken
+  // entirely. VAD-based barge-in is the only mechanism that catches
+  // mid-response interrupts. User can flip off in Settings to fully
+  // disable.
+  bargeInEnabled: boolean;
 }
 
 function loadSettings(): Settings {
@@ -121,6 +132,11 @@ function loadSettings(): Settings {
     // via localStorage so they're not re-opted-in on each reload.
     alwaysListenEnabled: true,
     handsFreeMode: false,
+    // Barge-in ON by default — without it, verbal stop/cancel during
+    // TTS is silently swallowed by the echo guard in useVoiceListener.
+    // The mic permission is already covered by alwaysListenEnabled,
+    // so users with voice already on don't see an extra prompt.
+    bargeInEnabled: true,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
