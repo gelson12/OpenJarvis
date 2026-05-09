@@ -115,6 +115,52 @@ export function InputArea() {
     isSpeechRecognitionSupported() &&
     !isPendingElaboration;
   const [voiceListenError, setVoiceListenError] = useState<string | null>(null);
+  // Cache the browser's actual mic permission state via the Permissions
+  // API. If permission is 'granted', we suppress the "Mic blocked" toast
+  // regardless of any stale 'not-allowed' error from a transient
+  // SpeechRecognition failure (e.g. a race with VAD's getUserMedia
+  // grabbing the mic first on page load). Without this check, the toast
+  // lies to the user after permission is granted but the listener
+  // errored once.
+  const [micPermissionState, setMicPermissionState] = useState<
+    'granted' | 'denied' | 'prompt' | 'unknown'
+  >('unknown');
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('permissions' in navigator)) {
+      return;
+    }
+    let cancelled = false;
+    let status: PermissionStatus | null = null;
+    const onChange = () => {
+      if (cancelled || !status) return;
+      setMicPermissionState(status.state as 'granted' | 'denied' | 'prompt');
+      if (status.state === 'granted') {
+        // Browser says we have mic; clear any stale "Mic blocked" toast.
+        setVoiceListenError((prev) => (prev === 'not-allowed' ? null : prev));
+      }
+    };
+    navigator.permissions
+      .query({ name: 'microphone' as PermissionName })
+      .then((s) => {
+        if (cancelled) return;
+        status = s;
+        onChange();
+        s.addEventListener('change', onChange);
+      })
+      .catch(() => {
+        // Permissions API not supported (older Safari) — leave 'unknown'.
+      });
+    return () => {
+      cancelled = true;
+      if (status) {
+        try {
+          status.removeEventListener('change', onChange);
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+  }, []);
 
   // Hands-free auto-submit timer. Cleared if the user says "wait /
   // cancel / scratch that" within ~1.5s, OR if a new transcript
@@ -708,7 +754,8 @@ export function InputArea() {
             Submitting… (say "wait" to cancel)
           </span>
         )}
-        {voiceListenError === 'not-allowed' && (
+        {voiceListenError === 'not-allowed'
+          && micPermissionState !== 'granted' && (
           <span style={{ color: 'var(--color-error)' }}>
             Mic blocked — grant permission in browser to enable always-listening
           </span>
