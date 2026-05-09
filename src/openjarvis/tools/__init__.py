@@ -161,10 +161,11 @@ try:
 except ImportError:
     pass
 
-try:
-    import openjarvis.tools.web_search_tools  # noqa: F401
-except ImportError:
-    pass
+# NOTE: web_search_tools.py was a duplicate of the existing web_search.py
+# (which already registers 'web_search' with Tavily+DDG fallback). The
+# duplicate registration crashed startup with "ToolRegistry already has
+# an entry for 'web_search'". Existing tool stays canonical; the
+# free-only DDG variant is shelved for now.
 
 # Integration tool surfaces (Obsidian vault, n8n, Railway, GitHub,
 # Cloudinary, V0, SMTP). Each registers its BaseTool subclasses via
