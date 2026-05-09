@@ -162,6 +162,43 @@ export function InputArea() {
     };
   }, []);
 
+  // Proactively trigger the browser's mic permission UI on first user
+  // interaction when state is 'prompt'. Without this, Chrome / Edge
+  // silently sit in 'prompt' state forever — VAD and SpeechRecognition
+  // both error with 'not-allowed' before the user ever sees the prompt.
+  // After the user clicks Allow, the Permissions API onchange fires and
+  // micPermissionState flips to 'granted', which clears the toast and
+  // (via the useBargeInVAD hook's userGestureSeenRef) starts VAD.
+  useEffect(() => {
+    if (micPermissionState !== 'prompt') return;
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices) return;
+    if (!alwaysListenEnabled && !bargeInEnabled) return;
+    let cancelled = false;
+    const triggerPrompt = async () => {
+      window.removeEventListener('pointerdown', triggerPrompt);
+      window.removeEventListener('keydown', triggerPrompt);
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        // We don't need this stream; MicVAD and SpeechRecognition open
+        // their own. Releasing immediately keeps the mic indicator off
+        // until those consumers actually need it.
+        if (!cancelled) stream.getTracks().forEach((t) => t.stop());
+      } catch {
+        // User denied — Permissions API onchange will flip to 'denied'
+        // and the toast will appear correctly.
+      }
+    };
+    window.addEventListener('pointerdown', triggerPrompt, { once: true });
+    window.addEventListener('keydown', triggerPrompt, { once: true });
+    return () => {
+      cancelled = true;
+      window.removeEventListener('pointerdown', triggerPrompt);
+      window.removeEventListener('keydown', triggerPrompt);
+    };
+  }, [micPermissionState, alwaysListenEnabled, bargeInEnabled]);
+
   // Hands-free auto-submit timer. Cleared if the user says "wait /
   // cancel / scratch that" within ~1.5s, OR if a new transcript
   // arrives (means the user is still speaking).
@@ -755,7 +792,7 @@ export function InputArea() {
           </span>
         )}
         {voiceListenError === 'not-allowed'
-          && micPermissionState !== 'granted' && (
+          && micPermissionState === 'denied' && (
           <span style={{ color: 'var(--color-error)' }}>
             Mic blocked — grant permission in browser to enable always-listening
           </span>
