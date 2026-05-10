@@ -115,6 +115,13 @@ export function InputArea() {
     isSpeechRecognitionSupported() &&
     !isPendingElaboration;
   const [voiceListenError, setVoiceListenError] = useState<string | null>(null);
+  // Tracks whether SpeechRecognition has ever fired onstart successfully
+  // this session. Once true, we know the mic is actually accessible and
+  // suppress any stale 'not-allowed' error toast — even if the Permissions
+  // API is returning stale 'denied' state (e.g. user changed the setting
+  // in the browser UI after a previous denial; the change event doesn't
+  // always fire for settings-level changes, so the API can lag behind).
+  const [micEverStarted, setMicEverStarted] = useState(false);
   // Cache the browser's actual mic permission state via the Permissions
   // API. If permission is 'granted', we suppress the "Mic blocked" toast
   // regardless of any stale 'not-allowed' error from a transient
@@ -285,6 +292,13 @@ export function InputArea() {
 
   useVoiceListener({
     enabled: continuousListenActive,
+    // Force a recognition restart whenever the Permissions API state
+    // changes to 'granted'. If recognition previously stopped with
+    // 'not-allowed' (stopped=true inside the hook), the effect won't
+    // auto-restart — changing restartKey tears down the old instance
+    // and creates a fresh one that can succeed now that permission is
+    // actually granted.
+    restartKey: micPermissionState,
     onTranscript: (transcript) => {
       const text = transcript.trim();
       if (!text) return;
@@ -402,6 +416,18 @@ export function InputArea() {
       });
     },
     onError: (errorCode) => {
+      // Don't surface a 'not-allowed' error when the Permissions API
+      // already confirms access is granted, or when recognition has
+      // successfully started at least once this session. Both signals
+      // mean the mic IS accessible — the error is transient (e.g. a
+      // race with VAD's getUserMedia on page load) and should not
+      // produce a "Mic blocked" toast.
+      if (
+        errorCode === 'not-allowed' &&
+        (micPermissionState === 'granted' || micEverStarted)
+      ) {
+        return;
+      }
       setVoiceListenError(errorCode);
     },
     onStarted: () => {
@@ -409,6 +435,7 @@ export function InputArea() {
       // toast from a previous session where permission hadn't been
       // granted yet. Otherwise the toast lies indefinitely after the
       // user grants permission.
+      setMicEverStarted(true);
       setVoiceListenError(null);
     },
   });
@@ -792,7 +819,8 @@ export function InputArea() {
           </span>
         )}
         {voiceListenError === 'not-allowed'
-          && micPermissionState === 'denied' && (
+          && !micEverStarted
+          && micPermissionState !== 'granted' && (
           <span style={{ color: 'var(--color-error)' }}>
             Mic blocked — grant permission in browser to enable always-listening
           </span>

@@ -75,6 +75,14 @@ interface UseVoiceListenerOptions {
   onStarted?: () => void;
   /** ISO language tag, default 'en-US'. */
   lang?: string;
+  /**
+   * Opaque value — when this changes the recognition instance is torn down
+   * and restarted from scratch. Use this to force a restart after the user
+   * grants mic permission in browser settings: the Permissions API onChange
+   * event fires, the caller increments this key, and the hook re-runs its
+   * effect so recognition can succeed where it previously got 'not-allowed'.
+   */
+  restartKey?: unknown;
 }
 
 /**
@@ -87,6 +95,7 @@ export function useVoiceListener({
   onError,
   onStarted,
   lang = 'en-US',
+  restartKey,
 }: UseVoiceListenerOptions): void {
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   // Capture latest callbacks so the effect doesn't tear down on every render
@@ -188,5 +197,6 @@ export function useVoiceListener({
       }
       recognitionRef.current = null;
     };
-  }, [enabled, lang]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, lang, restartKey]);
 }
