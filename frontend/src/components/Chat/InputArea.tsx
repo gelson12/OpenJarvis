@@ -285,6 +285,7 @@ export function InputArea() {
 
   useVoiceListener({
     enabled: continuousListenActive,
+    micPermissionState,
     onTranscript: (transcript) => {
       const text = transcript.trim();
       if (!text) return;
@@ -294,8 +295,6 @@ export function InputArea() {
       if (isAbort(text)) {
         cancelAutoSubmit();
         setPendingAutoSubmit(false);
-        // If they're aborting, also clear what's in the input box so
-        // we don't accidentally submit half a thought.
         setInput('');
         return;
       }
@@ -311,20 +310,10 @@ export function InputArea() {
       }
 
       // Decide whether THIS transcript should populate the input box.
-      // - wake: agent-prefix command; strip the wake word, treat the rest
-      //   as the message
-      // - speech: regular utterance, append as-is
-      // - affirmative / negative: short reply ("yes", "no", "yes send it",
-      //   "sure", "not now"). These previously dropped on the floor when
-      //   no ElaborationBanner was up, which broke confirmation prompts —
-      //   the agent would say "Say 'yes, send it' to confirm" and the
-      //   user's spoken yes would silently vanish. Treat them as speech
-      //   so they reach the input + submit path. Reply-as-speech is also
-      //   what a typed user would do — the model sees "yes" with the
-      //   prior assistant confirmation in context and fires the tool.
       let toAppend = '';
       let cameFromWakeWord = false;
       let cameFromShortReply = false;
+
       if (intent === 'wake') {
         const command = stripWakeWord(text);
         if (command) {
@@ -337,35 +326,27 @@ export function InputArea() {
         toAppend = text;
         cameFromShortReply = true;
       }
+
       if (!toAppend) return;
 
-      // Strip a trailing "over / send it / go" if present — that's
-      // the submission cue, not part of the message.
       const hasSendTrigger = endsWithSendTrigger(toAppend);
       if (hasSendTrigger) {
         toAppend = stripCloseTrigger(toAppend);
       }
 
-      // Append to existing input (so two utterances combine), or
-      // populate fresh if empty.
       setInput((prev) => {
         const next = prev.trim() ? `${prev} ${toAppend}` : toAppend;
 
-        // SUBMIT TRIGGER 1 — explicit close phrase, fire immediately.
         if (hasSendTrigger && next.trim()) {
           cancelAutoSubmit();
-          // Defer one tick so React state settles before submit reads it.
           setTimeout(() => sendMessage(), 0);
           return next;
         }
 
-        // SUBMIT TRIGGER 2 — hands-free mode + wake-word command +
-        // substantial content + silence. Schedule a delayed submit.
-        // A new transcript will reset this; abort phrase will cancel.
         if (
-          handsFreeMode
-          && cameFromWakeWord
-          && next.trim().split(/\s+/).length >= 3
+          handsFreeMode &&
+          cameFromWakeWord &&
+          next.trim().split(/\s+/).length >= 3
         ) {
           cancelAutoSubmit();
           setPendingAutoSubmit(true);
@@ -375,15 +356,6 @@ export function InputArea() {
             sendMessage();
           }, 1500);
         } else if (cameFromShortReply && prev.trim() === '') {
-          // SUBMIT TRIGGER 3 — bare "yes" / "no" / "sure" with an empty
-          // input box. Treat as a confirmation reply and auto-submit
-          // after a short pause so the user can say "yes please" without
-          // racing the timer. Skipped if the input already has content
-          // (the short reply is then treated as part of a longer thought).
-          // Works regardless of handsFreeMode because confirmation flows
-          // are the one case where a one-word answer is the COMPLETE
-          // intended message — and the user has just been told to say
-          // exactly that.
           cancelAutoSubmit();
           setPendingAutoSubmit(true);
           autoSubmitTimerRef.current = setTimeout(() => {
@@ -392,8 +364,6 @@ export function InputArea() {
             sendMessage();
           }, 800);
         } else {
-          // New incoming speech that isn't a wake-word command — reset
-          // any pending auto-submit (the user is still speaking).
           cancelAutoSubmit();
           setPendingAutoSubmit(false);
         }
@@ -405,13 +375,10 @@ export function InputArea() {
       setVoiceListenError(errorCode);
     },
     onStarted: () => {
-      // Listener fired up successfully — clear any stale "Mic blocked"
-      // toast from a previous session where permission hadn't been
-      // granted yet. Otherwise the toast lies indefinitely after the
-      // user grants permission.
       setVoiceListenError(null);
     },
   });
+
 
   // Clean up the auto-submit timer on unmount.
   useEffect(() => () => cancelAutoSubmit(), [cancelAutoSubmit]);
