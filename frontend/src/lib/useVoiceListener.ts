@@ -11,12 +11,10 @@
 //     a long silence); we restart in onend whenever `enabled` is true,
 //     so the listener feels truly continuous from the user's perspective
 //
-// Call sites:
-//   - ElaborationBanner: ephemeral listening (~30s window for yes/no after
-//     a "may I elaborate?" prompt)
-//   - InputArea / dashboard: always-on listening when the user has the
-//     toggle enabled — every final transcript gets routed through
-//     classifyIntent() to decide what to do with it
+// Recovery note (important):
+// Some browsers can emit a transient 'not-allowed' during permission races.
+// If the caller tells us mic permission is actually 'granted', we should not
+// permanently latch a fatal stopped state for that instance.
 
 import { useEffect, useRef } from 'react';
 
@@ -32,7 +30,7 @@ interface SpeechRecognitionEventLike {
 }
 
 interface SpeechRecognitionErrorEventLike {
-  error: string;  // 'no-speech' | 'audio-capture' | 'not-allowed' | ...
+  error: string; // 'no-speech' | 'audio-capture' | 'not-allowed' | ...
   message?: string;
 }
 
@@ -63,6 +61,8 @@ export function isSpeechRecognitionSupported(): boolean {
   );
 }
 
+type MicPermissionState = 'granted' | 'denied' | 'prompt' | 'unknown';
+
 interface UseVoiceListenerOptions {
   enabled: boolean;
   /** Called for every FINAL transcript (interim results are filtered out). */
@@ -75,6 +75,9 @@ interface UseVoiceListenerOptions {
   onStarted?: () => void;
   /** ISO language tag, default 'en-US'. */
   lang?: string;
+
+  /** Caller-reported mic permission state from Permissions API (when available). */
+  micPermissionState?: MicPermissionState;
 }
 
 /**
@@ -86,22 +89,26 @@ export function useVoiceListener({
   onTranscript,
   onError,
   onStarted,
+  micPermissionState = 'unknown',
   lang = 'en-US',
 }: UseVoiceListenerOptions): void {
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  // Capture latest callbacks so the effect doesn't tear down on every render
+
+  // Capture latest callbacks/state so the effect doesn't tear down on every render
   const onTranscriptRef = useRef(onTranscript);
   const onErrorRef = useRef(onError);
   const onStartedRef = useRef(onStarted);
+  const micPermissionStateRef = useRef(micPermissionState);
+
   onTranscriptRef.current = onTranscript;
   onErrorRef.current = onError;
   onStartedRef.current = onStarted;
+  micPermissionStateRef.current = micPermissionState;
 
   useEffect(() => {
     if (!enabled || !isSpeechRecognitionSupported()) return;
 
-    const Ctor =
-      window.SpeechRecognition || window.webkitSpeechRecognition!;
+    const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition!;
     const recognition = new Ctor();
     recognition.continuous = true;
     recognition.interimResults = true;
@@ -110,72 +117,54 @@ export function useVoiceListener({
     let stopped = false;
 
     recognition.onresult = (ev: SpeechRecognitionEventLike) => {
-      // Walk the new results from resultIndex onwards; emit only finals
       for (let i = ev.resultIndex; i < ev.results.length; i++) {
         const result = ev.results[i];
-        if (result.isFinal) {
-          const transcript = result[0]?.transcript ?? '';
-          if (!transcript.trim()) continue;
-          // Echo guard: if browser TTS is CURRENTLY emitting audio, the
-          // mic is almost certainly picking up Jarvis's own voice and
-          // SpeechRecognition is treating it as user input. Drop those
-          // transcripts to avoid feedback loops where the assistant's
-          // own utterance becomes the next user message.
-          //
-          // Only check `synth.speaking`, NOT `synth.pending`. `pending`
-          // means "an utterance is queued but not yet started" — common
-          // when a second ElaborationBanner stacks while the first is
-          // still awaiting yes/no, leaving `pending` stuck true while
-          // the user is trying to confirm. The original guard checked
-          // both and produced a dead listener that silently swallowed
-          // every "yes". `speaking` alone is the narrow signal that
-          // matters: if Jarvis is audibly talking right now, ignore
-          // the mic; otherwise let transcripts through.
-          const synth =
-            typeof window !== 'undefined' ? window.speechSynthesis : null;
-          if (synth && synth.speaking) {
-            continue;
-          }
-          onTranscriptRef.current(transcript);
-        }
+        if (!result.isFinal) continue;
+
+        const transcript = result[0]?.transcript ?? '';
+        if (!transcript.trim()) continue;
+
+        // Echo guard: if browser TTS is currently speaking, ignore mic input.
+        const synth = typeof window !== 'undefined' ? window.speechSynthesis : null;
+        if (synth && synth.speaking) continue;
+
+        onTranscriptRef.current(transcript);
       }
     };
 
     recognition.onstart = () => {
-      // Listener is actually running — clear any sticky 'not-allowed'
-      // toast left over from a prior session that errored before mic
-      // permission was granted. Without this, the user grants perm,
-      // listener starts succeeding, but the red banner persists
-      // indefinitely.
       onStartedRef.current?.();
     };
 
     recognition.onerror = (ev: SpeechRecognitionErrorEventLike) => {
-      // Non-fatal — silence/audio-glitch errors auto-recover via onend.
-      if (ev.error === 'no-speech' || ev.error === 'audio-capture') {
-        return;
-      }
-      // Fatal — surface so UI can show a hint.
+      // Ignore non-fatal “silence/audio glitch” errors.
+      if (ev.error === 'no-speech' || ev.error === 'audio-capture') return;
+
       onErrorRef.current?.(ev.error);
-      stopped = true;  // don't auto-restart on permission denial
+
+      // Only latch fatal stopped=true on not-allowed if we *know* permission is denied.
+      if (ev.error === 'not-allowed') {
+        if (micPermissionStateRef.current !== 'granted') {
+          stopped = true;
+        }
+      } else {
+        stopped = true;
+      }
     };
 
     recognition.onend = () => {
-      // Browsers (especially Chrome) end recognition after periods of
-      // silence. While `enabled` is still true, restart so the listener
-      // truly stays on.
       if (stopped) return;
       try {
         recognition.start();
       } catch {
-        // start() throws if already started — safe to ignore.
+        // start() can throw if already started — ignore.
       }
     };
 
     try {
       recognition.start();
       recognitionRef.current = recognition;
-    } catch (exc) {
+    } catch {
       onErrorRef.current?.('start-failed');
     }
 
