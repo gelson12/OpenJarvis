@@ -2,10 +2,12 @@ import { useState, useCallback } from 'react';
 import {
   LiveKitRoom,
   RoomAudioRenderer,
+  StartAudio,
   BarVisualizer,
   VoiceAssistantControlBar,
   useVoiceAssistant,
 } from '@livekit/components-react';
+import { MediaDeviceFailure } from 'livekit-client';
 
 interface ConnectionDetails {
   serverUrl: string;
@@ -14,9 +16,9 @@ interface ConnectionDetails {
   participantToken: string;
 }
 
-// The shared secret is baked at build time. It is defense-in-depth only —
-// the real gate is OpenJarvis's server-side HTTP Basic Auth, which the
-// same-origin fetch carries automatically via the browser credential cache.
+// Defense-in-depth only — the real gate is OpenJarvis's server-side HTTP
+// Basic Auth, which the same-origin fetch carries automatically. Baked at
+// build time via the Dockerfile ARG VITE_VOICE_SECRET.
 const VOICE_SECRET: string =
   ((import.meta as unknown as { env?: Record<string, string> }).env
     ?.VITE_VOICE_SECRET as string) || '';
@@ -41,16 +43,24 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
         style={{ color: 'var(--color-accent, #1fd5f9)' }}
       />
 
+      {/* Plays the agent's audio track */}
       <RoomAudioRenderer />
+
+      {/* Only renders when the browser autoplay policy blocks playback;
+          hides itself once the user taps and audio is unblocked. This is
+          the fix for "browser is blocking the audio". */}
+      <StartAudio
+        label="🔊 Tap to enable Jarvis audio"
+        className="rounded-full px-6 py-2 text-sm font-medium"
+        style={{ background: 'var(--color-accent, #1fd5f9)', color: '#04121a' }}
+      />
+
       <VoiceAssistantControlBar />
 
       <button
         onClick={onEnd}
         className="rounded-full px-6 py-2 text-sm font-medium transition-opacity hover:opacity-80"
-        style={{
-          background: 'var(--color-error, #e5484d)',
-          color: 'white',
-        }}
+        style={{ background: 'var(--color-error, #e5484d)', color: 'white' }}
       >
         End session
       </button>
@@ -75,7 +85,11 @@ export function VoicePage() {
         },
       });
       if (!res.ok) {
-        throw new Error(`Token request failed (HTTP ${res.status})`);
+        const detail =
+          res.status === 403
+            ? 'Voice secret mismatch (set VITE_VOICE_SECRET and LIVEKIT_TOKEN_SHARED_SECRET to the same value, then redeploy).'
+            : `Token request failed (HTTP ${res.status}).`;
+        throw new Error(detail);
       }
       setConn((await res.json()) as ConnectionDetails);
     } catch (e) {
@@ -86,6 +100,19 @@ export function VoicePage() {
   }, []);
 
   const handleEnd = useCallback(() => setConn(null), []);
+
+  const handleMediaFailure = useCallback((failure?: MediaDeviceFailure) => {
+    setConn(null);
+    if (failure === MediaDeviceFailure.PermissionDenied) {
+      setError(
+        'Microphone blocked. Click the camera/mic icon in your browser address bar, allow the microphone, then try again.'
+      );
+    } else if (failure === MediaDeviceFailure.NotFound) {
+      setError('No microphone found. Connect a mic and try again.');
+    } else {
+      setError('Could not access the microphone. Check browser permissions.');
+    }
+  }, []);
 
   if (conn) {
     return (
@@ -98,6 +125,7 @@ export function VoicePage() {
           video={false}
           onDisconnected={handleEnd}
           onError={(e) => setError(e.message)}
+          onMediaDeviceFailure={handleMediaFailure}
           className="flex items-center justify-center"
         >
           <VoiceSession onEnd={handleEnd} />
@@ -108,10 +136,7 @@ export function VoicePage() {
 
   return (
     <div className="flex h-full w-full flex-col items-center justify-center gap-5 p-8">
-      <h1
-        className="text-2xl font-semibold"
-        style={{ color: 'var(--color-text)' }}
-      >
+      <h1 className="text-2xl font-semibold" style={{ color: 'var(--color-text)' }}>
         Talk to Jarvis
       </h1>
       <p
@@ -123,7 +148,7 @@ export function VoicePage() {
 
       {error && (
         <div
-          className="rounded-md px-4 py-2 text-sm"
+          className="max-w-md rounded-md px-4 py-2 text-center text-sm"
           style={{ color: 'var(--color-error, #e5484d)' }}
         >
           {error}

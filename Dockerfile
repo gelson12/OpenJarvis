@@ -4,6 +4,14 @@ FROM node:22-slim AS frontend
 WORKDIR /app
 COPY frontend/ ./frontend/
 RUN cd frontend && npm ci --ignore-scripts 2>/dev/null || npm install
+
+# Shared-secret for the LiveKit token endpoint, baked into the SPA at
+# build time so the browser can send the X-Voice-Secret header. Railway
+# passes the service variable of the same name as a build arg. Empty by
+# default (gate then relies solely on OpenJarvis HTTP Basic Auth).
+ARG VITE_VOICE_SECRET=""
+ENV VITE_VOICE_SECRET=${VITE_VOICE_SECRET}
+
 RUN cd frontend && npm run build
 
 # Stage 2: Build Python package
