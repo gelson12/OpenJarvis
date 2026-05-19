@@ -11,6 +11,7 @@ import {
   useTranscriptions,
   useLocalParticipant,
   useTracks,
+  useDataChannel,
 } from '@livekit/components-react';
 import { Track, MediaDeviceFailure } from 'livekit-client';
 import { motion } from 'motion/react';
@@ -155,6 +156,25 @@ function SelfView() {
   );
 }
 
+// Receives structured UI commands from the worker over the LiveKit data
+// channel (topic "ui-command"). Today: voice-controlled camera toggle —
+// the worker parses the camera on/off intent server-side and sends a
+// structured command, so we never parse transcription text here.
+function UiCommandBridge() {
+  const { localParticipant } = useLocalParticipant();
+  useDataChannel('ui-command', (msg) => {
+    try {
+      const data = JSON.parse(new TextDecoder().decode(msg.payload));
+      if (data?.type === 'camera') {
+        void localParticipant.setCameraEnabled(Boolean(data.enabled));
+      }
+    } catch {
+      // Malformed / unknown command — ignore.
+    }
+  });
+  return null;
+}
+
 function VoiceSession({ onEnd }: { onEnd: () => void }) {
   return (
     <div className="relative flex h-full w-full flex-col">
@@ -198,6 +218,7 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
 
       <RoomAudioRenderer />
       <SelfView />
+      <UiCommandBridge />
     </div>
   );
 }
