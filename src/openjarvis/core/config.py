@@ -1614,6 +1614,15 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
     if not config_path.exists() and cfg.security.profile:
         apply_security_profile(cfg.security, cfg.server)
 
+    # Env override: register external MCP servers without shipping a TOML
+    # config into the container. OPENJARVIS_MCP_SERVERS is a JSON list of
+    # server configs, same shape builder._discover_external_mcp expects,
+    # e.g. '[{"name":"desktop-win","url":"https://host/mcp"}]'. Takes
+    # precedence over any [tools.mcp].servers from the config file.
+    _mcp_env = os.environ.get("OPENJARVIS_MCP_SERVERS")
+    if _mcp_env and _mcp_env.strip():
+        cfg.tools.mcp.servers = _mcp_env.strip()
+
     return cfg
 
 

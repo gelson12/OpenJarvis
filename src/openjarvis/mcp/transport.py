@@ -110,10 +110,12 @@ class StreamableHTTPTransport(MCPTransport):
         *,
         connect_timeout: float = 10.0,
         request_timeout: float = 60.0,
+        headers: Optional[dict] = None,
     ) -> None:
         import httpx
 
         self._url = url
+        self._extra_headers = dict(headers) if headers else {}
         self._session_id: Optional[str] = None
         self._client = httpx.Client(
             timeout=httpx.Timeout(
@@ -137,6 +139,9 @@ class StreamableHTTPTransport(MCPTransport):
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
+        # Caller-supplied headers (e.g. Authorization for a tunneled
+        # desktop MCP server). Set first so protocol headers always win.
+        headers.update(self._extra_headers)
         if self._session_id is not None:
             headers["Mcp-Session-Id"] = self._session_id
         return headers

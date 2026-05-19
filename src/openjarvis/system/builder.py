@@ -603,7 +603,9 @@ class SystemBuilder:
         args = cfg.get("args", [])
 
         if url:
-            transport = StreamableHTTPTransport(url=url)
+            transport = StreamableHTTPTransport(
+                url=url, headers=cfg.get("headers") or None
+            )
         elif command:
             transport = StdioTransport(command=[command] + args)
         else:
