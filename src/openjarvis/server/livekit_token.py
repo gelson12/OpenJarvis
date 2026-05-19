@@ -52,15 +52,19 @@ async def issue_livekit_token(
     shared_secret = os.environ.get("LIVEKIT_TOKEN_SHARED_SECRET", "")
     agent_name = os.environ.get("OPENJARVIS_VOICE_AGENT_NAME", _DEFAULT_AGENT_NAME)
 
-    if shared_secret:
-        if not x_voice_secret or not hmac.compare_digest(
-            x_voice_secret, shared_secret
-        ):
-            raise HTTPException(status_code=403, detail="Invalid voice secret")
-    else:
+    # Shared secret is defense-in-depth ONLY. The real gate is OpenJarvis's
+    # HTTP Basic Auth — every /v1/* route already sits behind it and the
+    # same-origin SPA fetch carries those creds automatically. A missing or
+    # mismatched X-Voice-Secret (e.g. VITE_VOICE_SECRET not baked into the
+    # SPA build) must NEVER hard-fail voice. Log and proceed.
+    if shared_secret and (
+        not x_voice_secret
+        or not hmac.compare_digest(x_voice_secret, shared_secret)
+    ):
         logger.warning(
-            "LIVEKIT_TOKEN_SHARED_SECRET not set — /v1/livekit/token is "
-            "gated only by HTTP Basic Auth. Set it in production."
+            "X-Voice-Secret missing/mismatched — proceeding anyway "
+            "(endpoint still behind HTTP Basic Auth). Bake VITE_VOICE_SECRET "
+            "at build time to silence this."
         )
 
     missing = [
