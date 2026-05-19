@@ -1,13 +1,19 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   LiveKitRoom,
   RoomAudioRenderer,
   StartAudio,
   BarVisualizer,
   VoiceAssistantControlBar,
+  TrackToggle,
+  VideoTrack,
   useVoiceAssistant,
+  useTranscriptions,
+  useLocalParticipant,
+  useTracks,
 } from '@livekit/components-react';
-import { MediaDeviceFailure } from 'livekit-client';
+import { Track, MediaDeviceFailure } from 'livekit-client';
+import { motion } from 'motion/react';
 
 interface ConnectionDetails {
   serverUrl: string;
@@ -17,53 +23,172 @@ interface ConnectionDetails {
 }
 
 // Defense-in-depth only — the real gate is OpenJarvis's server-side HTTP
-// Basic Auth, which the same-origin fetch carries automatically. Baked at
+// Basic Auth, carried automatically by the same-origin fetch. Baked at
 // build time via the Dockerfile ARG VITE_VOICE_SECRET.
 const VOICE_SECRET: string =
   ((import.meta as unknown as { env?: Record<string, string> }).env
     ?.VITE_VOICE_SECRET as string) || '';
 
-function VoiceSession({ onEnd }: { onEnd: () => void }) {
+// Per-state look for the "alive" core.
+const CORE_BY_STATE: Record<
+  string,
+  { glow: string; scale: number[]; dur: number; label: string }
+> = {
+  listening: { glow: '#1fd5f9', scale: [1, 1.06, 1], dur: 2.4, label: 'Listening' },
+  thinking: { glow: '#a855f7', scale: [1, 1.12, 1], dur: 1.1, label: 'Thinking' },
+  speaking: { glow: '#22e0a1', scale: [1, 1.18, 1], dur: 0.7, label: 'Speaking' },
+  initializing: { glow: '#64748b', scale: [1, 1.03, 1], dur: 3, label: 'Waking up' },
+  disconnected: { glow: '#64748b', scale: [1, 1.02, 1], dur: 3.5, label: 'Connecting' },
+};
+
+function AliveCore() {
   const { state, audioTrack } = useVoiceAssistant();
+  const look = CORE_BY_STATE[state] ?? CORE_BY_STATE.disconnected;
 
   return (
-    <div className="flex flex-col items-center gap-8">
-      <div
-        className="text-sm uppercase tracking-widest"
-        style={{ color: 'var(--color-text-muted)' }}
-      >
-        {state === 'disconnected' ? 'Connecting…' : `Jarvis · ${state}`}
-      </div>
-
+    <div className="relative flex h-72 w-72 items-center justify-center">
+      {/* outer breathing halo */}
+      <motion.div
+        className="absolute inset-0 rounded-full"
+        style={{ background: `radial-gradient(circle, ${look.glow}33 0%, transparent 70%)` }}
+        animate={{ scale: look.scale, opacity: [0.5, 0.85, 0.5] }}
+        transition={{ duration: look.dur, repeat: Infinity, ease: 'easeInOut' }}
+      />
+      {/* inner core ring */}
+      <motion.div
+        className="absolute h-44 w-44 rounded-full border"
+        style={{ borderColor: `${look.glow}aa`, boxShadow: `0 0 60px ${look.glow}66` }}
+        animate={{ scale: look.scale, rotate: state === 'thinking' ? 360 : 0 }}
+        transition={{
+          scale: { duration: look.dur, repeat: Infinity, ease: 'easeInOut' },
+          rotate: { duration: 6, repeat: Infinity, ease: 'linear' },
+        }}
+      />
+      {/* audio-reactive bars at the centre */}
       <BarVisualizer
         state={state}
         trackRef={audioTrack}
-        barCount={7}
-        className="h-40 w-72"
-        style={{ color: 'var(--color-accent, #1fd5f9)' }}
+        barCount={5}
+        className="h-24 w-40"
+        style={{ color: look.glow }}
       />
-
-      {/* Plays the agent's audio track */}
-      <RoomAudioRenderer />
-
-      {/* Only renders when the browser autoplay policy blocks playback;
-          hides itself once the user taps and audio is unblocked. This is
-          the fix for "browser is blocking the audio". */}
-      <StartAudio
-        label="🔊 Tap to enable Jarvis audio"
-        className="rounded-full px-6 py-2 text-sm font-medium"
-        style={{ background: 'var(--color-accent, #1fd5f9)', color: '#04121a' }}
-      />
-
-      <VoiceAssistantControlBar />
-
-      <button
-        onClick={onEnd}
-        className="rounded-full px-6 py-2 text-sm font-medium transition-opacity hover:opacity-80"
-        style={{ background: 'var(--color-error, #e5484d)', color: 'white' }}
+      <div
+        className="absolute -bottom-2 text-xs uppercase tracking-[0.3em]"
+        style={{ color: 'var(--color-text-muted)' }}
       >
-        End session
-      </button>
+        Jarvis · {look.label}
+      </div>
+    </div>
+  );
+}
+
+function Transcript() {
+  const segments = useTranscriptions();
+  const { localParticipant } = useLocalParticipant();
+  const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [segments.length]);
+
+  if (segments.length === 0) {
+    return (
+      <p className="text-center text-xs" style={{ color: 'var(--color-text-muted)' }}>
+        Say something — the transcript will appear here.
+      </p>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {segments.map((seg, i) => {
+        const mine = seg.participantInfo?.identity === localParticipant?.identity;
+        return (
+          <div
+            key={`${seg.participantInfo?.identity ?? 'agent'}-${i}`}
+            className={`flex ${mine ? 'justify-end' : 'justify-start'}`}
+          >
+            <div
+              className="max-w-[80%] rounded-2xl px-4 py-2 text-sm"
+              style={{
+                background: mine
+                  ? 'var(--color-accent, #1fd5f9)'
+                  : 'var(--color-bg-secondary, #1e293b)',
+                color: mine ? '#04121a' : 'var(--color-text)',
+              }}
+            >
+              <div
+                className="mb-0.5 text-[10px] uppercase tracking-wider opacity-70"
+              >
+                {mine ? 'You' : 'Jarvis'}
+              </div>
+              {seg.text}
+            </div>
+          </div>
+        );
+      })}
+      <div ref={endRef} />
+    </div>
+  );
+}
+
+function SelfView() {
+  const tracks = useTracks([Track.Source.Camera]);
+  const cam = tracks.find((t) => t.participant?.isLocal && t.publication);
+  if (!cam) return null;
+  return (
+    <div
+      className="absolute bottom-4 right-4 h-28 w-40 overflow-hidden rounded-lg border"
+      style={{ borderColor: 'var(--color-accent, #1fd5f9)' }}
+    >
+      <VideoTrack trackRef={cam} className="h-full w-full object-cover" />
+    </div>
+  );
+}
+
+function VoiceSession({ onEnd }: { onEnd: () => void }) {
+  return (
+    <div className="relative flex h-full w-full flex-col">
+      {/* Alive core */}
+      <div className="flex flex-1 items-center justify-center">
+        <AliveCore />
+      </div>
+
+      {/* Transcript */}
+      <div
+        className="mx-auto mb-4 max-h-52 w-full max-w-2xl overflow-y-auto rounded-xl p-4"
+        style={{ background: 'var(--color-surface, #0b1220)' }}
+      >
+        <Transcript />
+      </div>
+
+      {/* Controls */}
+      <div className="mb-4 flex items-center justify-center gap-3">
+        <VoiceAssistantControlBar />
+        <TrackToggle
+          source={Track.Source.Camera}
+          showIcon
+          className="rounded-full px-4 py-2 text-sm font-medium"
+          style={{ background: 'var(--color-bg-secondary, #1e293b)', color: 'var(--color-text)' }}
+        >
+          Camera
+        </TrackToggle>
+        <StartAudio
+          label="🔊 Enable audio"
+          className="rounded-full px-4 py-2 text-sm font-medium"
+          style={{ background: 'var(--color-accent, #1fd5f9)', color: '#04121a' }}
+        />
+        <button
+          onClick={onEnd}
+          className="rounded-full px-5 py-2 text-sm font-medium transition-opacity hover:opacity-80"
+          style={{ background: 'var(--color-error, #e5484d)', color: 'white' }}
+        >
+          End session
+        </button>
+      </div>
+
+      <RoomAudioRenderer />
+      <SelfView />
     </div>
   );
 }
@@ -85,11 +210,7 @@ export function VoicePage() {
         },
       });
       if (!res.ok) {
-        const detail =
-          res.status === 403
-            ? 'Voice secret mismatch (set VITE_VOICE_SECRET and LIVEKIT_TOKEN_SHARED_SECRET to the same value, then redeploy).'
-            : `Token request failed (HTTP ${res.status}).`;
-        throw new Error(detail);
+        throw new Error(`Token request failed (HTTP ${res.status}).`);
       }
       setConn((await res.json()) as ConnectionDetails);
     } catch (e) {
@@ -102,21 +223,20 @@ export function VoicePage() {
   const handleEnd = useCallback(() => setConn(null), []);
 
   const handleMediaFailure = useCallback((failure?: MediaDeviceFailure) => {
-    setConn(null);
     if (failure === MediaDeviceFailure.PermissionDenied) {
       setError(
-        'Microphone blocked. Click the camera/mic icon in your browser address bar, allow the microphone, then try again.'
+        'Microphone/camera blocked. Allow it via the icon in your browser address bar, then try again.'
       );
     } else if (failure === MediaDeviceFailure.NotFound) {
-      setError('No microphone found. Connect a mic and try again.');
+      setError('No microphone found. Connect one and try again.');
     } else {
-      setError('Could not access the microphone. Check browser permissions.');
+      setError('Could not access the microphone/camera. Check browser permissions.');
     }
   }, []);
 
   if (conn) {
     return (
-      <div className="flex h-full w-full items-center justify-center p-8">
+      <div className="h-full w-full p-6">
         <LiveKitRoom
           serverUrl={conn.serverUrl}
           token={conn.participantToken}
@@ -126,7 +246,7 @@ export function VoicePage() {
           onDisconnected={handleEnd}
           onError={(e) => setError(e.message)}
           onMediaDeviceFailure={handleMediaFailure}
-          className="flex items-center justify-center"
+          className="h-full w-full"
         >
           <VoiceSession onEnd={handleEnd} />
         </LiveKitRoom>

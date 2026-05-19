@@ -48,7 +48,7 @@ def create_security_middleware() -> Any:
             # microphone=(self) so the same-origin LiveKit voice UI can
             # call getUserMedia. camera/geolocation stay disabled.
             response.headers["Permissions-Policy"] = (
-                "camera=(), microphone=(self), geolocation=()"
+                "camera=(self), microphone=(self), geolocation=()"
             )
             # connect-src/media-src/worker-src added so the browser can
             # reach the LiveKit signalling server (wss) + its audio
@@ -73,7 +73,7 @@ SECURITY_HEADERS = {
     "X-XSS-Protection": "1; mode=block",
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Permissions-Policy": "camera=(), microphone=(self), geolocation=()",
+    "Permissions-Policy": "camera=(self), microphone=(self), geolocation=()",
     "Content-Security-Policy": (
         "default-src 'self' 'unsafe-inline' 'unsafe-eval'; "
         "connect-src 'self' https://*.livekit.cloud wss://*.livekit.cloud; "
