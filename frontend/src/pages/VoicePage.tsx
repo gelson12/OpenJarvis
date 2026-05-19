@@ -14,6 +14,15 @@ import {
 } from '@livekit/components-react';
 import { Track, MediaDeviceFailure } from 'livekit-client';
 import { motion } from 'motion/react';
+import {
+  useVoiceListener,
+  isSpeechRecognitionSupported,
+} from '../lib/useVoiceListener';
+import { classifyIntent } from '../lib/voice_intents';
+import {
+  useMicPermission,
+  useMicPromptOnGesture,
+} from '../lib/useMicPermission';
 
 interface ConnectionDetails {
   serverUrl: string;
@@ -234,6 +243,35 @@ export function VoicePage() {
     }
   }, []);
 
+  // ── Hands-free wake-word ────────────────────────────────────────────
+  // While disconnected, run continuous browser SpeechRecognition. Saying
+  // "Jarvis" / "Hey Jarvis" / "wake up" triggers the exact same start()
+  // path as the manual button. The listener auto-tears-down the moment we
+  // begin connecting (enabled → false), so it releases the mic before
+  // LiveKitRoom grabs it — no contention.
+  const listening = !conn && !connecting;
+  const { state: micPermissionState } = useMicPermission();
+  useMicPromptOnGesture(listening, micPermissionState);
+  useVoiceListener({
+    enabled: listening,
+    micPermissionState,
+    onTranscript: (t) => {
+      if (connecting || conn) return; // re-entrancy guard
+      if (classifyIntent(t) === 'wake') start();
+    },
+    onError: (code) => {
+      if (code === 'not-allowed') {
+        setError(
+          "Microphone blocked. Allow it via the address-bar icon to use 'Hey Jarvis'."
+        );
+      }
+    },
+  });
+  const wakeArmed =
+    listening &&
+    isSpeechRecognitionSupported() &&
+    micPermissionState !== 'denied';
+
   if (conn) {
     return (
       <div className="h-full w-full p-6">
@@ -283,6 +321,15 @@ export function VoicePage() {
       >
         {connecting ? 'Connecting…' : 'Talk to Jarvis'}
       </button>
+
+      {wakeArmed && (
+        <p
+          className="text-xs"
+          style={{ color: 'var(--color-text-muted)' }}
+        >
+          🎙️ Listening for “Hey Jarvis”…
+        </p>
+      )}
     </div>
   );
 }

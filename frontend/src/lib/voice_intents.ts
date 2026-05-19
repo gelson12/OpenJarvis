@@ -77,6 +77,7 @@ const WAKE_PATTERNS = [
   /\bhey jarvis\b/i,
   /\bok jarvis\b/i,
   /\bok\.? jarvis\b/i,
+  /\bwake up\b/i,   // bare hands-free activation phrase
   /\bcomputer\b/,  // Star Trek mode
 ];
 
