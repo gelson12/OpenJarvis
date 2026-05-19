@@ -281,17 +281,27 @@ export function VoicePage() {
       if (classifyIntent(t) === 'wake') start();
     },
     onError: (code) => {
-      if (code === 'not-allowed') {
+      // Only surface a hard error when the Permissions API actually says
+      // 'denied'. A 'not-allowed' while still in 'prompt'/'unknown' is the
+      // benign cold-start race — the user just hasn't granted yet; the
+      // gesture helper + the effect re-arm (on micPermissionState change)
+      // recover automatically, so a scary toast here is wrong.
+      if (code === 'not-allowed' && micPermissionState === 'denied') {
         setError(
           "Microphone blocked. Allow it via the address-bar icon to use 'Hey Jarvis'."
         );
       }
     },
   });
+  const speechSupported = isSpeechRecognitionSupported();
   const wakeArmed =
+    listening && speechSupported && micPermissionState === 'granted';
+  // Cold start: mic not yet granted but usable — tell the user the one
+  // gesture that unlocks hands-free (browser mic permission needs it).
+  const wakeNeedsGesture =
     listening &&
-    isSpeechRecognitionSupported() &&
-    micPermissionState !== 'denied';
+    speechSupported &&
+    (micPermissionState === 'prompt' || micPermissionState === 'unknown');
 
   if (conn) {
     return (
@@ -348,7 +358,15 @@ export function VoicePage() {
           className="text-xs"
           style={{ color: 'var(--color-text-muted)' }}
         >
-          🎙️ Listening for “Hey Jarvis”…
+          🎙️ Listening — just say “Hey Jarvis”
+        </p>
+      )}
+      {wakeNeedsGesture && (
+        <p
+          className="text-xs"
+          style={{ color: 'var(--color-text-muted)' }}
+        >
+          🎙️ Click anywhere once to enable hands-free, then say “Hey Jarvis”
         </p>
       )}
     </div>

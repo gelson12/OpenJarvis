@@ -107,6 +107,11 @@ export function useVoiceListener({
 
   useEffect(() => {
     if (!enabled || !isSpeechRecognitionSupported()) return;
+    // Don't even construct recognition while the mic is denied — it would
+    // just error 'not-allowed' on a loop. We re-run (see deps) the moment
+    // the Permissions API reports a different state, so a later 'granted'
+    // gets a FRESH recognition instance instead of a dead latched one.
+    if (micPermissionState === 'denied') return;
 
     const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition!;
     const recognition = new Ctor();
@@ -177,5 +182,10 @@ export function useVoiceListener({
       }
       recognitionRef.current = null;
     };
-  }, [enabled, lang]);
+    // micPermissionState IS a dependency: when it flips to 'granted'
+    // after the user allows the mic, this effect re-runs and creates a
+    // fresh, working recognition instance (the old one had latched
+    // stopped=true on the initial 'not-allowed'). This is the fix for
+    // hands-free wake-word never engaging on a cold first visit.
+  }, [enabled, lang, micPermissionState]);
 }
