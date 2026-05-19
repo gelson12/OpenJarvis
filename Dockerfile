@@ -21,12 +21,16 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src/ src/
 COPY rust/ rust/
+# LiveKit voice worker is co-located in this image (single-service
+# deployment): its code + deps must be present alongside the API server.
+COPY livekit/ livekit/
 
 # Copy built frontend into the server static directory
 COPY --from=frontend /app/src/openjarvis/server/static src/openjarvis/server/static/
 
 RUN pip install --no-cache-dir uv && \
-    uv pip install --system ".[server,memory-obsidian,inference-cloud,browser]"
+    uv pip install --system ".[server,memory-obsidian,inference-cloud,browser]" && \
+    uv pip install --system -r livekit/requirements.txt
 
 # Stage 3: Runtime
 FROM python:3.12-slim-bookworm
@@ -59,6 +63,13 @@ ARG BUILD_TIME=unknown
 ENV OPENJARVIS_GIT_COMMIT=${RAILWAY_GIT_COMMIT_SHA}
 ENV OPENJARVIS_BUILD_TIME=${BUILD_TIME}
 
-EXPOSE 8000
+# Pre-download the Silero VAD model so the voice worker doesn't stall on
+# first job fetching it. Non-fatal: it will lazy-download if this skips.
+RUN python -c "from livekit.plugins import silero; silero.VAD.load()" 2>/dev/null || \
+    echo "Silero VAD prefetch skipped; worker will download it on first job"
 
-CMD exec jarvis serve --host 0.0.0.0 --port ${PORT:-8000}
+EXPOSE 8080
+
+# Single container runs BOTH the OpenJarvis API server and the LiveKit
+# voice worker (see livekit/start.sh). No separate worker service needed.
+CMD ["bash", "/app/livekit/start.sh"]
