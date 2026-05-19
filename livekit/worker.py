@@ -28,7 +28,13 @@ Environment variables:
   OPENJARVIS_BASIC_AUTH_USER    - Basic Auth user (match OpenJarvis service)
   OPENJARVIS_BASIC_AUTH_PASSWORD- Basic Auth password (match OpenJarvis service)
   OPENJARVIS_API_KEY            - Bearer key; used only if Basic Auth vars unset
-  OPENJARVIS_MODEL              - model label sent in the request (default: openjarvis)
+  OPENJARVIS_MODEL              - model name OpenJarvis routes on. MUST be a
+                                  name its MultiEngine accepts: a discovered
+                                  model or a cloud-prefixed id (gpt-*, o1-*,
+                                  o3-*, o4-*, claude-*, gemini-*, openrouter/*).
+                                  Default: openrouter/auto (works with just
+                                  OPENROUTER_API_KEY on the OpenJarvis service).
+                                  Override e.g. openrouter/anthropic/claude-sonnet-4
 """
 
 import os
@@ -101,7 +107,7 @@ async def entrypoint(ctx: agents.JobContext):
         "OPENJARVIS_URL", "http://localhost:8000"
     ).rstrip("/")
     openjarvis_key = os.environ.get("OPENJARVIS_API_KEY", "basic-auth")
-    model_name = os.environ.get("OPENJARVIS_MODEL", "openjarvis")
+    model_name = os.environ.get("OPENJARVIS_MODEL", "openrouter/auto")
 
     try:
         stt = deepgram.STT()
