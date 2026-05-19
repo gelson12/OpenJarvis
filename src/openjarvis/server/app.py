@@ -326,6 +326,16 @@ def create_app(
         except Exception as exc:
             logger.debug("Webhook routes init skipped: %s", exc)
 
+    # LiveKit voice token endpoint — registered before the SPA catch-all
+    # so POST /v1/livekit/token is matched as an API route, not swallowed
+    # by the index.html fallback.
+    try:
+        from openjarvis.server.livekit_token import router as livekit_token_router
+
+        app.include_router(livekit_token_router)
+    except Exception as exc:
+        logger.debug("LiveKit token route init skipped: %s", exc)
+
     # Serve static frontend assets if the static/ directory exists
     static_dir = pathlib.Path(__file__).parent / "static"
     if static_dir.is_dir():
