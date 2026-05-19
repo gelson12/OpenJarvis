@@ -233,12 +233,17 @@ class AgentStreamBridge:
         request: ChatCompletionRequest,
         *,
         memory_backend: object | None = None,
+        openai_strict: bool = False,
     ) -> None:
         self._agent = agent
         self._bus = bus
         self._model = model
         self._request = request
         self._memory_backend = memory_backend
+        # When True (set by a plain OpenAI client like the LiveKit voice
+        # worker), suppress OpenJarvis's custom `event:` SSE messages so
+        # the stream is strictly OpenAI-compatible (chunks + [DONE] only).
+        self._openai_strict = openai_strict
         self._chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         self._queue: asyncio.Queue = asyncio.Queue()
         self._callbacks: dict[EventType, object] = {}
@@ -463,7 +468,7 @@ class AgentStreamBridge:
 
                 if isinstance(item, Event):
                     sse_name = _EVENT_MAP.get(item.event_type)
-                    if sse_name:
+                    if sse_name and not self._openai_strict:
                         yield self._format_named_event(sse_name, item.data)
 
             # Agent is done -- retrieve result
@@ -513,7 +518,7 @@ class AgentStreamBridge:
                     }
                 )
 
-            if tool_results_data:
+            if tool_results_data and not self._openai_strict:
                 yield self._format_named_event(
                     "tool_results",
                     {"results": tool_results_data},
@@ -711,10 +716,13 @@ async def create_agent_stream(
     request: ChatCompletionRequest,
     *,
     memory_backend: object | None = None,
+    openai_strict: bool = False,
 ) -> StreamingResponse:
     """Create an AgentStreamBridge and return a FastAPI StreamingResponse."""
     bridge = AgentStreamBridge(
-        agent, bus, model, request, memory_backend=memory_backend,
+        agent, bus, model, request,
+        memory_backend=memory_backend,
+        openai_strict=openai_strict,
     )
     return StreamingResponse(
         bridge.stream(),

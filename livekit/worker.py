@@ -130,7 +130,13 @@ async def entrypoint(ctx: agents.JobContext):
             model=model_name,
             base_url=f"{openjarvis_url}/v1",
             api_key=openjarvis_key,
-            extra_headers=_openjarvis_auth_headers(),
+            extra_headers={
+                **_openjarvis_auth_headers(),
+                # Tell OpenJarvis to emit a STRICT OpenAI SSE stream
+                # (only chat chunks + [DONE]) — the LiveKit LLM client
+                # crashes on OpenJarvis's custom `event:` UI events.
+                "X-OpenJarvis-Stream": "openai",
+            },
         ),
         tts=tts,
     )

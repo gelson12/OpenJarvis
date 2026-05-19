@@ -526,8 +526,18 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         # so it can't stream tokens in real-time).  For plain chat, stream
         # directly from the engine for true token-by-token output.
         if agent is not None and bus is not None and request_body.tools:
+            # Plain OpenAI clients (e.g. the LiveKit voice worker) send
+            # X-OpenJarvis-Stream: openai and need a strict OpenAI SSE
+            # stream — no custom `event:` UI messages, which crash the
+            # OpenAI client parser with "choices is None".
+            openai_strict = (
+                request.headers.get("x-openjarvis-stream", "").strip().lower()
+                == "openai"
+            )
             return await _handle_agent_stream(
-                agent, bus, model, request_body, memory_backend=memory_backend,
+                agent, bus, model, request_body,
+                memory_backend=memory_backend,
+                openai_strict=openai_strict,
             )
         return await _handle_stream(
             engine, model, request_body, complexity_info,
@@ -678,12 +688,16 @@ def _handle_agent(
     )
 
 
-async def _handle_agent_stream(agent, bus, model, req, *, memory_backend=None):
+async def _handle_agent_stream(
+    agent, bus, model, req, *, memory_backend=None, openai_strict=False
+):
     """Stream agent response with EventBus events via SSE."""
     from openjarvis.server.stream_bridge import create_agent_stream
 
     return await create_agent_stream(
-        agent, bus, model, req, memory_backend=memory_backend,
+        agent, bus, model, req,
+        memory_backend=memory_backend,
+        openai_strict=openai_strict,
     )
 
 
