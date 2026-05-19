@@ -5,17 +5,36 @@ Bridges LiveKit voice sessions to OpenJarvis's /v1/chat/completions endpoint.
 All intelligence (tools, memory, multi-LLM routing) lives in OpenJarvis.
 This worker handles: VAD, STT (Deepgram), voice loop, TTS (Deepgram).
 
-Environment variables required:
-  LIVEKIT_URL          - wss://your-server.livekit.cloud
-  LIVEKIT_API_KEY      - LiveKit API key
-  LIVEKIT_API_SECRET   - LiveKit API secret
-  DEEPGRAM_API_KEY     - Deepgram API key (for STT + TTS)
-  OPENJARVIS_URL       - URL of the OpenJarvis service
-  OPENJARVIS_API_KEY   - API key matching OPENJARVIS_API_KEY on that service
+AUTH NOTE:
+  OpenJarvis gates /v1/* behind HTTP Basic Auth whenever
+  OPENJARVIS_BASIC_AUTH_USER + OPENJARVIS_BASIC_AUTH_PASSWORD are set on
+  the OpenJarvis service (this is the production configuration). The
+  LiveKit openai plugin would otherwise send 'Authorization: Bearer ...',
+  which the Basic Auth gate rejects with 401. So we precompute and force
+  a Basic auth header from env vars (no secrets hardcoded).
+
+  If OpenJarvis is instead run with OPENJARVIS_AUTH_ENABLED=true (Bearer
+  mode) and no Basic Auth, leave the BASIC_AUTH_* vars unset and set
+  OPENJARVIS_API_KEY instead — the plugin's default Bearer auth is used.
+
+Environment variables:
+  LIVEKIT_URL                   - wss://your-server.livekit.cloud
+  LIVEKIT_API_KEY               - LiveKit API key
+  LIVEKIT_API_SECRET            - LiveKit API secret
+  DEEPGRAM_API_KEY              - Deepgram API key (STT + TTS)
+  OPENJARVIS_URL                - OpenJarvis base URL
+                                  private: http://openjarvis.railway.internal:8000
+                                  public : https://openjarvis-production-92cf.up.railway.app
+  OPENJARVIS_BASIC_AUTH_USER    - Basic Auth user (match OpenJarvis service)
+  OPENJARVIS_BASIC_AUTH_PASSWORD- Basic Auth password (match OpenJarvis service)
+  OPENJARVIS_API_KEY            - Bearer key; used only if Basic Auth vars unset
+  OPENJARVIS_MODEL              - model label sent in the request (default: openjarvis)
 """
 
 import os
+import base64
 import logging
+
 from dotenv import load_dotenv
 from livekit import agents
 from livekit.agents import AgentSession, Agent, RoomInputOptions
@@ -46,6 +65,25 @@ CAPABILITY:
 """
 
 
+def _openjarvis_auth_headers() -> dict:
+    """Force the Authorization header OpenJarvis actually accepts.
+
+    Production OpenJarvis runs the Basic Auth gate. The openai plugin's
+    default 'Bearer <api_key>' would be rejected with 401, so when the
+    Basic Auth env vars are present we override Authorization with a
+    precomputed Basic token. Returns {} when Basic Auth is not configured
+    (the plugin then falls back to its default Bearer auth).
+    """
+    user = os.environ.get("OPENJARVIS_BASIC_AUTH_USER", "")
+    password = os.environ.get("OPENJARVIS_BASIC_AUTH_PASSWORD", "")
+    if user and password:
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        logger.info("OpenJarvis auth: HTTP Basic (user=%s)", user)
+        return {"Authorization": f"Basic {token}"}
+    logger.info("OpenJarvis auth: Bearer (OPENJARVIS_API_KEY)")
+    return {}
+
+
 def prewarm(proc: agents.JobProcess):
     """Pre-load VAD model once per worker process to avoid cold-start delay."""
     proc.userdata["vad"] = silero.VAD.load()
@@ -59,8 +97,11 @@ class Assistant(Agent):
 async def entrypoint(ctx: agents.JobContext):
     await ctx.connect()
 
-    openjarvis_url = os.environ.get("OPENJARVIS_URL", "http://localhost:8000")
-    openjarvis_key = os.environ.get("OPENJARVIS_API_KEY", "default-key-change-me")
+    openjarvis_url = os.environ.get(
+        "OPENJARVIS_URL", "http://localhost:8000"
+    ).rstrip("/")
+    openjarvis_key = os.environ.get("OPENJARVIS_API_KEY", "basic-auth")
+    model_name = os.environ.get("OPENJARVIS_MODEL", "openjarvis")
 
     try:
         stt = deepgram.STT()
@@ -80,9 +121,10 @@ async def entrypoint(ctx: agents.JobContext):
         vad=ctx.proc.userdata["vad"],
         stt=stt,
         llm=openai.LLM(
-            model="openjarvis",
+            model=model_name,
             base_url=f"{openjarvis_url}/v1",
             api_key=openjarvis_key,
+            extra_headers=_openjarvis_auth_headers(),
         ),
         tts=tts,
     )
@@ -99,6 +141,7 @@ async def entrypoint(ctx: agents.JobContext):
 if __name__ == "__main__":
     agents.cli.run_app(
         agents.WorkerOptions(
+            agent_name="openjarvis-agent",
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
         )
