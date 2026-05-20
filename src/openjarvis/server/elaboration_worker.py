@@ -17,6 +17,7 @@ import asyncio
 import difflib
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from openjarvis.server import claude_cli_client
@@ -295,6 +296,73 @@ _TRIVIAL_MESSAGES: frozenset[str] = frozenset({
 })
 
 
+# ── Topic-coherence gate (Phase B, opt-in) ──────────────────────────
+# Fires elaboration only when the user has stayed on a coherent topic
+# across the recent turns. Lightweight Jaccard on content words — no
+# embedding model needed; the worker stays lean.
+_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+    "has", "have", "he", "her", "him", "his", "how", "i", "if", "in", "is",
+    "it", "its", "me", "my", "of", "on", "or", "our", "she", "so", "that",
+    "the", "their", "them", "they", "this", "to", "was", "we", "were",
+    "what", "when", "where", "which", "who", "why", "will", "with", "you",
+    "your", "do", "does", "did", "can", "could", "would", "should", "shall",
+    "would", "may", "might", "just", "about", "into", "out", "up", "down",
+    "over", "under", "again", "also", "than", "then", "there", "here", "now",
+})
+
+
+def _content_words(text: str) -> set[str]:
+    if not text:
+        return set()
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return {t for t in tokens if len(t) > 2 and t not in _STOPWORDS}
+
+
+def _topic_coherent(
+    messages: list[dict[str, Any]],
+    *,
+    window: int,
+    threshold: float,
+) -> bool:
+    """True if the last ``window`` user turns share a topic.
+
+    Computes Jaccard similarity over content-word sets between adjacent
+    pairs of recent user turns and requires AT LEAST ONE pair to clear
+    ``threshold``. That's the "2-3 consecutive contextual topics"
+    intent: not three turns in lockstep, but a coherent chain that
+    connects at least two of the recent turns.
+    """
+    user_texts: list[str] = []
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            user_texts.append(content)
+        elif isinstance(content, list):
+            # Multi-modal: keep text parts only.
+            parts = [
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            if parts:
+                user_texts.append(" ".join(parts))
+    recent = user_texts[-window:]
+    if len(recent) < 2:
+        return False  # need at least two turns to be 'coherent'
+    sets = [_content_words(t) for t in recent]
+    for a, b in zip(sets, sets[1:]):
+        union = a | b
+        if not union:
+            continue
+        jaccard = len(a & b) / len(union)
+        if jaccard >= threshold:
+            return True
+    return False
+
+
 def _is_trivial_question(text: str) -> bool:
     """True if the user's message is a greeting/ack and elaboration
     would be noise. Compares lowercased + stripped + punctuation-stripped
@@ -347,6 +415,29 @@ async def spawn_elaboration(
             "Elaboration: skipping trivial question %r", original_question[:60],
         )
         return None
+
+    # Phase B opt-in: only fire elaboration when the recent user turns
+    # share a topic. Off by default so existing Phase A behaviour is
+    # unchanged unless explicitly enabled.
+    if os.environ.get("ELABORATION_REQUIRE_TOPIC_COHERENCE", "").lower() in (
+        "1", "true", "yes",
+    ):
+        try:
+            window = int(os.environ.get("ELABORATION_TOPIC_WINDOW", "3"))
+        except ValueError:
+            window = 3
+        try:
+            threshold = float(
+                os.environ.get("ELABORATION_TOPIC_THRESHOLD", "0.25")
+            )
+        except ValueError:
+            threshold = 0.25
+        if not _topic_coherent(messages, window=window, threshold=threshold):
+            logger.debug(
+                "Elaboration: skipping — last %d user turns not topic-coherent",
+                window,
+            )
+            return None
 
     store = get_store()
     elab = await store.create(

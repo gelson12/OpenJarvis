@@ -40,10 +40,13 @@ Environment variables:
 import os
 import re
 import json
+import time
 import base64
+import random
 import asyncio
 import logging
 
+import httpx
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import AgentSession, Agent, RoomInputOptions, StopResponse
@@ -224,6 +227,63 @@ async def _describe_frame(frame: rtc.VideoFrame) -> str | None:
         return None
 
 
+# ── Elaboration (proactive Claude-CLI follow-up) ─────────────────────
+# OpenJarvis's routes.py:745 already spawns a slow-track elaboration for
+# every /v1/chat/completions request, voice included. The worker just
+# needs to SURFACE it through Aura — saying the polite prompt with the
+# agent's actual voice, listening for spoken yes/no via the existing STT
+# path, and speaking the full Claude-CLI answer on accept. No browser
+# banner is mounted on the Voice page (browser TTS + browser
+# SpeechRecognition would fight LiveKit for mic + speakers).
+_ELAB_DEADLINE_S = 30.0  # mirrors LISTEN_TIMEOUT_MS in ElaborationBanner
+
+# Polite spoken openers — short, voice-friendly, mirror the chat banner.
+_POLITE_PROMPTS = (
+    "If I may, sir — would you like me to expand on that?",
+    "There's a touch more on this if you'd care to hear it, sir.",
+    "Shall I dig a little deeper, sir?",
+    "Care for a fuller answer, sir?",
+)
+
+# Voice intent classification — Python port of voice_intents.ts so we
+# can match the spoken yes/no without a round-trip to the frontend.
+_AFFIRM_RE = re.compile(
+    r"\b("
+    r"yes|yeah|yep|yup|sure|ok(?:ay)?|please|"
+    r"go ahead|go on|carry on|proceed|continue|"
+    r"of course|certainly|absolutely|"
+    r"elaborat\w*|expand|tell me more|do it|send it|fire (?:it|away)"
+    r")\b",
+    re.I,
+)
+_NEGATIVE_RE = re.compile(
+    r"\b(no|nope|not now|not yet|skip|dismiss|later|nah|no thanks?|no thank you)\b",
+    re.I,
+)
+_STOP_RE = re.compile(
+    r"\b(stop|cancel|never ?mind|abort|forget it|quiet|shut up)\b",
+    re.I,
+)
+
+
+def _classify_intent(text: str) -> str:
+    """Return 'affirmative' | 'negative' | 'stop' | 'speech'.
+
+    Stop beats negative beats affirmative — a "cancel" should never be
+    misread as a yes even if the rest of the phrase rambles politely.
+    """
+    if not text:
+        return "speech"
+    t = text.strip().lower()
+    if _STOP_RE.search(t):
+        return "stop"
+    if _NEGATIVE_RE.search(t):
+        return "negative"
+    if _AFFIRM_RE.search(t):
+        return "affirmative"
+    return "speech"
+
+
 class Assistant(Agent):
     def __init__(self, room: rtc.Room):
         super().__init__(instructions=AGENT_INSTRUCTION)
@@ -232,6 +292,13 @@ class Assistant(Agent):
         self._latest_frame: rtc.VideoFrame | None = None
         self._video_tasks: set[asyncio.Task] = set()
         self._wire_video(room)
+        # Elaboration state — set by the SSE listener, cleared on the
+        # next user turn (yes/no) or when the deadline passes.
+        self._pending_elab_id: str | None = None
+        self._pending_elab_deadline: float = 0.0
+        self._elab_task: asyncio.Task | None = None
+        self._oj_base: str = ""
+        self._oj_auth: dict = {}
 
     # ── Camera track capture ─────────────────────────────────────────
     def _wire_video(self, room: rtc.Room) -> None:
@@ -268,14 +335,156 @@ class Assistant(Agent):
                         self._video_tasks.add(t)
                         t.add_done_callback(self._video_tasks.discard)
 
-    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        """Intercept camera on/off before it reaches the LLM.
+    # ── Elaboration bridge (proactive Claude-CLI follow-up) ──────────
+    def start_elaboration_listener(
+        self, openjarvis_url: str, auth_headers: dict
+    ) -> None:
+        """Subscribe to OpenJarvis's elaborations SSE in the background.
 
-        Sends a structured data-channel command to the browser and speaks
-        a short confirmation, then short-circuits the turn (no LLM round
-        trip) so "turn the camera on" never becomes a chat message.
+        Idempotent — repeated calls leave the existing task running.
+        """
+        self._oj_base = openjarvis_url.rstrip("/")
+        self._oj_auth = dict(auth_headers)
+        if self._elab_task is not None and not self._elab_task.done():
+            return
+        self._elab_task = asyncio.create_task(self._consume_elab_stream())
+
+    async def _consume_elab_stream(self) -> None:
+        """Long-lived SSE consumer with exponential backoff (cap 30 s).
+
+        Parses MCP-style server-sent events (event: + data:) and routes
+        them to _handle_elab_event.
+        """
+        url = f"{self._oj_base}/v1/elaborations/stream"
+        headers = {**self._oj_auth, "Accept": "text/event-stream"}
+        backoff = 1.0
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream("GET", url, headers=headers) as r:
+                        r.raise_for_status()
+                        backoff = 1.0
+                        event_name: str | None = None
+                        data_lines: list[str] = []
+                        async for line in r.aiter_lines():
+                            if line == "":
+                                if event_name and data_lines:
+                                    payload = "\n".join(data_lines)
+                                    await self._handle_elab_event(
+                                        event_name, payload
+                                    )
+                                event_name = None
+                                data_lines = []
+                                continue
+                            if line.startswith(":"):
+                                continue  # SSE comment / heartbeat
+                            if line.startswith("event:"):
+                                event_name = line[6:].strip()
+                            elif line.startswith("data:"):
+                                data_lines.append(line[5:].lstrip())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "elaboration SSE disconnected (%s); reconnecting in %.0fs",
+                    exc,
+                    backoff,
+                )
+                await asyncio.sleep(min(backoff, 30.0))
+                backoff = min(backoff * 2.0, 30.0)
+
+    async def _handle_elab_event(self, event: str, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return
+
+        if event == "proposed":
+            elab_id = data.get("id")
+            if not elab_id:
+                return
+            # If a previous elaboration is still pending, dismiss it so
+            # we never queue overlapping spoken prompts.
+            if self._pending_elab_id and self._pending_elab_id != elab_id:
+                old = self._pending_elab_id
+                asyncio.create_task(self._elab_dismiss(old))
+            self._pending_elab_id = elab_id
+            self._pending_elab_deadline = time.time() + _ELAB_DEADLINE_S
+            polite = random.choice(_POLITE_PROMPTS)
+            try:
+                await self.session.say(polite)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("session.say polite prompt failed: %s", exc)
+            return
+
+        if event == "accepted_full":
+            answer = (
+                data.get("claude_answer") or data.get("answer") or ""
+            ).strip()
+            if not answer:
+                return
+            try:
+                await self.session.say(answer)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("session.say elaboration answer failed: %s", exc)
+            if self._pending_elab_id == data.get("id"):
+                self._pending_elab_id = None
+            return
+
+        if event in ("dismissed", "discarded", "failed"):
+            if self._pending_elab_id == data.get("id"):
+                self._pending_elab_id = None
+            return
+
+    async def _elab_post(self, path: str) -> None:
+        url = f"{self._oj_base}{path}"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, headers=self._oj_auth)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("elaboration POST %s failed: %s", path, exc)
+
+    async def _elab_accept(self, elab_id: str) -> None:
+        await self._elab_post(f"/v1/elaborations/{elab_id}/accept")
+
+    async def _elab_dismiss(self, elab_id: str) -> None:
+        await self._elab_post(f"/v1/elaborations/{elab_id}/dismiss")
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """Intercept commands before they reach the LLM.
+
+        Order matters:
+        1. Pending elaboration yes/no — short-circuit (don't treat "yes"
+           as a new question; clean up stale prompts past the deadline).
+        2. Camera on/off — structured data-channel command + confirmation.
+        3. Vision intent — inject a frame description so OpenJarvis can
+           answer as if it can see.
         """
         text = getattr(new_message, "text_content", "") or ""
+
+        # 0) Pending elaboration yes/no — must run BEFORE camera/vision
+        # so "yes" doesn't accidentally trigger something else.
+        if self._pending_elab_id:
+            if time.time() < self._pending_elab_deadline:
+                intent = _classify_intent(text)
+                if intent == "affirmative":
+                    elab_id = self._pending_elab_id
+                    self._pending_elab_id = None
+                    await self._elab_accept(elab_id)
+                    raise StopResponse()
+                if intent in ("negative", "stop"):
+                    elab_id = self._pending_elab_id
+                    self._pending_elab_id = None
+                    await self._elab_dismiss(elab_id)
+                    raise StopResponse()
+                # Else: user is continuing the conversation — leave the
+                # elaboration pending until the deadline; don't speak the
+                # polite prompt again.
+            else:
+                # Deadline elapsed before any yes/no — silently dismiss.
+                elab_id = self._pending_elab_id
+                self._pending_elab_id = None
+                asyncio.create_task(self._elab_dismiss(elab_id))
 
         # 1) Camera on/off — structured command, short-circuit the turn.
         want = _camera_intent(text)
@@ -358,12 +567,19 @@ async def entrypoint(ctx: agents.JobContext):
         tts=tts,
     )
 
+    assistant = Assistant(ctx.room)
     await session.start(
         room=ctx.room,
-        agent=Assistant(ctx.room),
+        agent=assistant,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC()
         ),
+    )
+    # Subscribe to OpenJarvis's elaboration SSE so we can surface the
+    # slow-track Claude-CLI follow-up through Aura. Loopback in the
+    # single-container deploy; Basic Auth header reused.
+    assistant.start_elaboration_listener(
+        openjarvis_url, _openjarvis_auth_headers()
     )
 
 
