@@ -3,18 +3,19 @@
 > 🎯 **Why this doc exists.** OpenJarvis's `livekit/worker.py` is the production-grade
 > LiveKit channel for a *framework*. But a minimal reference also exists in the wild:
 > [**gelson12/friday_jarvis2**](https://github.com/gelson12/friday_jarvis2) — a
-> two-branch tutorial-derived voice agent (`br` = Python worker, `LiveKit` = Next.js
-> UI). Reading this doc lets you see, side-by-side, **what you get from OpenJarvis
-> that a minimal LiveKit voice agent does not** — and where the minimal one is, in
-> fact, the right call.
+> three-branch tutorial-derived voice agent (`main` = Google TTS variant, `br` =
+> Deepgram-Aura variant, `LiveKit` = Next.js UI). Reading this doc lets you see,
+> side-by-side, **what you get from OpenJarvis that a minimal LiveKit voice agent
+> does not** — and where the minimal one is, in fact, the right call.
 
-## 🗂️ Table of contents — the three sections
+## 🗂️ Table of contents — the sections
 
 | § | Title | What it covers |
 |---|---|---|
 | 1️⃣ | 🐍 [**`br` branch** deep-dive](#-the-br-branch--the-voice) | The minimal Python LiveKit worker — *the agent half* of friday_jarvis2 |
 | 2️⃣ | ⚛️ [**`LiveKit` branch** deep-dive](#%EF%B8%8F-the-livekit-branch--the-face) | The minimal Next.js custom UI — *the frontend half* of friday_jarvis2 |
-| 3️⃣ | 🏛️ [**OpenJarvis vs friday_jarvis2**](#%EF%B8%8F-zoom-out--friday_jarvis2-vs-the-entire-openjarvis-project) | Platform vs product — coding, infra, worker, versatility, self-learning |
+| 3️⃣ | 🌿 [**`main` sibling branch**](#-sibling-branch--main-the-tts-only-variant) | The TTS-only variant (Google Cloud TTS instead of Deepgram Aura) — A/B sibling of `br` |
+| 4️⃣ | 🏛️ [**OpenJarvis vs friday_jarvis2**](#%EF%B8%8F-zoom-out--friday_jarvis2-vs-the-entire-openjarvis-project) | Platform vs product — coding, infra, worker, versatility, self-learning |
 
 > 📍 You are reading this on the **`livekit` branch of OpenJarvis**, next to
 > `livekit/worker.py`. The same content is mirrored on both friday_jarvis2 branches
@@ -226,6 +227,51 @@ The **only shared contract** is the LiveKit project: `LIVEKIT_URL`, `LIVEKIT_API
 - [ ] 🤝 Both services share the same `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`.
 - [ ] 🌍 Both services in the same Railway region (latency).
 - [ ] 🗣️ Open the UI, click **Talk to Friday**, hear a reply within ~1–2 s.
+
+---
+
+# 🌿 Sibling branch — `main` (the TTS-only variant)
+
+> 🧪 **What `main` is for:** an A/B-test sibling of `br`. They are **byte-identical except for one TTS provider call** — kept as a controlled experiment so any latency / quality / cost delta can be attributed cleanly to the TTS provider alone.
+
+## 🔬 The whole functional diff (literally one line)
+
+```diff
+- # TTS: Google Cloud only        (main — baseline)
++ # TTS: Deepgram Aura            (br   — low-latency contender)
+
+- tts = google.TTS()
++ tts = deepgram.TTS()
+```
+
+Everything else — STT chain, LLM (Hermes via openai plugin), VAD (Silero), noise cancellation (BVC), session shape, prompts, Dockerfile, `railway.json` — is identical between `main` and `br`.
+
+## 🚫 Common mis-rememberings (set the record straight)
+
+- ❌ **`main` does NOT use Gemini.** Neither branch uses Gemini. The Google product on `main` is **Google Cloud Text-to-Speech** (a TTS service), not the Gemini LLM. The LLM on both branches is **Hermes** (called via the OpenAI plugin's wire format with model id `"hermes-agent"`).
+- ❌ **No custom voice-assistance worker.** Both `main` and `br` use the **stock `livekit-agents` worker pattern** — same `agent.py` skeleton, same `WorkerOptions(entrypoint_fnc, prewarm_fnc)`, same automatic dispatch. The only customisation is the provider choices inside `entrypoint`.
+
+## 📋 `main` vs `br` vs `LiveKit` at-a-glance
+
+| 🔍 Aspect | 🪴 `main` | 🐍 `br` | ⚛️ `LiveKit` |
+|---|---|---|---|
+| Role | Python voice agent | Python voice agent | Next.js UI |
+| 🔊 **TTS** | **Google Cloud TTS** | **Deepgram Aura** ⚡ | n/a |
+| 🎤 STT | Deepgram → Google | Deepgram → Google | n/a |
+| 🧠 LLM | Hermes (`hermes-agent`) | Hermes (`hermes-agent`) | none |
+| 👂 VAD | Silero | Silero | n/a |
+| 🛡️ Noise cancel | BVC | BVC | n/a |
+| 🤖 Custom worker? | ❌ stock livekit-agents | ❌ stock livekit-agents | n/a (HTTP server) |
+| 🪂 TTS fallback? | ❌ fail-fast | ❌ fail-fast | n/a |
+| 🎯 Purpose | Baseline (Google) | Low-latency contender | Custom UI |
+
+## 🎯 Which one to actually deploy
+
+- ⚡ **`br`** for production — Deepgram Aura is the streaming TTS with the lowest TTFB; that's why our LiveKit-branch UI is wired to it.
+- 🧪 **`main`** for A/B comparison only — kept around so you can flip back and re-measure if Deepgram Aura's quality or pricing ever changes.
+- 🎨 **`LiveKit`** is the *frontend*, orthogonal — it doesn't care which TTS branch is running, as long as one of them is registered to the LiveKit project.
+
+> 💡 **Mental model:** `main` and `br` are the *same agent with a different voice*. `LiveKit` is the *face that talks to whichever voice is registered*.
 
 ---
 
