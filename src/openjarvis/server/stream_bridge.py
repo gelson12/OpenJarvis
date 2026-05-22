@@ -459,10 +459,51 @@ class AgentStreamBridge:
             )
             yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-            # Drain queue until the agent finishes
+            # Drain queue until the agent finishes. agent.run() executes in
+            # a background thread and — for openai_strict consumers (the
+            # LiveKit voice worker) — emits nothing onto the wire until it
+            # completes. A tool-using turn can take many seconds, so without
+            # a keepalive the consumer's read-timeout fires mid-think and the
+            # whole reply is lost. Send an empty-delta chunk every few seconds
+            # to keep the connection's read clock alive; bail out after a hard
+            # cap so a genuinely hung agent.run() can't wedge the worker.
+            _silent = 0.0
+            _SILENCE_CAP = 120.0
             while True:
-                item = await self._queue.get()
+                try:
+                    item = await asyncio.wait_for(
+                        self._queue.get(), timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    _silent += 2.0
+                    if _silent >= _SILENCE_CAP:
+                        timeout_chunk = ChatCompletionChunk(
+                            id=self._chunk_id,
+                            model=self._model,
+                            choices=[
+                                StreamChoice(
+                                    delta=DeltaMessage(
+                                        content="Sorry, sir — that took too "
+                                        "long. Please try again."
+                                    ),
+                                    finish_reason="stop",
+                                )
+                            ],
+                        )
+                        yield f"data: {timeout_chunk.model_dump_json()}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    # Keepalive: a valid OpenAI SSE chunk with an empty delta
+                    # — no visible content, but it resets the read timeout.
+                    keepalive = ChatCompletionChunk(
+                        id=self._chunk_id,
+                        model=self._model,
+                        choices=[StreamChoice(delta=DeltaMessage())],
+                    )
+                    yield f"data: {keepalive.model_dump_json()}\n\n"
+                    continue
 
+                _silent = 0.0
                 if item is _DONE:
                     break
 
