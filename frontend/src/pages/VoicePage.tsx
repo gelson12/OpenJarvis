@@ -15,15 +15,6 @@ import {
 } from '@livekit/components-react';
 import { Track, MediaDeviceFailure } from 'livekit-client';
 import { motion } from 'motion/react';
-import {
-  useVoiceListener,
-  isSpeechRecognitionSupported,
-} from '../lib/useVoiceListener';
-import { classifyIntent } from '../lib/voice_intents';
-import {
-  useMicPermission,
-  useMicPromptOnGesture,
-} from '../lib/useMicPermission';
 
 interface ConnectionDetails {
   serverUrl: string;
@@ -264,44 +255,16 @@ export function VoicePage() {
     }
   }, []);
 
-  // ── Hands-free wake-word ────────────────────────────────────────────
-  // While disconnected, run continuous browser SpeechRecognition. Saying
-  // "Jarvis" / "Hey Jarvis" / "wake up" triggers the exact same start()
-  // path as the manual button. The listener auto-tears-down the moment we
-  // begin connecting (enabled → false), so it releases the mic before
-  // LiveKitRoom grabs it — no contention.
-  const listening = !conn && !connecting;
-  const { state: micPermissionState } = useMicPermission();
-  useMicPromptOnGesture(listening, micPermissionState);
-  useVoiceListener({
-    enabled: listening,
-    micPermissionState,
-    onTranscript: (t) => {
-      if (connecting || conn) return; // re-entrancy guard
-      if (classifyIntent(t) === 'wake') start();
-    },
-    onError: (code) => {
-      // Only surface a hard error when the Permissions API actually says
-      // 'denied'. A 'not-allowed' while still in 'prompt'/'unknown' is the
-      // benign cold-start race — the user just hasn't granted yet; the
-      // gesture helper + the effect re-arm (on micPermissionState change)
-      // recover automatically, so a scary toast here is wrong.
-      if (code === 'not-allowed' && micPermissionState === 'denied') {
-        setError(
-          "Microphone blocked. Allow it via the address-bar icon to use 'Hey Jarvis'."
-        );
-      }
-    },
-  });
-  const speechSupported = isSpeechRecognitionSupported();
-  const wakeArmed =
-    listening && speechSupported && micPermissionState === 'granted';
-  // Cold start: mic not yet granted but usable — tell the user the one
-  // gesture that unlocks hands-free (browser mic permission needs it).
-  const wakeNeedsGesture =
-    listening &&
-    speechSupported &&
-    (micPermissionState === 'prompt' || micPermissionState === 'unknown');
+  // Auto-connect on page load — no button click. The browser asks for
+  // mic permission once (LiveKit WebRTC init); after the first Allow it
+  // is automatic. Wake/sleep ("Hey Jarvis" / "goodbye Jarvis") is gated
+  // server-side in the worker, not in the browser.
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (startedRef.current || conn || connecting) return;
+    startedRef.current = true;
+    void start();
+  }, [conn, connecting, start]);
 
   if (conn) {
     return (
@@ -353,22 +316,9 @@ export function VoicePage() {
         {connecting ? 'Connecting…' : 'Talk to Jarvis'}
       </button>
 
-      {wakeArmed && (
-        <p
-          className="text-xs"
-          style={{ color: 'var(--color-text-muted)' }}
-        >
-          🎙️ Listening — just say “Hey Jarvis”
-        </p>
-      )}
-      {wakeNeedsGesture && (
-        <p
-          className="text-xs"
-          style={{ color: 'var(--color-text-muted)' }}
-        >
-          🎙️ Click anywhere once to enable hands-free, then say “Hey Jarvis”
-        </p>
-      )}
+      <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+        Connecting automatically — then say “Hey Jarvis” to begin.
+      </p>
     </div>
   );
 }

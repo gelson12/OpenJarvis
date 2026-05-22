@@ -284,12 +284,24 @@ def _classify_intent(text: str) -> str:
     return "speech"
 
 
+# ── Wake / sleep ─────────────────────────────────────────────────────
+# The session auto-connects, so the worker is always listening. It stays
+# DORMANT (silent, ignores speech) until it hears the wake phrase, and
+# returns to dormant on the sleep phrase. Gated in on_user_turn_completed
+# via `raise StopResponse()` (livekit-agents catches it → turn dropped).
+_WAKE_RE = re.compile(r"\b(hey\s+|ok\s+|okay\s+)?jarvis\b", re.I)
+_SLEEP_RE = re.compile(r"\bgood\s?bye,?\s+jarvis\b", re.I)
+
+
 class Assistant(Agent):
     def __init__(self, room: rtc.Room):
         super().__init__(instructions=AGENT_INSTRUCTION)
         self._room = room
+        # Wake/sleep: dormant on connect, woken by "Hey Jarvis".
+        self._awake = False
         # Most-recent camera frame from the user's video track (or None).
         self._latest_frame: rtc.VideoFrame | None = None
+        self._seen_frame = False
         self._video_tasks: set[asyncio.Task] = set()
         self._wire_video(room)
         # Elaboration state — set by the SSE listener, cleared on the
@@ -306,9 +318,13 @@ class Assistant(Agent):
 
         async def _consume(track: rtc.VideoTrack) -> None:
             stream = rtc.VideoStream(track)
+            logger.info("video: subscribed to a video track")
             try:
                 async for ev in stream:
                     self._latest_frame = ev.frame
+                    if not self._seen_frame:
+                        self._seen_frame = True
+                        logger.info("video: first frame received")
             finally:
                 await stream.aclose()
 
@@ -403,6 +419,11 @@ class Assistant(Agent):
             elab_id = data.get("id")
             if not elab_id:
                 return
+            # Don't surface proactive prompts while dormant — just
+            # dismiss them so they don't linger server-side.
+            if not self._awake:
+                asyncio.create_task(self._elab_dismiss(elab_id))
+                return
             # If a previous elaboration is still pending, dismiss it so
             # we never queue overlapping spoken prompts.
             if self._pending_elab_id and self._pending_elab_id != elab_id:
@@ -461,6 +482,28 @@ class Assistant(Agent):
            answer as if it can see.
         """
         text = getattr(new_message, "text_content", "") or ""
+
+        # ── Wake / sleep gate (runs before everything else) ──────────
+        # The session is always connected; stay dormant until "Hey
+        # Jarvis", return to dormant on "goodbye Jarvis".
+        if not self._awake:
+            if _WAKE_RE.search(text):
+                self._awake = True
+                rest = _WAKE_RE.sub("", text).strip(" ,.!?-")
+                if len(rest.split()) >= 2:
+                    # "Hey Jarvis, what's the time" — answer the question.
+                    new_message.content = [rest]
+                    text = rest
+                else:
+                    await self.session.say("Yes, sir?")
+                    raise StopResponse()
+            else:
+                raise StopResponse()  # dormant — ignore non-wake speech
+        else:
+            if _SLEEP_RE.search(text):
+                self._awake = False
+                await self.session.say("Goodbye, sir.")
+                raise StopResponse()
 
         # 0) Pending elaboration yes/no — must run BEFORE camera/vision
         # so "yes" doesn't accidentally trigger something else.
@@ -572,7 +615,10 @@ async def entrypoint(ctx: agents.JobContext):
         room=ctx.room,
         agent=assistant,
         room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC()
+            noise_cancellation=noise_cancellation.BVC(),
+            # Required for the worker to receive the user's camera +
+            # screen-share tracks (default off → no video reaches us).
+            video_enabled=True,
         ),
     )
     # Subscribe to OpenJarvis's elaboration SSE so we can surface the
