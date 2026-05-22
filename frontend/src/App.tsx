@@ -190,7 +190,9 @@ export default function App() {
     <>
       <Routes>
         <Route element={<Layout />}>
-          <Route index element={<ChatPage />} />
+          {/* Voice is the default landing (login / refresh at root). */}
+          <Route index element={<VoicePage />} />
+          <Route path="chat" element={<ChatPage />} />
           <Route path="dashboard" element={<DashboardPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="get-started" element={<GetStartedPage />} />

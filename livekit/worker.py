@@ -296,8 +296,17 @@ def _classify_intent(text: str) -> str:
 # DORMANT (silent, ignores speech) until it hears the wake phrase, and
 # returns to dormant on the sleep phrase. Gated in on_user_turn_completed
 # via `raise StopResponse()` (livekit-agents catches it → turn dropped).
-_WAKE_RE = re.compile(r"\b(hey\s+|ok\s+|okay\s+)?jarvis\b", re.I)
-_SLEEP_RE = re.compile(r"\bgood\s?bye,?\s+jarvis\b", re.I)
+# Wake match is deliberately forgiving — Deepgram routinely mis-hears
+# "Jarvis" as "Travis / Jervis / Java's / Jarviss". In dormant mode a
+# false positive is harmless (it just wakes), so we accept the common
+# variants to make activation reliable.
+_WAKE_RE = re.compile(
+    r"\b(jarvis|jarviss|jarvi|jervis|travis|java'?s|charvis)\b", re.I
+)
+_SLEEP_RE = re.compile(
+    r"\b(good\s?bye|go to sleep|sleep now|that'?s all for now|stand down)\b",
+    re.I,
+)
 
 
 # ── Desktop bridge (operate the user's Windows machines) ─────────────
@@ -635,6 +644,25 @@ class Assistant(Agent):
             ).strip()
             if not answer:
                 return
+            # Never speak a raw internal status/log line — the Claude-CLI
+            # backend sometimes returns e.g.
+            # "[cli_worker: CLI auth recovery in progress …]" instead of a
+            # real elaboration. Drop those silently.
+            low = answer.lower()
+            if answer.startswith("[") or any(
+                marker in low
+                for marker in (
+                    "cli_worker",
+                    "auth recovery",
+                    "claude_pro task",
+                    "skipping",
+                    "traceback",
+                )
+            ):
+                logger.warning("elaboration answer looked like a log line — dropped")
+                if self._pending_elab_id == data.get("id"):
+                    self._pending_elab_id = None
+                return
             try:
                 await self.session.say(answer)
             except Exception as exc:  # noqa: BLE001
@@ -812,12 +840,22 @@ async def entrypoint(ctx: agents.JobContext):
             video_enabled=True,
         ),
     )
-    # Subscribe to OpenJarvis's elaboration SSE so we can surface the
-    # slow-track Claude-CLI follow-up through Aura. Loopback in the
-    # single-container deploy; Basic Auth header reused.
-    assistant.start_elaboration_listener(
-        openjarvis_url, _openjarvis_auth_headers()
-    )
+    # Proactive elaboration is OFF by default. The OpenJarvis dual-track
+    # elaboration fires on every turn (not the "3+ coherent topics" the
+    # user expects) and its Claude-CLI backend currently leaks raw status
+    # lines (e.g. "[cli_worker: CLI auth recovery in progress …]") as the
+    # spoken answer. Re-enable only with OPENJARVIS_VOICE_ELABORATION=1
+    # once that backend is reliable and topic-gated.
+    if os.environ.get("OPENJARVIS_VOICE_ELABORATION", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        assistant.start_elaboration_listener(
+            openjarvis_url, _openjarvis_auth_headers()
+        )
+    else:
+        logger.info("voice elaboration disabled (set OPENJARVIS_VOICE_ELABORATION=1 to enable)")
 
 
 if __name__ == "__main__":
