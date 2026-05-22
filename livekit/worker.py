@@ -475,6 +475,22 @@ _DESKTOP_MACHINE_RE = re.compile(
 )
 _DESKTOP_OPEN_RE = re.compile(r"\b(open|launch|start)\b", re.I)
 
+# Spoken folder names → a path the desktop-bridge resolves via
+# os.path.expanduser/expandvars. "list my downloads folder" -> "~\Downloads".
+_KNOWN_DIRS = {
+    "downloads": "~\\Downloads", "download": "~\\Downloads",
+    "desktop": "~\\Desktop",
+    "documents": "~\\Documents", "document": "~\\Documents",
+    "pictures": "~\\Pictures", "picture": "~\\Pictures",
+    "videos": "~\\Videos", "video": "~\\Videos",
+    "music": "~\\Music",
+    "home folder": "~", "home directory": "~", "user folder": "~",
+}
+# An explicit path: drive (C:\...), ~/..., %VAR%..., or a UNC \\share.
+_EXPLICIT_PATH_RE = re.compile(
+    r"([a-zA-Z]:\\[^\s,]*|[~%][^\s,]*|\\\\[^\s,]+)"
+)
+
 
 def _norm_machine(machine: str) -> str:
     """Map free-form machine words to a bridge label ('laptop'/'rog'/'all')."""
@@ -484,6 +500,25 @@ def _norm_machine(machine: str) -> str:
     if m in ("all", "both", "every"):
         return "all"
     return "laptop"  # default — covers 'laptop', 'desktop', 'pc', '' etc.
+
+
+def _desktop_path(text: str) -> str:
+    """Best-effort file/folder path from a spoken request.
+
+    Order: an explicit path, then a known Windows folder name, then the
+    bare word before "folder"/"directory".
+    """
+    m = _EXPLICIT_PATH_RE.search(text)
+    if m:
+        return m.group(1)
+    low = text.lower()
+    for word, path in _KNOWN_DIRS.items():
+        if re.search(rf"\b{re.escape(word)}\b", low):
+            return path
+    m = re.search(r"\b([\w.\-]+)\s+(?:folder|directory|dir)\b", text, re.I)
+    if m:
+        return m.group(1)
+    return ""
 
 
 def _desktop_intent(text: str):
@@ -498,22 +533,28 @@ def _desktop_intent(text: str):
     if not m:
         return None
     machine = _norm_machine(m.group(1))
-    low = text.lower()
-    # Strip the "on my laptop" clause so it isn't mistaken for the target.
-    body = _DESKTOP_MACHINE_RE.sub("", text).strip(" ,.!?-")
-    if re.search(r"\b(list|show me|what'?s in)\b", low) and re.search(
-        r"\b(folder|directory|dir)\b", low
-    ):
-        path = _after(body, "folder", "directory", "dir", " in ", " of ")
-        return (machine, "list_dir", {"path": path}) if path else None
-    if re.search(r"\bread\b", low) and re.search(r"\bfile\b", low):
-        path = _after(body, "file", "read")
+    # Drop the "on my laptop" clause so it isn't mistaken for a path/target.
+    body = _DESKTOP_MACHINE_RE.sub(" ", text)
+    low = body.lower()
+    path = _desktop_path(body)
+
+    if re.search(r"\b(run|execute)\b", low) and "command" in low:
+        cmd = re.sub(r"^.*?\bcommand\b[:\s]*", "", body, flags=re.I)
+        cmd = cmd.strip(" ,.!?-\"'")
+        return (machine, "shell", {"command": cmd}) if cmd else None
+    if re.search(r"\bread\b", low) and re.search(r"\bfile\b|\.\w{1,5}\b", low):
         return (machine, "read_file", {"path": path}) if path else None
-    if re.search(r"\b(run|execute)\s+(the\s+)?command\b", low):
-        command = _after(body, "command")
-        return (machine, "shell", {"command": command}) if command else None
+    if path and re.search(
+        r"\b(list|show|see|browse|what'?s|files?|folder|directory|contents)\b",
+        low,
+    ):
+        return (machine, "list_dir", {"path": path})
     if _DESKTOP_OPEN_RE.search(low):
-        target = _after(body, "open", "launch", "start")
+        target = re.sub(r"^.*?\b(?:open|launch|start)\b\s*", "", body,
+                        flags=re.I)
+        target = re.sub(r"\b(?:the|a|an|please|for me|up)\b", " ", target,
+                        flags=re.I)
+        target = re.sub(r"\s+", " ", target).strip(" ,.!?-\"'")
         return (machine, "open", {"target": target}) if target else None
     return None
 
