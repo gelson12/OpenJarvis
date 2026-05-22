@@ -488,16 +488,12 @@
   }
 
   .hud-backdrop::before {
-    /* faint grid */
+    /* The HUD grid now lives in the <AmbientBackground> canvas, which
+       gives it glowing nodes and energy pulses. Kept empty so the
+       backdrop's radial glows + noise grain still render. */
     content: '';
     position: absolute; inset: 0;
-    background-image:
-      linear-gradient(var(--color-border-subtle) 1px, transparent 1px),
-      linear-gradient(90deg, var(--color-border-subtle) 1px, transparent 1px);
-    background-size: 48px 48px;
-    mask-image: radial-gradient(ellipse at center, black 40%, transparent 80%);
-    -webkit-mask-image: radial-gradient(ellipse at center, black 40%, transparent 80%);
-    opacity: 0.45;
+    opacity: 0;
   }
 
   .hud-backdrop::after {

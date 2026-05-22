@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Outlet, useNavigate } from 'react-router';
 import { Sidebar } from './Sidebar/Sidebar';
 import { SystemPulse } from './SystemPulse';
+import { AmbientBackground } from './AmbientBackground';
 import { useAppStore } from '../lib/store';
 import { checkHealth } from '../lib/api';
 
@@ -26,6 +27,7 @@ export function Layout() {
   return (
     <div className="flex flex-col h-full w-full overflow-hidden relative" style={{ paddingTop: '3px' }}>
       <div className="hud-backdrop" aria-hidden="true" />
+      <AmbientBackground />
       <SystemPulse apiReachable={apiReachable} />
 
       {/* Health check banner */}
