@@ -236,4 +236,12 @@ try:
 except ImportError:
     pass
 
+# Desktop control — operate the user's Windows machines (laptop + ROG) over
+# a LiveKit data-channel bridge. Soft-skips if the `livekit` realtime SDK is
+# not installed (it lives in the pyproject `server` extra).
+try:
+    import openjarvis.tools.desktop_bridge  # noqa: F401
+except ImportError:
+    pass
+
 __all__ = ["BaseTool", "ToolExecutor", "ToolSpec"]

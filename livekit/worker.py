@@ -41,6 +41,7 @@ import os
 import re
 import json
 import time
+import uuid
 import base64
 import random
 import asyncio
@@ -48,7 +49,7 @@ import logging
 
 import httpx
 from dotenv import load_dotenv
-from livekit import agents, rtc
+from livekit import agents, rtc, api
 from livekit.agents import AgentSession, Agent, RoomInputOptions, StopResponse
 from livekit.agents.utils.images import encode, EncodeOptions, ResizeOptions
 from livekit.plugins import openai, deepgram, silero, noise_cancellation
@@ -203,31 +204,36 @@ async def _describe_frame(frame: rtc.VideoFrame) -> str | None:
             ),
         )
         b64 = base64.b64encode(jpeg).decode()
-        resp = await client.chat.completions.create(
-            model=_VISION_MODEL,
-            max_tokens=150,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Describe what is visible in this webcam "
-                                "frame in 1-2 concrete sentences. Focus on "
-                                "the main subject, any text, and notable "
-                                "details. No preamble."
-                            ),
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64}"
+        # Bound the vision call — a slow OpenRouter response must never
+        # stall the voice turn (the await runs inside on_user_turn_completed).
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=_VISION_MODEL,
+                max_tokens=150,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Describe what is visible in this webcam "
+                                    "frame in 1-2 concrete sentences. Focus "
+                                    "on the main subject, any text, and "
+                                    "notable details. No preamble."
+                                ),
                             },
-                        },
-                    ],
-                }
-            ],
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+            ),
+            timeout=12.0,
         )
         desc = (resp.choices[0].message.content or "").strip()
         return desc or None
@@ -362,6 +368,13 @@ _WEBSEARCH_RE = re.compile(
     r"\b(?:search\s+(?:the\s+)?(?:web|internet|google)|google|look\s+up|"
     r"web\s+search|search\s+for)\b", re.I
 )
+# An explicit "put it on screen" verb. The bare nouns `news`/`maps` match
+# far too eagerly ("any news on my project" should be answered, not turned
+# into a news panel), so those two intents additionally require this verb.
+_CONTENT_VERB = re.compile(
+    r"\b(show|open|bring up|pull up|display|get me|give me|pop up|put up|"
+    r"launch|see)\b", re.I
+)
 
 
 def _after(text: str, *keywords: str) -> str:
@@ -397,10 +410,15 @@ def _content_intent(text: str):
         return ("youtube", _after(t, "youtube for", "youtube", "videos of",
                                   "videos about", "videos for", " for ",
                                   " of ", " about "))
-    if _NEWS_RE.search(low):
+    if _NEWS_RE.search(low) and (
+        _CONTENT_VERB.search(low) or "headlines" in low
+    ):
         return ("news", _after(t, "news about", "news on", "headlines about",
                                " about ", " on "))
-    if _MAP_RE.search(low):
+    if _MAP_RE.search(low) and (
+        _CONTENT_VERB.search(low)
+        or re.search(r"\b(directions?\s+to|map\s+of|navigate\s+to)\b", low)
+    ):
         return ("maps", _after(t, "map of", "directions to", "directions from",
                                "navigate to", "where is", " to ", " of "))
     if _WEBSEARCH_RE.search(low):
@@ -409,10 +427,182 @@ def _content_intent(text: str):
     return None
 
 
+# ── Desktop control (operate the user's Windows machines) ────────────
+# A `desktop-bridge` process runs on each Windows machine (laptop, ROG),
+# connects OUTBOUND to LiveKit, and sits in the JARVIS_CONTROL_ROOM. We
+# join that same room as a second connection, publish a JSON command on
+# `desktop-cmd`, and await the matching reply on `desktop-result`. No
+# tunnel needed — the worker and the PCs are all outbound-only.
+#
+# This regex fallback fires the bridge directly on the user's turn — the
+# reliable path, since the routed LLM tends to chat instead of emitting
+# tool calls. The server-side `desktop_control` ToolRegistry tool is the
+# smart, LLM-driven counterpart.
+_CONTROL_ROOM = os.environ.get("JARVIS_CONTROL_ROOM", "jarvis-control")
+_TOPIC_CMD = "desktop-cmd"
+_TOPIC_RESULT = "desktop-result"
+
+_DESKTOP_MACHINE_RE = re.compile(
+    r"\bon\s+(?:my\s+|the\s+)?(laptop|rog|pc|desktop|computer|machine)\b", re.I
+)
+_DESKTOP_OPEN_RE = re.compile(r"\b(open|launch|start)\b", re.I)
+
+
+def _norm_machine(machine: str) -> str:
+    """Map free-form machine words to a bridge label ('laptop'/'rog'/'all')."""
+    m = (machine or "").strip().lower()
+    if "rog" in m:
+        return "rog"
+    if m in ("all", "both", "every"):
+        return "all"
+    return "laptop"  # default — covers 'laptop', 'desktop', 'pc', '' etc.
+
+
+def _desktop_intent(text: str):
+    """Detect a desktop-control intent. Returns ``(machine, cmd, args)`` or None.
+
+    Requires an explicit "on my laptop / on the rog" clause so ordinary
+    conversation never reaches the user's machines by accident.
+    """
+    if not text:
+        return None
+    m = _DESKTOP_MACHINE_RE.search(text)
+    if not m:
+        return None
+    machine = _norm_machine(m.group(1))
+    low = text.lower()
+    # Strip the "on my laptop" clause so it isn't mistaken for the target.
+    body = _DESKTOP_MACHINE_RE.sub("", text).strip(" ,.!?-")
+    if re.search(r"\b(list|show me|what'?s in)\b", low) and re.search(
+        r"\b(folder|directory|dir)\b", low
+    ):
+        path = _after(body, "folder", "directory", "dir", " in ", " of ")
+        return (machine, "list_dir", {"path": path}) if path else None
+    if re.search(r"\bread\b", low) and re.search(r"\bfile\b", low):
+        path = _after(body, "file", "read")
+        return (machine, "read_file", {"path": path}) if path else None
+    if re.search(r"\b(run|execute)\s+(the\s+)?command\b", low):
+        command = _after(body, "command")
+        return (machine, "shell", {"command": command}) if command else None
+    if _DESKTOP_OPEN_RE.search(low):
+        target = _after(body, "open", "launch", "start")
+        return (machine, "open", {"target": target}) if target else None
+    return None
+
+
+def _desktop_reply(machine: str, cmd: str, args: dict, res: dict) -> str:
+    """Format a desktop-bridge result into a one-line spoken confirmation."""
+    if not isinstance(res, dict) or res.get("error"):
+        err = res.get("error") if isinstance(res, dict) else "no response"
+        return f"I couldn't do that on the {machine}, sir — {err}"
+    if cmd == "open":
+        return (
+            f"Opened {res.get('opened', args.get('target', ''))} "
+            f"on the {machine}, sir."
+        )
+    if cmd == "list_dir":
+        entries = res.get("entries", [])
+        return f"The {machine} folder holds {len(entries)} items, sir."
+    if cmd == "read_file":
+        content = (res.get("content") or "").strip()
+        if not content:
+            return f"That file on the {machine} is empty, sir."
+        return f"Here is that file on the {machine}, sir: {content[:300]}"
+    if cmd == "shell":
+        out = (res.get("stdout") or "").strip()
+        rc = res.get("returncode")
+        tail = f" {out[:280]}" if out else ""
+        return f"Done on the {machine}, sir — exit {rc}.{tail}"
+    return f"Done on the {machine}, sir."
+
+
+class DesktopBridge:
+    """Lazy LiveKit connection to the desktop-bridge control room."""
+
+    def __init__(self) -> None:
+        self._room: rtc.Room | None = None
+        self._pending: dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+
+    async def _ensure(self) -> rtc.Room | None:
+        async with self._lock:
+            if self._room is not None:
+                return self._room
+            url = os.environ.get("LIVEKIT_URL", "")
+            key = os.environ.get("LIVEKIT_API_KEY", "")
+            secret = os.environ.get("LIVEKIT_API_SECRET", "")
+            if not (url and key and secret):
+                logger.warning("desktop bridge: LIVEKIT_* env not set")
+                return None
+            token = (
+                api.AccessToken(key, secret)
+                .with_identity(f"openjarvis-worker-ctl-{uuid.uuid4().hex[:8]}")
+                .with_grants(
+                    api.VideoGrants(
+                        room_join=True,
+                        room=_CONTROL_ROOM,
+                        can_publish=True,
+                        can_subscribe=True,
+                        can_publish_data=True,
+                    )
+                )
+                .to_jwt()
+            )
+            room = rtc.Room()
+
+            @room.on("data_received")
+            def _on_data(packet: rtc.DataPacket) -> None:  # noqa: ANN001
+                if packet.topic != _TOPIC_RESULT:
+                    return
+                try:
+                    msg = json.loads(bytes(packet.data).decode("utf-8"))
+                except Exception:  # noqa: BLE001
+                    return
+                fut = self._pending.pop(msg.get("id", ""), None)
+                if fut and not fut.done():
+                    fut.set_result(msg)
+
+            await room.connect(url, token)
+            self._room = room
+            logger.info("desktop bridge: connected to '%s'", _CONTROL_ROOM)
+            return room
+
+    async def send(
+        self, target: str, cmd: str, args: dict, timeout: float = 30.0
+    ) -> dict:
+        """Send a command to a machine's bridge; return its result dict."""
+        room = await self._ensure()
+        if room is None:
+            return {"error": "desktop bridge unavailable (LIVEKIT_* unset)"}
+        cmd_id = uuid.uuid4().hex
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[cmd_id] = fut
+        payload = json.dumps(
+            {"id": cmd_id, "target": target, "cmd": cmd, "args": args}
+        ).encode("utf-8")
+        try:
+            await room.local_participant.publish_data(
+                payload, reliable=True, topic=_TOPIC_CMD
+            )
+            msg = await asyncio.wait_for(fut, timeout)
+            return msg.get("result", {})
+        except asyncio.TimeoutError:
+            return {
+                "error": f"no response from the '{target}' machine — is its "
+                f"desktop-bridge running?"
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+        finally:
+            self._pending.pop(cmd_id, None)
+
+
 class Assistant(Agent):
     def __init__(self, room: rtc.Room):
         super().__init__(instructions=AGENT_INSTRUCTION)
         self._room = room
+        # Desktop control — lazy 2nd LiveKit connection to the PCs' bridge.
+        self._desktop = DesktopBridge()
         # Wake/sleep: dormant on connect, woken by "Hey Jarvis".
         self._awake = False
         # Most-recent camera frame from the user's video track (or None).
@@ -661,24 +851,52 @@ class Assistant(Agent):
         if intent is None:
             return False
         kind, arg = intent
+        dispatch = {
+            "web": lambda: self.web_search(arg),
+            "youtube": lambda: self.search_youtube(arg),
+            "news": lambda: self.show_news(arg),
+            "maps": lambda: self.show_map(arg),
+            "browser": lambda: self.open_browser(
+                arg or "https://www.google.com"
+            ),
+        }
+        if kind not in dispatch:
+            return False
         try:
-            if kind == "web":
-                reply = await self.web_search(arg)
-            elif kind == "youtube":
-                reply = await self.search_youtube(arg)
-            elif kind == "news":
-                reply = await self.show_news(arg)
-            elif kind == "maps":
-                reply = await self.show_map(arg)
-            elif kind == "browser":
-                reply = await self.open_browser(arg or "https://www.google.com")
-            else:
-                return False
+            # Bound the search/browser call so a hung provider can never
+            # freeze the whole voice turn.
+            reply = await asyncio.wait_for(dispatch[kind](), timeout=20.0)
+        except asyncio.TimeoutError:
+            logger.error("content intent '%s' timed out", kind)
+            reply = "That's taking too long, sir — try again in a moment."
         except Exception as exc:  # noqa: BLE001
             logger.error("content intent '%s' failed: %s", kind, exc)
             reply = "I couldn't complete that just now, sir."
         try:
             await self.session.say(reply)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _maybe_handle_desktop(self, text: str) -> bool:
+        """Operate the user's Windows machines when explicitly asked.
+
+        Regex fallback for the server-side ``desktop_control`` tool —
+        fires the DesktopBridge directly and speaks its result. Returns
+        True when a desktop intent was handled (caller stops the turn).
+        """
+        intent = _desktop_intent(text)
+        if intent is None:
+            return False
+        machine, cmd, args = intent
+        timeout = 70.0 if cmd == "shell" else 30.0
+        try:
+            res = await self._desktop.send(machine, cmd, args, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("desktop intent failed: %s", exc)
+            res = {"error": str(exc)}
+        try:
+            await self.session.say(_desktop_reply(machine, cmd, args, res))
         except Exception:  # noqa: BLE001
             pass
         return True
@@ -919,6 +1137,28 @@ class Assistant(Agent):
         return f"The browser is open, sir — loading {url}."
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """Intercept commands before the LLM — and never die silently.
+
+        Any unexpected error speaks a short apology instead of dropping
+        the turn with no audio at all (a cause of 'Jarvis went quiet').
+        ``StopResponse`` is the normal control-flow signal, so it is
+        re-raised untouched.
+        """
+        try:
+            await self._handle_turn(turn_ctx, new_message)
+        except StopResponse:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("turn handling failed: %s", exc)
+            try:
+                await self.session.say(
+                    "Apologies, sir — something went wrong there."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise StopResponse()
+
+    async def _handle_turn(self, turn_ctx, new_message) -> None:
         """Intercept commands before they reach the LLM.
 
         Order matters:
@@ -937,8 +1177,9 @@ class Assistant(Agent):
             if _WAKE_RE.search(text):
                 self._awake = True
                 rest = _WAKE_RE.sub("", text).strip(" ,.!?-")
-                if len(rest.split()) >= 2:
-                    # "Hey Jarvis, what's the time" — answer the question.
+                if rest:
+                    # "Jarvis, what's the time" / "Jarvis, help" — answer
+                    # whatever followed the wake word, however short.
                     new_message.content = [rest]
                     text = rest
                 else:
@@ -956,6 +1197,12 @@ class Assistant(Agent):
         # Handled by regex (worker @function_tools never fire on
         # OpenJarvis); we speak our own confirmation, so stop the turn.
         if await self._maybe_handle_content(text):
+            raise StopResponse()
+
+        # Desktop control — operate the user's Windows machines. Regex
+        # fallback for when the routed LLM doesn't emit the desktop_control
+        # tool call; we speak our own confirmation, so stop the turn.
+        if await self._maybe_handle_desktop(text):
             raise StopResponse()
 
         # Screen widgets — open/close panels on request (non-blocking).
@@ -1006,6 +1253,15 @@ class Assistant(Agent):
         #    normal OpenJarvis text turn answers as if Jarvis can see.
         if _is_vision_intent(text):
             frame = self._latest_frame
+            if frame is None and self._video_tasks:
+                # A video track is subscribed but its first frame may not
+                # have landed yet (e.g. camera was just turned on). Wait
+                # briefly rather than wrongly reporting "the camera is off".
+                for _ in range(15):
+                    await asyncio.sleep(0.1)
+                    if self._latest_frame is not None:
+                        break
+                frame = self._latest_frame
             if frame is None:
                 new_message.content.append(
                     "\n\n[Camera vision: the camera is off or no frame is "
@@ -1040,15 +1296,21 @@ async def entrypoint(ctx: agents.JobContext):
     # trying the nova-3 (`keyterms`) and nova-2 (`keywords`) forms in
     # turn, falling back to a plain STT so the worker never fails to
     # start on an API mismatch.
+    if not os.environ.get("DEEPGRAM_API_KEY"):
+        raise RuntimeError(
+            "DEEPGRAM_API_KEY is not set — Deepgram STT/TTS cannot start"
+        )
     stt = None
-    for _kw in (
-        {"keyterms": ["Jarvis"]},
-        {"keywords": [("Jarvis", 5.0)]},
-        {},
+    for _label, _kw in (
+        ("nova-3 keyterms", {"keyterms": ["Jarvis"]}),
+        ("nova-2 keywords", {"keywords": [("Jarvis", 5.0)]}),
+        ("no", {}),
     ):
         try:
             stt = deepgram.STT(**_kw)
-            logger.info("STT: Deepgram initialized (boost=%s)", bool(_kw))
+            logger.info(
+                "STT: Deepgram initialized (%s wake-word boost)", _label
+            )
             break
         except TypeError:
             continue  # kwarg not supported in this plugin version
@@ -1087,11 +1349,20 @@ async def entrypoint(ctx: agents.JobContext):
     )
 
     assistant = Assistant(ctx.room)
+    # BVC noise cancellation can over-suppress quiet speech; allow opting
+    # out with OPENJARVIS_NOISE_CANCEL=0 if user turns are being missed.
+    _nc = None
+    if os.environ.get("OPENJARVIS_NOISE_CANCEL", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    ):
+        _nc = noise_cancellation.BVC()
     await session.start(
         room=ctx.room,
         agent=assistant,
         room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC(),
+            noise_cancellation=_nc,
             # Required for the worker to receive the user's camera +
             # screen-share tracks (default off → no video reaches us).
             video_enabled=True,

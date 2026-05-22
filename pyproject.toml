@@ -79,6 +79,9 @@ server = [
     "python-multipart>=0.0.9",
     "psycopg[binary]>=3.1",
     "livekit-api>=0.8",
+    # `livekit` is the realtime SDK (rtc.Room) — needed by the
+    # desktop_control tool to join the desktop-bridge control room.
+    "livekit>=0.18",
 ]
 openhands = ["openhands-sdk>=1.0; python_version >= '3.12'"]
 gpu-metrics = ["pynvml>=12.0"]

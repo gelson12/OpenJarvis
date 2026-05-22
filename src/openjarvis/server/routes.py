@@ -140,6 +140,12 @@ _TOOL_GROUP_TRIGGERS: dict[str, tuple[str, ...]] = {
         "longitude", "latitude", "find the place", "find a place",
         "directions", "nearby",
     ),
+    "desktop": (
+        "my laptop", "the laptop", "my rog", "the rog", "my pc",
+        "my desktop", "my machine", "my computer", "on the laptop",
+        "on the rog", "on my", "open notepad", "run command",
+        "list the folder", "list the directory", "read the file",
+    ),
     "web_search": (
         "search the web", "google", "google it", "look up", "look it up",
         "what is", "who is", "when did", "find out about",
@@ -191,6 +197,7 @@ def _build_group_caches() -> tuple[dict[str, list[dict]], dict[str, str]]:
         "obsidian_": "vault",
         "weather_": "weather",
         "geocode_": "location",
+        "desktop_": "desktop",
         "web_search": "web_search",
     }
     exact_to_group: dict[str, str] = {
