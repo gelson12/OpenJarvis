@@ -109,8 +109,23 @@ def _openjarvis_auth_headers() -> dict:
 
 
 def prewarm(proc: agents.JobProcess):
-    """Pre-load VAD model once per worker process to avoid cold-start delay."""
-    proc.userdata["vad"] = silero.VAD.load()
+    """Pre-load VAD model once per worker process to avoid cold-start delay.
+
+    Tuned for a short single-word wake utterance ("Jarvis"): a low
+    min_speech_duration so a ~0.4 s word registers, a short
+    min_silence_duration so the turn endpoints fast, and a lower
+    activation_threshold so a quietly-spoken wake word still triggers.
+    """
+    try:
+        proc.userdata["vad"] = silero.VAD.load(
+            min_speech_duration=0.02,
+            min_silence_duration=0.25,
+            activation_threshold=0.38,
+            prefix_padding_duration=0.35,
+        )
+    except TypeError:
+        # Older silero plugin without these kwargs — fall back to defaults.
+        proc.userdata["vad"] = silero.VAD.load()
 
 
 # Structured command channel to the browser UI. The frontend listens via
@@ -674,6 +689,9 @@ class Assistant(Agent):
         self._desktop = DesktopBridge()
         # Wake/sleep: dormant on connect, woken by "Hey Jarvis".
         self._awake = False
+        # Set by the interim-transcript wake listener: the next turn is
+        # the one that woke us, so strip the wake word from it.
+        self._just_woke = False
         # Most-recent camera frame from the user's video track (or None).
         self._latest_frame: rtc.VideoFrame | None = None
         self._seen_frame = False
@@ -1242,13 +1260,25 @@ class Assistant(Agent):
         # ── Wake / sleep gate (runs before everything else) ──────────
         # The session is always connected; stay dormant until "Hey
         # Jarvis", return to dormant on "goodbye Jarvis".
-        if not self._awake:
+        if self._just_woke:
+            # The interim-transcript listener already woke us mid-utterance
+            # — strip the wake word and answer whatever followed it.
+            self._just_woke = False
+            rest = _WAKE_RE.sub("", text).strip(" ,.!?-")
+            if rest:
+                new_message.content = [rest]
+                text = rest
+            else:
+                await self.session.say("Yes, sir?")
+                raise StopResponse()
+        elif not self._awake:
+            # Interim listener missed it — last-chance check on the final
+            # transcript.
             if _WAKE_RE.search(text):
                 self._awake = True
                 rest = _WAKE_RE.sub("", text).strip(" ,.!?-")
                 if rest:
-                    # "Jarvis, what's the time" / "Jarvis, help" — answer
-                    # whatever followed the wake word, however short.
+                    # "Jarvis, what's the time" — answer what followed.
                     new_message.content = [rest]
                     text = rest
                 else:
@@ -1412,6 +1442,9 @@ async def entrypoint(ctx: agents.JobContext):
                 # (only chat chunks + [DONE]) — the LiveKit LLM client
                 # crashes on OpenJarvis's custom `event:` UI events.
                 "X-OpenJarvis-Stream": "openai",
+                # FAST PATH — skip the agent orchestrator; stream the
+                # engine token-by-token. Cuts seconds off each voice turn.
+                "X-OpenJarvis-Direct": "true",
             },
         ),
         tts=tts,
@@ -1427,6 +1460,21 @@ async def entrypoint(ctx: agents.JobContext):
         "no",
     ):
         _nc = noise_cancellation.BVC()
+    # Interim-transcript wake listener — wakes the agent the moment
+    # Deepgram emits "Jarvis" in ANY transcript (interim OR final), not
+    # only on a fully-endpointed turn. This is what makes waking reliable:
+    # a short or mis-finalised "Jarvis" still has many partial transcripts
+    # to match against. A false wake is harmless (dormant just flips on).
+    @session.on("user_input_transcribed")
+    def _on_user_transcript(ev) -> None:  # noqa: ANN001
+        if assistant._awake:
+            return
+        text = getattr(ev, "transcript", "") or ""
+        if text and _WAKE_RE.search(text):
+            assistant._awake = True
+            assistant._just_woke = True
+            logger.info("wake: matched on transcript %r", text[:60])
+
     await session.start(
         room=ctx.room,
         agent=assistant,

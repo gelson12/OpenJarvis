@@ -528,11 +528,25 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
 
     if request_body.stream:
         bus = getattr(request.app.state, "bus", None)
+        # X-OpenJarvis-Direct: the caller (e.g. the LiveKit voice worker)
+        # wants the FAST path — skip the agent orchestrator entirely and
+        # stream the engine token-by-token. The agent bridge runs
+        # agent.run() to completion before emitting anything, which adds
+        # seconds of latency; voice turns can't afford that.
+        openjarvis_direct = (
+            request.headers.get("x-openjarvis-direct", "").strip().lower()
+            in ("1", "true", "yes")
+        )
         # Use the agent stream bridge only when tools are present (the
         # bridge runs agent.run() synchronously and word-splits the result,
         # so it can't stream tokens in real-time).  For plain chat, stream
         # directly from the engine for true token-by-token output.
-        if agent is not None and bus is not None and request_body.tools:
+        if (
+            agent is not None
+            and bus is not None
+            and request_body.tools
+            and not openjarvis_direct
+        ):
             # Plain OpenAI clients (e.g. the LiveKit voice worker) send
             # X-OpenJarvis-Stream: openai and need a strict OpenAI SSE
             # stream — no custom `event:` UI messages, which crash the
