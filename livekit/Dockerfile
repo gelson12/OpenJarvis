@@ -18,6 +18,11 @@ COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel && \
     pip install -r requirements.txt
 
+# Playwright Chromium — fallback search engine + the live browser widget.
+RUN apt-get update \
+    && playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
 # Pre-download Silero VAD model at build time to avoid cold-start delay

@@ -16,6 +16,8 @@ import {
 import { Track, MediaDeviceFailure } from 'livekit-client';
 import { motion } from 'motion/react';
 import { NeuralOrb } from '../components/NeuralOrb';
+import { WidgetLayer } from '@/components/widgets/widget-layer';
+import { JarvisUIProvider } from '@/lib/jarvis-ui/store';
 
 interface ConnectionDetails {
   serverUrl: string;
@@ -279,9 +281,10 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
   const look = CORE_BY_STATE[state] ?? CORE_BY_STATE.disconnected;
 
   return (
-    <div className="relative flex h-full w-full flex-col overflow-hidden">
-      <CornerFrames glow={look.glow} />
-      <VoiceHud />
+    <JarvisUIProvider>
+      <div className="relative flex h-full w-full flex-col overflow-hidden">
+        <CornerFrames glow={look.glow} />
+        <VoiceHud />
 
       {/* drifting scan beam */}
       <motion.div
@@ -327,10 +330,13 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
         </button>
       </div>
 
-      <RoomAudioRenderer />
-      <SelfView />
-      <UiCommandBridge />
-    </div>
+        <RoomAudioRenderer />
+        <SelfView />
+        <UiCommandBridge />
+        {/* Floating voice-summoned widgets + gesture cursor. */}
+        <WidgetLayer />
+      </div>
+    </JarvisUIProvider>
   );
 }
 

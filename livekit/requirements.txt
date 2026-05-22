@@ -5,3 +5,5 @@ livekit-plugins-silero
 livekit-plugins-noise-cancellation
 requests
 python-dotenv
+httpx
+playwright
