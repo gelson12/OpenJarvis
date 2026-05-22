@@ -40,7 +40,12 @@ logger = logging.getLogger(__name__)
 _CONTROL_ROOM = os.environ.get("JARVIS_CONTROL_ROOM", "jarvis-control")
 _TOPIC_CMD = "desktop-cmd"
 _TOPIC_RESULT = "desktop-result"
-_VALID_ACTIONS = ("open", "list_dir", "read_file", "run_command")
+_VALID_ACTIONS = (
+    "open", "list_dir", "read_file", "write_file", "make_dir",
+    "run_command", "set_volume", "delete", "empty_recycle_bin",
+    "move", "copy", "search_files", "system_status", "list_processes",
+    "close_app", "media_key", "play_media", "lock_workstation",
+)
 
 
 def _norm_machine(machine: str) -> str:
@@ -190,9 +195,9 @@ class DesktopControlTool(BaseTool):
             description=(
                 "Operate one of the user's Windows machines — their laptop "
                 "or their ROG desktop. Open an app, file, folder or URL; "
-                "list a directory; read a text file; or run a shell command. "
-                "The target machine must have the desktop-bridge program "
-                "running."
+                "list a directory; read a text file; run a shell command; "
+                "or change the system volume. The target machine must have "
+                "the desktop-bridge program running."
             ),
             parameters={
                 "type": "object",
@@ -209,7 +214,20 @@ class DesktopControlTool(BaseTool):
                             "open = launch an app/file/folder/URL; "
                             "list_dir = list a folder's contents; "
                             "read_file = read a text file; "
-                            "run_command = run a shell command."
+                            "write_file = write text to a file; "
+                            "make_dir = create a directory; "
+                            "delete = move file/folder to Recycle Bin; "
+                            "empty_recycle_bin = clear the Recycle Bin; "
+                            "move/copy = move or copy file/folder; "
+                            "search_files = find files by name; "
+                            "system_status = CPU/RAM/disk snapshot; "
+                            "list_processes = top processes by RAM/CPU; "
+                            "close_app = terminate a running app; "
+                            "set_volume = change the system volume; "
+                            "media_key = play/pause/next/prev/stop; "
+                            "play_media = find and play a song/video; "
+                            "lock_workstation = lock the screen; "
+                            "run_command = last-resort PowerShell."
                         ),
                     },
                     "target": {
@@ -229,6 +247,81 @@ class DesktopControlTool(BaseTool):
                     "command": {
                         "type": "string",
                         "description": "For 'run_command': the shell command.",
+                    },
+                    "level": {
+                        "type": "integer",
+                        "description": (
+                            "For 'set_volume': an absolute volume level "
+                            "0-100. Omit to use 'direction' instead."
+                        ),
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["up", "down", "mute", "unmute"],
+                        "description": (
+                            "For 'set_volume' without a 'level': nudge the "
+                            "volume up/down, or mute/unmute."
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "For 'write_file': the text to write.",
+                    },
+                    "src": {
+                        "type": "string",
+                        "description": "For 'move'/'copy': source path.",
+                    },
+                    "dst": {
+                        "type": "string",
+                        "description": "For 'move'/'copy': destination path.",
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": (
+                            "For 'search_files': filename substring to "
+                            "match (case-insensitive)."
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "For 'close_app': process name to terminate "
+                            "(e.g. 'chrome', 'notepad')."
+                        ),
+                    },
+                    "top": {
+                        "type": "integer",
+                        "description": (
+                            "For 'list_processes': how many top entries "
+                            "to return (default 10)."
+                        ),
+                    },
+                    "by": {
+                        "type": "string",
+                        "enum": ["memory", "cpu"],
+                        "description": (
+                            "For 'list_processes': sort key (default memory)."
+                        ),
+                    },
+                    "key": {
+                        "type": "string",
+                        "enum": ["play_pause", "next", "previous", "stop"],
+                        "description": (
+                            "For 'media_key': which transport key to tap."
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "For 'play_media': the song/video name to find."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": (
+                            "For 'search_files': max matches to return "
+                            "(default 50)."
+                        ),
                     },
                 },
                 "required": ["machine", "action"],
@@ -284,6 +377,120 @@ class DesktopControlTool(BaseTool):
                     success=False,
                 )
             cmd, args, timeout = "read_file", {"path": path}, 30.0
+        elif action == "write_file":
+            path = params.get("path") or ""
+            content = params.get("content") or ""
+            if not path:
+                return ToolResult(
+                    tool_name="desktop_control",
+                    content="The 'write_file' action needs a 'path'.",
+                    success=False,
+                )
+            cmd, args, timeout = (
+                "write_file", {"path": path, "content": content}, 30.0
+            )
+        elif action == "make_dir":
+            path = params.get("path") or ""
+            if not path:
+                return ToolResult(
+                    tool_name="desktop_control",
+                    content="The 'make_dir' action needs a 'path'.",
+                    success=False,
+                )
+            cmd, args, timeout = "make_dir", {"path": path}, 30.0
+        elif action == "delete":
+            path = params.get("path") or params.get("target") or ""
+            if not path:
+                return ToolResult(
+                    tool_name="desktop_control",
+                    content="The 'delete' action needs a 'path'.",
+                    success=False,
+                )
+            cmd, args, timeout = "delete", {"path": path}, 30.0
+        elif action == "empty_recycle_bin":
+            cmd, args, timeout = "empty_recycle_bin", {}, 60.0
+        elif action in ("move", "copy"):
+            src = params.get("src") or ""
+            dst = params.get("dst") or ""
+            if not (src and dst):
+                return ToolResult(
+                    tool_name="desktop_control",
+                    content=f"The '{action}' action needs 'src' and 'dst'.",
+                    success=False,
+                )
+            cmd, args, timeout = action, {"src": src, "dst": dst}, 60.0
+        elif action == "search_files":
+            pattern = (params.get("pattern") or params.get("name") or "").strip()
+            if not pattern:
+                return ToolResult(
+                    tool_name="desktop_control",
+                    content="The 'search_files' action needs a 'pattern'.",
+                    success=False,
+                )
+            cmd, args, timeout = "search_files", {
+                "path": params.get("path") or "~",
+                "pattern": pattern,
+                "limit": int(params.get("limit") or 50),
+            }, 60.0
+        elif action == "system_status":
+            cmd, args, timeout = "system_status", {}, 30.0
+        elif action == "list_processes":
+            cmd, args, timeout = "list_processes", {
+                "top": int(params.get("top") or 10),
+                "by": (params.get("by") or "memory"),
+            }, 30.0
+        elif action == "close_app":
+            name = (params.get("name") or params.get("target") or "").strip()
+            if not name:
+                return ToolResult(
+                    tool_name="desktop_control",
+                    content="The 'close_app' action needs a 'name'.",
+                    success=False,
+                )
+            cmd, args, timeout = "close_app", {"name": name}, 30.0
+        elif action == "media_key":
+            key = (params.get("key") or "").strip().lower()
+            if not key:
+                return ToolResult(
+                    tool_name="desktop_control",
+                    content=(
+                        "The 'media_key' action needs a 'key' "
+                        "(play_pause/next/previous/stop)."
+                    ),
+                    success=False,
+                )
+            cmd, args, timeout = "media_key", {"key": key}, 10.0
+        elif action == "play_media":
+            query = (params.get("query") or params.get("target") or "").strip()
+            if not query:
+                return ToolResult(
+                    tool_name="desktop_control",
+                    content="The 'play_media' action needs a 'query'.",
+                    success=False,
+                )
+            cmd, args, timeout = "play_media", {"query": query}, 30.0
+        elif action == "lock_workstation":
+            cmd, args, timeout = "lock_workstation", {}, 10.0
+        elif action == "set_volume":
+            level = params.get("level")
+            direction = (params.get("direction") or "").strip().lower()
+            if level is not None:
+                vol_args: dict = {
+                    "action": "set",
+                    "level": max(0, min(100, int(level))),
+                }
+            elif direction in ("up", "down", "mute", "unmute"):
+                vol_args = {"action": direction}
+            else:
+                return ToolResult(
+                    tool_name="desktop_control",
+                    content=(
+                        "The 'set_volume' action needs a 'level' (0-100) "
+                        "or a 'direction' (up/down/mute/unmute)."
+                    ),
+                    success=False,
+                )
+            cmd, args, timeout = "volume", vol_args, 30.0
         else:  # run_command
             command = params.get("command") or params.get("target") or ""
             if not command:

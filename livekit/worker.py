@@ -485,10 +485,187 @@ _CONTROL_ROOM = os.environ.get("JARVIS_CONTROL_ROOM", "jarvis-control")
 _TOPIC_CMD = "desktop-cmd"
 _TOPIC_RESULT = "desktop-result"
 
+# The machine clause. Accept any natural preposition ("on/in/of/from my
+# laptop", "of my pc") AND a bare "my laptop / my pc" — Deepgram and
+# ordinary speech vary the wording, and the old `on`-only form silently
+# dropped "list the files in my laptop" / "lower the volume of my pc".
 _DESKTOP_MACHINE_RE = re.compile(
-    r"\bon\s+(?:my\s+|the\s+)?(laptop|rog|pc|desktop|computer|machine)\b", re.I
+    r"\b(?:on|in|of|from|to|with|using|inside|across)\s+"
+    r"(?:my\s+|the\s+|this\s+|our\s+)?"
+    r"(laptop|rog|pc|desktop|computer|machine)\b"
+    r"|\bmy\s+(laptop|rog|pc|computer|machine)\b",
+    re.I,
 )
 _DESKTOP_OPEN_RE = re.compile(r"\b(open|launch|start)\b", re.I)
+
+# Volume control words. `_VOL_DOWN`/`_VOL_UP` also cover the bare verbs
+# ("make it quieter", "turn it up") so a direction is always resolvable.
+_VOLUME_WORD = re.compile(
+    r"\b(volume|sound|audio|mute|unmute|louder|quieter)\b", re.I
+)
+_VOL_DOWN = re.compile(
+    r"\b(down|decrease|lower|reduce|quiet\w*|soft\w*|less)\b", re.I
+)
+_VOL_UP = re.compile(
+    r"\b(up|increase|raise|boost|crank|loud\w*|higher|more)\b", re.I
+)
+_VOL_SET = re.compile(r"\b(?:to|at)\s+(\d{1,3})\b", re.I)
+
+
+# A generous net for "this turn MIGHT be a desktop request". Matching here
+# only authorises the LLM router call — the router itself decides whether
+# it's actually a desktop command. Cheap to be loose; the router rejects
+# false positives with {"desktop": false}.
+_DESKTOP_HINT_RE = re.compile(
+    r"\b("
+    r"laptop|rog|pc|computer|machine|workstation|"
+    r"file|files|folder|folders|directory|document|documents|"
+    r"download|downloads|"
+    r"open|launch|start|run|execute|close|kill|terminate|quit|exit|"
+    r"delete|remove|trash|move|copy|rename|create|make|new|"
+    r"play|pause|skip|song|songs|music|video|videos|track|tune|"
+    r"volume|sound|audio|mute|unmute|louder|quieter|"
+    r"memory|ram|cpu|disk|storage|space|process|processes|task|tasks|"
+    r"recycle|bin|clean|cleanup|clear|"
+    r"app|apps|application|applications|program|programs|"
+    r"notepad|chrome|firefox|edge|spotify|word|excel|outlook|"
+    r"lock|shutdown|restart|reboot|sleep|"
+    r"desktop|screen|wallpaper|"
+    r"diagnose|debug|status|scan|"
+    r"read|aloud|contents?|txt|pdf|docx?|xlsx?|csv|"
+    r"share|attach|attachment"
+    r")\b",
+    re.I,
+)
+
+# The desktop bridge's command catalogue, in the exact shape the bridge
+# accepts. Kept near the router so the prompt stays in sync with reality.
+_BRIDGE_COMMANDS_GUIDE = """\
+Available bridge commands (use `command` and `args`):
+
+  open              {"target": "<app | file/folder path | url>"}
+  list_dir          {"path": "<dir>"}              # ~ = home; env vars ok
+  read_file         {"path": "<file>"}
+  write_file        {"path": "<file>", "content": "<text>"}
+  make_dir          {"path": "<dir>"}
+  delete            {"path": "<file or dir>"}      # ALWAYS Recycle Bin
+  empty_recycle_bin {}
+  move              {"src": "<from>", "dst": "<to>"}
+  copy              {"src": "<from>", "dst": "<to>"}
+  search_files      {"path": "<root>", "pattern": "<name substring>",
+                     "limit": 50}
+  system_status     {}                              # CPU / RAM / disk
+  list_processes    {"top": 10, "by": "memory" | "cpu"}
+  close_app         {"name": "<process name, e.g. chrome>"}
+  volume            {"action": "up"|"down"|"mute"|"unmute"|"set",
+                     "level": 0-100 (for 'set')}
+  media_key         {"key": "play_pause"|"next"|"previous"|"stop"}
+  play_media        {"query": "<song or video name>"}
+  lock_workstation  {}
+  shell             {"command": "<PowerShell, last-resort escape hatch>"}
+
+Standard folders: ~\\Downloads, ~\\Documents, ~\\Desktop, ~\\Pictures,
+~\\Music, ~\\Videos."""
+
+
+_ROUTER_MODEL = os.environ.get(
+    "OPENJARVIS_ROUTER_MODEL", "google/gemini-2.0-flash-001"
+)
+_router_client: AsyncOpenAI | None = None
+
+
+def _get_router_client() -> AsyncOpenAI | None:
+    """OpenRouter client for the intent router. Shares OPENROUTER_API_KEY
+    with vision. Returns None when the key is unset — caller falls back."""
+    global _router_client
+    if _router_client is not None:
+        return _router_client
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not key:
+        logger.warning(
+            "desktop router unavailable: OPENROUTER_API_KEY not set"
+        )
+        return None
+    _router_client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1", api_key=key
+    )
+    return _router_client
+
+
+async def _route_desktop(text: str, machines_online: list[str]) -> dict | None:
+    """Turn a free-form spoken request into a structured bridge command.
+
+    Returns ``{"machine", "cmd", "args", "say"}`` on success, or None when
+    the request isn't a desktop command / the LLM is unavailable. The
+    router is given the live list of online bridges so it can pick a
+    sensible default machine when the user doesn't name one.
+    """
+    client = _get_router_client()
+    if client is None or not text:
+        return None
+    online = ", ".join(machines_online) if machines_online else "none right now"
+    system = (
+        "You translate ONE spoken request into ONE command for the user's "
+        "Windows machines (laptop and rog). Output strict JSON only — no "
+        "prose, no code fences.\n\n"
+        "Schema. Either:\n"
+        '  {"desktop": false}   — when the request is NOT about operating '
+        "their computer.\n"
+        "Or:\n"
+        '  {"desktop": true, "machine": "laptop"|"rog"|"all", '
+        '"command": "<name>", "args": {...}, '
+        '"say": "<one short butler-voice sentence>"}\n\n'
+        f"{_BRIDGE_COMMANDS_GUIDE}\n\n"
+        "Rules:\n"
+        "- Default machine: laptop. Bridges online right now: "
+        + online + ".\n"
+        "- Prefer a NAMED command. Use `shell` only when nothing else fits.\n"
+        "- `delete` always sends to the Recycle Bin (never permanent).\n"
+        "- For app names like Word/Excel/Notepad use `open` with target "
+        "like 'notepad' or 'winword'. For URLs use `open` with the URL.\n"
+        "- `say` is one short sentence, butler tone ('Right away, sir.', "
+        "'Done, sir.', 'On it, sir.').\n"
+        "- If the request is conversation, a question, or unclear, output "
+        '{"desktop": false}.'
+    )
+    try:
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=_ROUTER_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+                max_tokens=400,
+                response_format={"type": "json_object"},
+            ),
+            timeout=6.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("desktop router LLM failed: %s", exc)
+        return None
+    raw = (resp.choices[0].message.content or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+    try:
+        data = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "desktop router non-JSON: %s — %r", exc, raw[:200]
+        )
+        return None
+    if not isinstance(data, dict) or not data.get("desktop"):
+        return None
+    cmd = (data.get("command") or "").strip()
+    if not cmd:
+        return None
+    return {
+        "machine": _norm_machine(str(data.get("machine") or "laptop")),
+        "cmd": cmd,
+        "args": data.get("args") or {},
+        "say": (data.get("say") or "").strip(),
+    }
 
 # Spoken folder names → a path the desktop-bridge resolves via
 # os.path.expanduser/expandvars. "list my downloads folder" -> "~\Downloads".
@@ -547,11 +724,28 @@ def _desktop_intent(text: str):
     m = _DESKTOP_MACHINE_RE.search(text)
     if not m:
         return None
-    machine = _norm_machine(m.group(1))
-    # Drop the "on my laptop" clause so it isn't mistaken for a path/target.
+    # The regex has two machine groups (prepositional vs. bare "my X").
+    machine = _norm_machine(m.group(1) or m.group(2))
+    # Drop the machine clause so it isn't mistaken for a path/target.
     body = _DESKTOP_MACHINE_RE.sub(" ", text)
     low = body.lower()
     path = _desktop_path(body)
+
+    # Volume — checked first; "decrease the volume" has no path/open verb.
+    if _VOLUME_WORD.search(low):
+        if re.search(r"\bunmute\b", low):
+            return (machine, "volume", {"action": "unmute"})
+        if re.search(r"\bmute\b", low):
+            return (machine, "volume", {"action": "mute"})
+        setm = _VOL_SET.search(low)
+        if setm and re.search(r"\b(volume|sound|audio)\b", low):
+            return (machine, "volume",
+                    {"action": "set", "level": int(setm.group(1))})
+        if _VOL_DOWN.search(low):
+            return (machine, "volume", {"action": "down"})
+        if _VOL_UP.search(low):
+            return (machine, "volume", {"action": "up"})
+        return None
 
     if re.search(r"\b(run|execute)\b", low) and "command" in low:
         cmd = re.sub(r"^.*?\bcommand\b[:\s]*", "", body, flags=re.I)
@@ -559,11 +753,18 @@ def _desktop_intent(text: str):
         return (machine, "shell", {"command": cmd}) if cmd else None
     if re.search(r"\bread\b", low) and re.search(r"\bfile\b|\.\w{1,5}\b", low):
         return (machine, "read_file", {"path": path}) if path else None
-    if path and re.search(
-        r"\b(list|show|see|browse|what'?s|files?|folder|directory|contents)\b",
+    # List a folder. A "strong" word (list/files/folder/…) stands alone;
+    # a "weak" one (show/see/what's) still needs a path so chit-chat like
+    # "what's up on my laptop" doesn't get treated as a directory listing.
+    # When no folder is named ("all the files in my laptop"), default to
+    # the user's home directory.
+    strong_list = re.search(
+        r"\b(list|files?|folder|directory|directories|contents?|browse|dir)\b",
         low,
-    ):
-        return (machine, "list_dir", {"path": path})
+    )
+    weak_list = re.search(r"\b(show|see|view|what'?s)\b", low)
+    if strong_list or (path and weak_list):
+        return (machine, "list_dir", {"path": path or "~"})
     if _DESKTOP_OPEN_RE.search(low):
         target = re.sub(r"^.*?\b(?:open|launch|start)\b\s*", "", body,
                         flags=re.I)
@@ -584,9 +785,26 @@ def _desktop_reply(machine: str, cmd: str, args: dict, res: dict) -> str:
             f"Opened {res.get('opened', args.get('target', ''))} "
             f"on the {machine}, sir."
         )
+    if cmd == "volume":
+        action = args.get("action", "")
+        if action == "mute":
+            return f"Muted the {machine}, sir."
+        if action == "unmute":
+            return f"Unmuted the {machine}, sir."
+        level = res.get("level")
+        if level is not None:
+            return f"Volume on the {machine} is now {level} percent, sir."
+        return f"Volume on the {machine} adjusted, sir."
     if cmd == "list_dir":
         entries = res.get("entries", [])
-        return f"The {machine} folder holds {len(entries)} items, sir."
+        if not entries:
+            return f"That folder on the {machine} is empty, sir."
+        names = [e.get("name", "") for e in entries[:8]]
+        extra = f", and {len(entries) - 8} more" if len(entries) > 8 else ""
+        return (
+            f"The {machine} folder holds {len(entries)} items, sir — "
+            f"{', '.join(names)}{extra}."
+        )
     if cmd == "read_file":
         content = (res.get("content") or "").strip()
         if not content:
@@ -597,16 +815,130 @@ def _desktop_reply(machine: str, cmd: str, args: dict, res: dict) -> str:
         rc = res.get("returncode")
         tail = f" {out[:280]}" if out else ""
         return f"Done on the {machine}, sir — exit {rc}.{tail}"
+    if cmd == "system_status":
+        cpu = res.get("cpu_percent")
+        ram_used = res.get("ram_used_gb")
+        ram_total = res.get("ram_total_gb")
+        ram_pct = res.get("ram_percent")
+        disk_free = res.get("disk_free_gb")
+        return (
+            f"On the {machine}, sir: CPU at {cpu} percent, "
+            f"RAM at {ram_pct} percent — {ram_used} of {ram_total} gigs "
+            f"used — and {disk_free} gigs free on the system drive."
+        )
+    if cmd == "list_processes":
+        top = res.get("top") or []
+        if not top:
+            return f"No processes to report on the {machine}, sir."
+        head = ", ".join(
+            f"{p.get('name','?')} {p.get('ram_mb',0):.0f} MB"
+            for p in top[:5]
+        )
+        return f"Top on the {machine}, sir: {head}."
+    if cmd == "close_app":
+        n = res.get("closed", 0)
+        name = args.get("name", "that app")
+        if not n:
+            return f"I don't see {name} running on the {machine}, sir."
+        plural = "" if n == 1 else " instances"
+        return f"Closed {n}{plural} of {name} on the {machine}, sir."
+    if cmd == "delete":
+        to = res.get("to", "")
+        if to == "recycle_bin":
+            return f"Sent it to the Recycle Bin on the {machine}, sir."
+        if to == "permanent":
+            return f"Permanently deleted on the {machine}, sir."
+        return f"Deleted on the {machine}, sir."
+    if cmd == "empty_recycle_bin":
+        return f"Recycle Bin emptied on the {machine}, sir."
+    if cmd == "search_files":
+        matches = res.get("matches") or []
+        if not matches:
+            return f"No matches on the {machine}, sir."
+        head = [os.path.basename(p) for p in matches[:5]]
+        tail = (f", and {len(matches) - 5} more"
+                if len(matches) > 5 else "")
+        return (
+            f"Found {len(matches)} on the {machine}, sir — "
+            f"{', '.join(head)}{tail}."
+        )
+    if cmd in ("move", "copy"):
+        verb = "Moved" if cmd == "move" else "Copied"
+        return f"{verb} it on the {machine}, sir."
+    if cmd == "make_dir":
+        return f"Folder created on the {machine}, sir."
+    if cmd == "write_file":
+        return f"File written on the {machine}, sir."
+    if cmd == "media_key":
+        key = (args.get("key") or "").lower()
+        labels = {
+            "play_pause": "Toggled playback",
+            "play": "Playing",
+            "pause": "Paused",
+            "next": "Skipping to the next track",
+            "previous": "Going back a track",
+            "prev": "Going back a track",
+            "stop": "Stopped",
+        }
+        return f"{labels.get(key, 'Done')} on the {machine}, sir."
+    if cmd == "play_media":
+        if res.get("playing") == "youtube":
+            return (
+                f"I didn't find that on the {machine}, sir — opened a "
+                "YouTube search instead."
+            )
+        playing = res.get("playing", "")
+        if playing:
+            return (
+                f"Playing {os.path.basename(playing)} on the {machine}, sir."
+            )
+        return f"Playing it on the {machine}, sir."
+    if cmd == "lock_workstation":
+        return f"Locked the {machine}, sir."
+    if cmd == "host_info":
+        host = res.get("hostname", machine)
+        return f"The {machine} reports as {host}, sir — online."
     return f"Done on the {machine}, sir."
 
 
 class DesktopBridge:
-    """Lazy LiveKit connection to the desktop-bridge control room."""
+    """Lazy LiveKit connection to the desktop-bridge control room.
+
+    Also a presence index: the bridge processes join the same room with
+    identity ``desktop-bridge-<machine>``, so the worker can know exactly
+    which user PCs are reachable at any moment without polling.
+    """
 
     def __init__(self) -> None:
         self._room: rtc.Room | None = None
         self._pending: dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _machine_from_identity(identity: str) -> str | None:
+        """Pull the machine label out of a ``desktop-bridge-<m>`` identity."""
+        if not identity or not identity.startswith("desktop-bridge-"):
+            return None
+        return identity[len("desktop-bridge-"):].strip().lower() or None
+
+    def online_machines(self) -> list[str]:
+        """Snapshot of the machines whose desktop-bridge is currently in
+        the control room. Returns ``[]`` if the worker hasn't joined yet
+        (so callers can fall back to "unknown" wording)."""
+        if self._room is None:
+            return []
+        machines: set[str] = set()
+        for p in self._room.remote_participants.values():
+            m = self._machine_from_identity(getattr(p, "identity", "") or "")
+            if m:
+                machines.add(m)
+        return sorted(machines)
+
+    def is_online(self, machine: str) -> bool:
+        m = (machine or "").strip().lower()
+        if m in ("", "all", "any"):
+            return bool(self.online_machines())
+        return m in set(self.online_machines())
 
     async def _ensure(self) -> rtc.Room | None:
         async with self._lock:
@@ -692,6 +1024,9 @@ class Assistant(Agent):
         # Set by the interim-transcript wake listener: the next turn is
         # the one that woke us, so strip the wake word from it.
         self._just_woke = False
+        # First-wake greeting includes desktop-bridge presence; cleared
+        # after the first wake so subsequent ones just say "Yes, sir?".
+        self._announced_status = False
         # Most-recent camera frame from the user's video track (or None).
         self._latest_frame: rtc.VideoFrame | None = None
         self._seen_frame = False
@@ -965,25 +1300,119 @@ class Assistant(Agent):
             pass
         return True
 
-    async def _maybe_handle_desktop(self, text: str) -> bool:
-        """Operate the user's Windows machines when explicitly asked.
+    async def _wake_greeting(self) -> str:
+        """Greeting spoken when the user wakes Jarvis with no follow-up.
 
-        Regex fallback for the server-side ``desktop_control`` tool —
-        fires the DesktopBridge directly and speaks its result. Returns
-        True when a desktop intent was handled (caller stops the turn).
+        On the FIRST wake of a session we name the desktop bridges that
+        are currently online, so the user immediately knows which of
+        their machines Jarvis can drive (rather than discovering it the
+        hard way mid-command).
         """
-        intent = _desktop_intent(text)
-        if intent is None:
+        if self._announced_status:
+            return "Yes, sir?"
+        self._announced_status = True
+        # Eagerly connect to the control room so presence is accurate.
+        try:
+            await self._desktop._ensure()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("control-room connect failed: %s", exc)
+        online = self._desktop.online_machines()
+        if not online:
+            return (
+                "At your service, sir. Note — no desktop bridges are "
+                "online; start desktop-bridge\\run.bat on the laptop or "
+                "the ROG if you need me to operate them."
+            )
+        if len(online) == 1:
+            return (
+                f"At your service, sir. Your {online[0]} is online "
+                "and ready."
+            )
+        return (
+            "At your service, sir. "
+            + " and ".join(online).capitalize()
+            + " are both online."
+        )
+
+    async def _maybe_handle_desktop(self, text: str) -> bool:
+        """Operate the user's Windows machines via the LLM intent router.
+
+        Architecture:
+          1. Broad keyword gate — cheap test for "could be desktop". This
+             filters out 90%+ of turns so we don't spend an LLM call.
+          2. LLM router — converts free-form speech into a structured
+             bridge command. Handles arbitrary phrasings ('in my pc',
+             'increase memory', 'play that Pink Floyd track'…).
+          3. Regex fallback — kept for when OPENROUTER_API_KEY is unset or
+             the router times out, so the feature still works.
+          4. Presence check — if the target machine's bridge isn't in the
+             control room we say so honestly, never pretend.
+
+        Returns True when handled (caller raises StopResponse).
+        """
+        if not text or not _DESKTOP_HINT_RE.search(text):
             return False
-        machine, cmd, args = intent
+
+        # Eagerly join the control room so presence is known before we
+        # decide what to say. Safe to call repeatedly — `_ensure` is locked.
+        try:
+            await self._desktop._ensure()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("control-room connect failed: %s", exc)
+
+        online = self._desktop.online_machines()
+
+        routed = await _route_desktop(text, online)
+        say_hint = ""
+        if routed is not None:
+            machine, cmd, args = routed["machine"], routed["cmd"], routed["args"]
+            say_hint = routed.get("say", "")
+        else:
+            intent = _desktop_intent(text)
+            if intent is None:
+                return False
+            machine, cmd, args = intent
+
+        # Honest offline message — never pretend we have access we don't.
+        if machine != "all" and not self._desktop.is_online(machine):
+            msg = (
+                f"Your {machine}'s desktop-bridge isn't connected, sir — "
+                "start desktop-bridge\\run.bat on that machine."
+            )
+            if online:
+                msg += f" Online right now: {', '.join(online)}."
+            try:
+                await self.session.say(msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        # Speak the router's quick acknowledgement immediately so the user
+        # hears progress while a long op (search, system_status) runs.
+        # Skip for chatty info commands — _desktop_reply produces the
+        # better, data-rich reply for those.
+        info_cmds = {
+            "list_dir", "read_file", "system_status", "list_processes",
+            "search_files", "host_info",
+        }
+        if say_hint and cmd not in info_cmds:
+            try:
+                await self.session.say(say_hint)
+            except Exception:  # noqa: BLE001
+                pass
+
         timeout = 70.0 if cmd == "shell" else 30.0
         try:
-            res = await self._desktop.send(machine, cmd, args, timeout=timeout)
+            res = await self._desktop.send(
+                machine, cmd, args, timeout=timeout
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.error("desktop intent failed: %s", exc)
+            logger.error("desktop send failed: %s", exc)
             res = {"error": str(exc)}
+
+        reply = _desktop_reply(machine, cmd, args, res)
         try:
-            await self.session.say(_desktop_reply(machine, cmd, args, res))
+            await self.session.say(reply)
         except Exception:  # noqa: BLE001
             pass
         return True
@@ -1269,7 +1698,7 @@ class Assistant(Agent):
                 new_message.content = [rest]
                 text = rest
             else:
-                await self.session.say("Yes, sir?")
+                await self.session.say(await self._wake_greeting())
                 raise StopResponse()
         elif not self._awake:
             # Interim listener missed it — last-chance check on the final
@@ -1282,7 +1711,7 @@ class Assistant(Agent):
                     new_message.content = [rest]
                     text = rest
                 else:
-                    await self.session.say("Yes, sir?")
+                    await self.session.say(await self._wake_greeting())
                     raise StopResponse()
             else:
                 raise StopResponse()  # dormant — ignore non-wake speech
