@@ -377,17 +377,33 @@ _CONTENT_VERB = re.compile(
 )
 
 
-def _after(text: str, *keywords: str) -> str:
-    """Return the slice of ``text`` after the last-occurring keyword."""
-    low = text.lower()
-    cut, klen = -1, 0
-    for kw in keywords:
-        i = low.rfind(kw)
-        if i > cut:
-            cut, klen = i, len(kw)
-    if cut < 0:
-        return ""
-    return text[cut + klen:].strip(" ,.?!-\"'")
+# Lead / filler / command words stripped to recover the bare query from a
+# spoken request like "can you play a video of cars on youtube".
+_QUERY_NOISE = re.compile(
+    r"\b(?:hey |ok |okay )?jarvis\b"
+    r"|\b(?:can|could|would|will)\s+you\b|\bplease\b|\bfor me\b"
+    r"|\bi\s+(?:want|need|wanna)(?:\s+to|\s+you\s+to)?\b"
+    r"|\bi'?d\s+like(?:\s+to|\s+you\s+to)?\b"
+    r"|\b(?:search(?:\s+the\s+(?:web|internet))?(?:\s+for)?|google|look\s+up"
+    r"|web\s+search(?:\s+for)?|find(?:\s+me)?|show(?:\s+me)?|bring\s+up"
+    r"|pull\s+up|put\s+up|open|play|get\s+me|display|watch|see)\b"
+    r"|\bon\s+(?:the\s+)?(?:web|internet)\b|\bonline\b",
+    re.I,
+)
+
+
+def _clean_query(text: str) -> str:
+    """Strip command / filler words to recover the bare search query."""
+    q = " " + (text or "") + " "
+    prev = None
+    while prev != q:
+        prev = q
+        q = _QUERY_NOISE.sub(" ", q)
+    q = re.sub(r"\s+", " ", q).strip(" ,.?!-\"'")
+    # Drop a dangling leading article left after the command word is gone
+    # ("play a video of cars" -> "a cars" -> "cars").
+    q = re.sub(r"^(?:a|an|the|some|my)\b\s*", "", q, flags=re.I)
+    return q
 
 
 def _content_intent(text: str):
@@ -406,24 +422,36 @@ def _content_intent(text: str):
         return ("browser", url.group(1) if url else "")
     if url:
         return ("browser", url.group(1))
+
     if _YOUTUBE_RE.search(low):
-        return ("youtube", _after(t, "youtube for", "youtube", "videos of",
-                                  "videos about", "videos for", " for ",
-                                  " of ", " about "))
-    if _NEWS_RE.search(low) and (
-        _CONTENT_VERB.search(low) or "headlines" in low
-    ):
-        return ("news", _after(t, "news about", "news on", "headlines about",
-                               " about ", " on "))
+        # The query can sit either side of "youtube" ("cars on youtube",
+        # "youtube for cars"), so strip every youtube/video marker and the
+        # command words wrapping it — what is left is the query itself.
+        q = re.sub(r"\b(?:on|from|in|via|over\s+on)\s+youtube\b", " ", t, flags=re.I)
+        q = re.sub(r"\byoutube\b", " ", q, flags=re.I)
+        q = re.sub(r"\b(?:videos?|clips?|footage)\s+(?:of|about|for|on|with)\b",
+                   " ", q, flags=re.I)
+        q = re.sub(r"\b(?:videos?|clips?|footage)\b", " ", q, flags=re.I)
+        return ("youtube", _clean_query(q))
+
+    if _NEWS_RE.search(low) and (_CONTENT_VERB.search(low) or "headlines" in low):
+        q = re.sub(r"\b(?:news|headlines)\b|\b(?:about|on|regarding)\b",
+                   " ", t, flags=re.I)
+        return ("news", _clean_query(q))
+
     if _MAP_RE.search(low) and (
         _CONTENT_VERB.search(low)
-        or re.search(r"\b(directions?\s+to|map\s+of|navigate\s+to)\b", low)
+        or re.search(r"\b(?:directions?\s+to|map\s+of|navigate\s+to|where\s+is)\b",
+                     low)
     ):
-        return ("maps", _after(t, "map of", "directions to", "directions from",
-                               "navigate to", "where is", " to ", " of "))
+        q = re.sub(r"\b(?:google\s+)?maps?\b|\bnavigation\b", " ", t, flags=re.I)
+        q = _clean_query(q)
+        q = re.sub(r"^(?:of|to|for|the)\s+", "", q, flags=re.I).strip()
+        return ("maps", q)
+
     if _WEBSEARCH_RE.search(low):
-        return ("web", _after(t, "search the web for", "search for",
-                              "look up", "google", " for "))
+        return ("web", _clean_query(t))
+
     return None
 
 

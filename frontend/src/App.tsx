@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Routes, Route } from 'react-router';
+import { Routes, Route, useNavigate } from 'react-router';
 import { Layout } from './components/Layout';
 import { ChatPage } from './pages/ChatPage';
 import { DashboardPage } from './pages/DashboardPage';
@@ -45,6 +45,14 @@ export default function App() {
     if (settings.theme === 'dark') root.classList.add('dark');
     else if (settings.theme === 'light') root.classList.add('light');
   }, [settings.theme]);
+
+  // Jarvis is voice-first: every fresh load / refresh lands on the Voice
+  // page. This runs once on mount only — clicking other tabs in-app still
+  // navigates normally (App does not remount on route changes).
+  const navigate = useNavigate();
+  useEffect(() => {
+    navigate('/voice', { replace: true });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync overlay conversations into the main app
   const importOverlay = useAppStore((s) => s.importOverlayConversation);
