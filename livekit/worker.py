@@ -41,6 +41,7 @@ import os
 import re
 import json
 import time
+import uuid
 import base64
 import random
 import asyncio
@@ -48,8 +49,14 @@ import logging
 
 import httpx
 from dotenv import load_dotenv
-from livekit import agents, rtc
-from livekit.agents import AgentSession, Agent, RoomInputOptions, StopResponse
+from livekit import agents, rtc, api
+from livekit.agents import (
+    AgentSession,
+    Agent,
+    RoomInputOptions,
+    StopResponse,
+    function_tool,
+)
 from livekit.agents.utils.images import encode, EncodeOptions, ResizeOptions
 from livekit.plugins import openai, deepgram, silero, noise_cancellation
 from openai import AsyncOpenAI
@@ -293,10 +300,115 @@ _WAKE_RE = re.compile(r"\b(hey\s+|ok\s+|okay\s+)?jarvis\b", re.I)
 _SLEEP_RE = re.compile(r"\bgood\s?bye,?\s+jarvis\b", re.I)
 
 
+# ── Desktop bridge (operate the user's Windows machines) ─────────────
+# A `desktop-bridge` process runs on each Windows machine (laptop, ROG),
+# connects OUTBOUND to LiveKit, and sits in the JARVIS_CONTROL_ROOM. We
+# join that same room as a second connection, publish a JSON command on
+# the `desktop-cmd` topic, and await the matching reply on
+# `desktop-result`. No tunnel / public hostname needed — LiveKit Cloud
+# is the rendezvous and the PCs are outbound-only. The bridge is
+# agent-agnostic: one install per PC serves friday_jarvis2 and OpenJarvis.
+_CONTROL_ROOM = os.environ.get("JARVIS_CONTROL_ROOM", "jarvis-control")
+_TOPIC_CMD = "desktop-cmd"
+_TOPIC_RESULT = "desktop-result"
+
+
+class DesktopBridge:
+    """Lazy LiveKit connection to the desktop-bridge control room."""
+
+    def __init__(self) -> None:
+        self._room: rtc.Room | None = None
+        self._pending: dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+
+    async def _ensure(self) -> rtc.Room | None:
+        async with self._lock:
+            if self._room is not None:
+                return self._room
+            url = os.environ.get("LIVEKIT_URL", "")
+            key = os.environ.get("LIVEKIT_API_KEY", "")
+            secret = os.environ.get("LIVEKIT_API_SECRET", "")
+            if not (url and key and secret):
+                logger.warning("desktop bridge: LIVEKIT_* env not set")
+                return None
+            token = (
+                api.AccessToken(key, secret)
+                .with_identity(f"openjarvis-worker-ctl-{uuid.uuid4().hex[:8]}")
+                .with_grants(
+                    api.VideoGrants(
+                        room_join=True,
+                        room=_CONTROL_ROOM,
+                        can_publish=True,
+                        can_subscribe=True,
+                        can_publish_data=True,
+                    )
+                )
+                .to_jwt()
+            )
+            room = rtc.Room()
+
+            @room.on("data_received")
+            def _on_data(packet: rtc.DataPacket) -> None:  # noqa: ANN001
+                if packet.topic != _TOPIC_RESULT:
+                    return
+                try:
+                    msg = json.loads(bytes(packet.data).decode("utf-8"))
+                except Exception:  # noqa: BLE001
+                    return
+                fut = self._pending.pop(msg.get("id", ""), None)
+                if fut and not fut.done():
+                    fut.set_result(msg)
+
+            await room.connect(url, token)
+            self._room = room
+            logger.info("desktop bridge: connected to '%s'", _CONTROL_ROOM)
+            return room
+
+    async def send(
+        self, target: str, cmd: str, args: dict, timeout: float = 30.0
+    ) -> dict:
+        """Send a command to a machine's bridge; return its result dict."""
+        room = await self._ensure()
+        if room is None:
+            return {"error": "desktop bridge unavailable (LIVEKIT_* unset)"}
+        cmd_id = uuid.uuid4().hex
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[cmd_id] = fut
+        payload = json.dumps(
+            {"id": cmd_id, "target": target, "cmd": cmd, "args": args}
+        ).encode("utf-8")
+        try:
+            await room.local_participant.publish_data(
+                payload, reliable=True, topic=_TOPIC_CMD
+            )
+            msg = await asyncio.wait_for(fut, timeout)
+            return msg.get("result", {})
+        except asyncio.TimeoutError:
+            self._pending.pop(cmd_id, None)
+            return {
+                "error": f"no response from the '{target}' machine — is its "
+                f"desktop-bridge running?"
+            }
+        except Exception as exc:  # noqa: BLE001
+            self._pending.pop(cmd_id, None)
+            return {"error": str(exc)}
+
+
+def _norm_machine(machine: str) -> str:
+    """Map free-form machine words to a bridge label ('laptop'/'rog')."""
+    m = (machine or "").strip().lower()
+    if "rog" in m:
+        return "rog"
+    if m in ("all", "both", "every"):
+        return "all"
+    return "laptop"  # default — covers 'laptop', 'desktop', 'pc', '' etc.
+
+
 class Assistant(Agent):
     def __init__(self, room: rtc.Room):
         super().__init__(instructions=AGENT_INSTRUCTION)
         self._room = room
+        self._desktop = DesktopBridge()
         # Wake/sleep: dormant on connect, woken by "Hey Jarvis".
         self._awake = False
         # Most-recent camera frame from the user's video track (or None).
@@ -350,6 +462,85 @@ class Assistant(Agent):
                         t = asyncio.create_task(_consume(pub.track))
                         self._video_tasks.add(t)
                         t.add_done_callback(self._video_tasks.discard)
+
+    # ── Desktop control tools (laptop + ROG) ────────────────────────
+    # These reach the user's PCs via the DesktopBridge. They only get
+    # invoked when OPENJARVIS_MODEL resolves to a tool-capable model
+    # (the default openrouter/auto does).
+    @function_tool
+    async def open_on_machine(self, machine: str, target: str) -> str:
+        """Open a file, folder, application, or URL on one of the user's
+        Windows machines.
+
+        Args:
+            machine: Which machine — "laptop" or "rog".
+            target: What to open — an app name (e.g. "notepad"), a file
+                or folder path, or a URL.
+        """
+        m = _norm_machine(machine)
+        res = await self._desktop.send(m, "open", {"target": target})
+        if res.get("error"):
+            return f"Could not open {target} on the {m}: {res['error']}"
+        return f"Opened {res.get('opened', target)} on the {m}."
+
+    @function_tool
+    async def list_files_on_machine(self, machine: str, path: str) -> str:
+        """List the files and folders in a directory on a Windows machine.
+
+        Args:
+            machine: Which machine — "laptop" or "rog".
+            path: Directory path to list (e.g. "C:/Users/Gelson/Downloads").
+        """
+        m = _norm_machine(machine)
+        res = await self._desktop.send(m, "list_dir", {"path": path})
+        if res.get("error"):
+            return f"Could not list {path} on the {m}: {res['error']}"
+        entries = res.get("entries", [])
+        names = [
+            f"{e['name']}/" if e.get("dir") else e["name"] for e in entries
+        ]
+        return f"{m} {res.get('path', path)} ({len(names)} items): " + ", ".join(
+            names[:60]
+        )
+
+    @function_tool
+    async def read_file_on_machine(self, machine: str, path: str) -> str:
+        """Read a text file from a Windows machine.
+
+        Args:
+            machine: Which machine — "laptop" or "rog".
+            path: File path to read.
+        """
+        m = _norm_machine(machine)
+        res = await self._desktop.send(m, "read_file", {"path": path})
+        if res.get("error"):
+            return f"Could not read {path} on the {m}: {res['error']}"
+        return f"{path} on the {m}:\n{res.get('content', '')}"
+
+    @function_tool
+    async def run_command_on_machine(self, machine: str, command: str) -> str:
+        """Run a shell command on a Windows machine and return its output.
+        Use only when the user explicitly asks to run something.
+
+        Args:
+            machine: Which machine — "laptop" or "rog".
+            command: The shell command to run.
+        """
+        m = _norm_machine(machine)
+        res = await self._desktop.send(
+            m, "shell", {"command": command}, timeout=70.0
+        )
+        if res.get("error"):
+            return f"Command failed on the {m}: {res['error']}"
+        out = (res.get("stdout") or "").strip()
+        err = (res.get("stderr") or "").strip()
+        rc = res.get("returncode")
+        parts = [f"{m} exit {rc}"]
+        if out:
+            parts.append(f"stdout: {out}")
+        if err:
+            parts.append(f"stderr: {err}")
+        return " | ".join(parts)
 
     # ── Elaboration bridge (proactive Claude-CLI follow-up) ──────────
     def start_elaboration_listener(
