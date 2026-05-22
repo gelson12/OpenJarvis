@@ -797,16 +797,36 @@ async def entrypoint(ctx: agents.JobContext):
     openjarvis_key = os.environ.get("OPENJARVIS_API_KEY", "basic-auth")
     model_name = os.environ.get("OPENJARVIS_MODEL", "openrouter/auto")
 
-    try:
-        stt = deepgram.STT()
-        logger.info("STT: Deepgram initialized")
-    except Exception as exc:
-        logger.error("Deepgram STT init failed: %s", exc)
-        raise RuntimeError("STT provider unavailable") from exc
+    # STT with wake-word boosting. "Jarvis" is an uncommon proper noun
+    # Deepgram routinely mis-hears (Travis/Jervis/service…), which is why
+    # waking took several tries. We boost it via Deepgram's keyword API —
+    # trying the nova-3 (`keyterms`) and nova-2 (`keywords`) forms in
+    # turn, falling back to a plain STT so the worker never fails to
+    # start on an API mismatch.
+    stt = None
+    for _kw in (
+        {"keyterms": ["Jarvis"]},
+        {"keywords": [("Jarvis", 5.0)]},
+        {},
+    ):
+        try:
+            stt = deepgram.STT(**_kw)
+            logger.info("STT: Deepgram initialized (boost=%s)", bool(_kw))
+            break
+        except TypeError:
+            continue  # kwarg not supported in this plugin version
+        except Exception as exc:
+            logger.error("Deepgram STT init failed: %s", exc)
+            raise RuntimeError("STT provider unavailable") from exc
+    if stt is None:
+        raise RuntimeError("STT provider unavailable")
 
+    # TTS — male, Jarvis-like voice. Deepgram Aura 'orion' is a calm,
+    # composed male voice; override via OPENJARVIS_TTS_VOICE.
+    tts_voice = os.environ.get("OPENJARVIS_TTS_VOICE", "aura-orion-en")
     try:
-        tts = deepgram.TTS()
-        logger.info("TTS: Deepgram Aura initialized")
+        tts = deepgram.TTS(model=tts_voice)
+        logger.info("TTS: Deepgram Aura initialized (voice=%s)", tts_voice)
     except Exception as exc:
         logger.error("Deepgram TTS init failed: %s", exc)
         raise RuntimeError("TTS provider unavailable") from exc
