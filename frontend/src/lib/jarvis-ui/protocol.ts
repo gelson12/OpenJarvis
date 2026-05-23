@@ -20,7 +20,8 @@ export type WidgetKind =
   | 'maps'
   | 'browser'
   | 'apps'
-  | 'system';
+  | 'system'
+  | 'cti';
 
 /** A live widget panel rendered on screen. */
 export interface WidgetInstance {
@@ -87,6 +88,15 @@ export interface BrowserPayload {
   loading?: boolean;
 }
 
+/** `cti` widget payload — an embedded OpenCTI dashboard/page. The worker
+ * may supply a full `url` (overriding the env-baked default) and an
+ * optional `path` to deep-link a specific dashboard within OpenCTI. */
+export interface CTIPayload {
+  url?: string;
+  path?: string;
+  dashboard?: string;
+}
+
 /** Commands the worker sends to the browser on {@link JARVIS_UI_TOPIC}. */
 export type JarvisUIMessage =
   | { type: 'open_widget'; kind: WidgetKind; title?: string; payload?: unknown; id?: string }
@@ -106,6 +116,7 @@ export const WIDGET_KINDS: WidgetKind[] = [
   'browser',
   'apps',
   'system',
+  'cti',
 ];
 
 /** Default panel size per widget kind, in CSS pixels. */
@@ -120,6 +131,7 @@ export const WIDGET_DEFAULT_SIZE: Record<WidgetKind, { w: number; h: number }> =
   browser: { w: 820, h: 560 },
   apps: { w: 380, h: 320 },
   system: { w: 340, h: 260 },
+  cti: { w: 900, h: 640 },
 };
 
 /** Default header text per widget kind. */
@@ -134,4 +146,5 @@ export const WIDGET_DEFAULT_TITLE: Record<WidgetKind, string> = {
   browser: 'Browser',
   apps: 'Apps & Services',
   system: 'System Status',
+  cti: 'Intelligence',
 };

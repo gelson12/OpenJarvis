@@ -47,6 +47,8 @@ import random
 import asyncio
 import logging
 
+from datetime import datetime, timedelta, timezone
+
 import httpx
 from dotenv import load_dotenv
 from livekit import agents, rtc, api
@@ -901,6 +903,457 @@ def _desktop_reply(machine: str, cmd: str, args: dict, res: dict) -> str:
     return f"Done on the {machine}, sir."
 
 
+# ── OpenCTI (intelligence / investigation layer) ─────────────────────
+# Parallel pipeline to the desktop router above. Same shape: a broad
+# keyword gate authorises an LLM router call → structured GraphQL
+# operation → spoken result. Lives in the worker (not just the
+# OpenJarvis backend tool) because the LLM-emitted tool calls aren't
+# reliable on the routed model — proven by the desktop layer.
+
+_CTI_HINT_RE = re.compile(
+    r"\b("
+    r"opencti|cti|"
+    r"intel|intelligence|threat|threats|"
+    r"observable|observables|indicator|indicators|"
+    r"incident|incidents|investigate|investigation|"
+    r"adversary|actor|ioc|iocs|stix|"
+    r"kill\s?chain|campaign|malware|phishing|breach|"
+    r"suspicious|"
+    r"log\s+(?:the\s+|that\s+|this\s+)?(?:domain|ip|url|hash|email|file)|"
+    r"indicators\s+of\s+compromise"
+    r")\b",
+    re.I,
+)
+
+_CTI_COMMANDS_GUIDE = """\
+Available OpenCTI commands (use `command` and `args`):
+
+  cti_search        {"query": "<term>", "limit": 10}
+                    Search across STIX objects (entities, observables,
+                    indicators, incidents, threat actors, malware,
+                    reports, intrusion sets).
+
+  cti_add_observable {"value": "<observable value>",
+                      "observable_type": "domain"|"ip"|"ipv6"|"url"
+                                       |"email"|"md5"|"sha1"|"sha256"
+                                       |"hash"|"file"|"user-agent"
+                                       |"mutex"|"registry-key"}
+                    Log a new cyber observable in the knowledge graph.
+
+  cti_create_incident {"name": "<incident name>",
+                       "description": "<free text, optional>"}
+
+  cti_link          {"from_id": "<stix id>", "to_id": "<stix id>",
+                     "relationship": "related-to"|"indicates"
+                                   |"attributed-to"|"uses"|"targets"
+                                   |"mitigates"|"based-on"}
+
+  cti_summary       {"hours": 24}     # rollup of new objects in window
+  cti_list_indicators {"limit": 10}
+  cti_open_panel    {"dashboard": "<slug>", "path": "<optional URL path>"}
+                    Mount the on-screen Intelligence panel; optional
+                    deep-link path like "/dashboard/threats"."""
+
+
+_CTI_OPEN_RE = re.compile(
+    r"\b(open|show|bring up|pop up|put up|launch|display)\b[^.]*"
+    r"\b(?:intel|intelligence|cti|opencti|threat\s+panel|threats?\s+dashboard)\b",
+    re.I,
+)
+
+
+async def _route_cti(text: str) -> dict | None:
+    """LLM-routed OpenCTI intent. Returns structured command or None.
+
+    Mirrors `_route_desktop()` — same OpenRouter client, same JSON mode,
+    same temperature. Separate router prompt because OpenCTI's vocabulary
+    (STIX, observables, indicators, kill chain) is wildly different from
+    desktop ops and conflating them would muddle both.
+    """
+    client = _get_router_client()
+    if client is None or not text:
+        return None
+    system = (
+        "You translate ONE spoken request into ONE command for the user's "
+        "self-hosted OpenCTI intelligence platform. Output strict JSON "
+        "only — no prose, no code fences.\n\n"
+        "Schema. Either:\n"
+        '  {"cti": false}    — when the request is NOT about threat '
+        "intelligence / OpenCTI / investigations.\n"
+        "Or:\n"
+        '  {"cti": true, "command": "<name>", "args": {...}, '
+        '"say": "<one short butler-voice sentence>"}\n\n'
+        f"{_CTI_COMMANDS_GUIDE}\n\n"
+        "Rules:\n"
+        "- For 'log foo.com as a suspicious domain' → cti_add_observable "
+        '{"value": "foo.com", "observable_type": "domain"}.\n'
+        "- For 'open the intel panel' / 'show the threats dashboard' → "
+        "cti_open_panel (optionally with a dashboard slug).\n"
+        "- For 'what came in today' / 'today's threats' → cti_summary.\n"
+        "- `say` is one short sentence, butler tone "
+        "('Logged, sir.', 'On it, sir.', 'Searching the intel, sir.').\n"
+        '- If the request isn\'t about intel work, output {"cti": false}.'
+    )
+    try:
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=_ROUTER_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+                max_tokens=400,
+                response_format={"type": "json_object"},
+            ),
+            timeout=6.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cti router LLM failed: %s", exc)
+        return None
+    raw = (resp.choices[0].message.content or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+    try:
+        data = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cti router non-JSON: %s — %r", exc, raw[:200])
+        return None
+    if not isinstance(data, dict) or not data.get("cti"):
+        return None
+    cmd = (data.get("command") or "").strip()
+    if not cmd:
+        return None
+    return {
+        "cmd": cmd,
+        "args": data.get("args") or {},
+        "say": (data.get("say") or "").strip(),
+    }
+
+
+# OpenCTI observable type vocabulary — same map the server tool uses, kept
+# duplicated here so the worker can run without importing the backend.
+_OBSERVABLE_TYPE_MAP: dict[str, str] = {
+    "domain": "Domain-Name", "domain-name": "Domain-Name",
+    "hostname": "Hostname",
+    "ip": "IPv4-Addr", "ipv4": "IPv4-Addr",
+    "ipv6": "IPv6-Addr",
+    "url": "Url",
+    "email": "Email-Addr", "email-addr": "Email-Addr",
+    "md5": "StixFile", "sha1": "StixFile", "sha256": "StixFile",
+    "hash": "StixFile", "file": "StixFile",
+    "user-agent": "User-Agent",
+    "mutex": "Mutex",
+    "registry-key": "Windows-Registry-Key",
+}
+
+
+class OpenCTIClient:
+    """Thin async GraphQL client used by the worker's `_maybe_handle_cti`.
+
+    Lighter-weight than the backend's full `_OpenCTIClient` — we only need
+    the handful of operations the voice router emits. Lazy-initialised so
+    a deployment without `OPENCTI_URL` set just falls back to "OpenCTI
+    isn't configured, sir" instead of crashing.
+    """
+
+    def __init__(self) -> None:
+        self._client: httpx.AsyncClient | None = None
+        self._lock = asyncio.Lock()
+
+    async def _ensure(self) -> httpx.AsyncClient | None:
+        async with self._lock:
+            if self._client is not None:
+                return self._client
+            url = os.environ.get("OPENCTI_URL", "").rstrip("/")
+            token = os.environ.get("OPENCTI_TOKEN", "")
+            if not (url and token):
+                logger.warning(
+                    "opencti: OPENCTI_URL / OPENCTI_TOKEN not set"
+                )
+                return None
+            self._client = httpx.AsyncClient(
+                base_url=url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=httpx.Timeout(30.0, connect=10.0),
+            )
+            logger.info("opencti: worker client connected to %s", url)
+            return self._client
+
+    async def _gql(self, query: str, variables: dict | None = None) -> dict:
+        client = await self._ensure()
+        if client is None:
+            raise RuntimeError(
+                "OpenCTI unavailable — set OPENCTI_URL and OPENCTI_TOKEN "
+                "on the worker."
+            )
+        resp = await client.post(
+            "/graphql",
+            json={"query": query, "variables": variables or {}},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "errors" in data and data["errors"]:
+            raise RuntimeError(f"opencti errors: {data['errors'][:2]}")
+        return data.get("data") or {}
+
+    # ── Operations ───────────────────────────────────────────────
+
+    async def search(self, query: str, limit: int = 10) -> dict:
+        gql = """
+        query Search($search: String, $count: Int) {
+          stixCoreObjects(search: $search, first: $count) {
+            edges {
+              node {
+                id
+                entity_type
+                representative { main secondary }
+              }
+            }
+          }
+        }
+        """
+        data = await self._gql(gql, {"search": query, "count": limit})
+        edges = (data.get("stixCoreObjects") or {}).get("edges") or []
+        return {
+            "matches": [
+                {
+                    "id": (e.get("node") or {}).get("id"),
+                    "type": (e.get("node") or {}).get("entity_type"),
+                    "name": (
+                        ((e.get("node") or {}).get("representative") or {})
+                        .get("main")
+                        or ""
+                    ),
+                }
+                for e in edges
+            ],
+            "query": query,
+        }
+
+    async def add_observable(self, value: str, raw_type: str) -> dict:
+        obs_type = _OBSERVABLE_TYPE_MAP.get(
+            (raw_type or "").strip().lower(), raw_type or ""
+        )
+        if not obs_type:
+            raise RuntimeError(f"unknown observable type '{raw_type}'")
+        type_to_key: dict[str, str] = {
+            "Domain-Name": "DomainName", "Hostname": "Hostname",
+            "IPv4-Addr": "IPv4Addr", "IPv6-Addr": "IPv6Addr",
+            "Url": "Url", "Email-Addr": "EmailAddr",
+            "StixFile": "StixFile", "User-Agent": "UserAgent",
+            "Mutex": "Mutex",
+            "Windows-Registry-Key": "WindowsRegistryKey",
+        }
+        key = type_to_key.get(obs_type, obs_type.replace("-", ""))
+        if obs_type == "StixFile":
+            inner: dict = {
+                "name": value,
+                "hashes": [{"algorithm": "Unknown", "hash": value}],
+            }
+        elif obs_type == "Windows-Registry-Key":
+            inner = {"attribute_key": value}
+        else:
+            inner = {"value": value}
+        gql = """
+        mutation AddObs($input: StixCyberObservableAddInput!) {
+          stixCyberObservableAdd(input: $input) {
+            id
+            observable_value
+            entity_type
+          }
+        }
+        """
+        data = await self._gql(
+            gql, {"input": {"type": obs_type, key: inner}}
+        )
+        obs = data.get("stixCyberObservableAdd") or {}
+        return {
+            "id": obs.get("id"),
+            "value": obs.get("observable_value") or value,
+            "type": obs.get("entity_type") or obs_type,
+        }
+
+    async def create_incident(self, name: str, description: str = "") -> dict:
+        gql = """
+        mutation IncAdd($input: IncidentAddInput!) {
+          incidentAdd(input: $input) {
+            id
+            name
+          }
+        }
+        """
+        data = await self._gql(
+            gql, {"input": {"name": name, "description": description}}
+        )
+        inc = data.get("incidentAdd") or {}
+        return {"id": inc.get("id"), "name": inc.get("name")}
+
+    async def link(self, from_id: str, to_id: str, rel: str = "related-to") -> dict:
+        gql = """
+        mutation RelAdd($input: StixCoreRelationshipAddInput!) {
+          stixCoreRelationshipAdd(input: $input) {
+            id
+            relationship_type
+          }
+        }
+        """
+        data = await self._gql(
+            gql,
+            {
+                "input": {
+                    "fromId": from_id,
+                    "toId": to_id,
+                    "relationship_type": rel,
+                }
+            },
+        )
+        r = data.get("stixCoreRelationshipAdd") or {}
+        return {
+            "id": r.get("id"),
+            "relationship": r.get("relationship_type") or rel,
+        }
+
+    async def summary(self, hours: int = 24) -> dict:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        gql = """
+        query Summary($filters: FilterGroup) {
+          stixCoreObjects(
+            filters: $filters,
+            first: 8,
+            orderBy: created_at,
+            orderMode: desc
+          ) {
+            pageInfo { globalCount }
+            edges {
+              node {
+                entity_type
+                representative { main }
+              }
+            }
+          }
+        }
+        """
+        filters = {
+            "mode": "and",
+            "filters": [
+                {
+                    "key": "created_at",
+                    "operator": "gt",
+                    "values": [cutoff],
+                }
+            ],
+            "filterGroups": [],
+        }
+        data = await self._gql(gql, {"filters": filters})
+        block = data.get("stixCoreObjects") or {}
+        total = (block.get("pageInfo") or {}).get("globalCount", 0)
+        edges = block.get("edges") or []
+        return {
+            "window_hours": hours,
+            "total": total,
+            "recent": [
+                {
+                    "type": (e.get("node") or {}).get("entity_type"),
+                    "name": (
+                        ((e.get("node") or {}).get("representative") or {})
+                        .get("main", "")
+                    ),
+                }
+                for e in edges
+            ],
+        }
+
+    async def list_indicators(self, limit: int = 10) -> dict:
+        gql = """
+        query Inds($count: Int) {
+          indicators(
+            first: $count, orderBy: created_at, orderMode: desc
+          ) {
+            edges {
+              node {
+                id
+                name
+                x_opencti_score
+              }
+            }
+          }
+        }
+        """
+        data = await self._gql(gql, {"count": limit})
+        edges = (data.get("indicators") or {}).get("edges") or []
+        return {
+            "indicators": [
+                {
+                    "id": (e.get("node") or {}).get("id"),
+                    "name": (e.get("node") or {}).get("name"),
+                    "score": (e.get("node") or {}).get("x_opencti_score"),
+                }
+                for e in edges
+            ],
+        }
+
+
+def _cti_reply(cmd: str, args: dict, res: dict) -> str:
+    """Format an OpenCTI result into a single butler sentence."""
+    if not isinstance(res, dict) or res.get("error"):
+        err = res.get("error") if isinstance(res, dict) else "no response"
+        return f"OpenCTI hiccup, sir — {err}"
+    if cmd == "cti_search":
+        matches = res.get("matches") or []
+        if not matches:
+            q = args.get("query", "that")
+            return f"Nothing in the intel for '{q}', sir."
+        head = ", ".join(
+            f"{m.get('name','?')} ({m.get('type','')})"
+            for m in matches[:5]
+        )
+        return f"{len(matches)} hits, sir — {head}."
+    if cmd == "cti_add_observable":
+        return (
+            f"Logged {args.get('value', res.get('value', 'it'))} as a "
+            f"{args.get('observable_type', res.get('type', 'observable'))}, sir."
+        )
+    if cmd == "cti_create_incident":
+        return (
+            f"Incident '{args.get('name', res.get('name', 'unnamed'))}' "
+            "is on the books, sir."
+        )
+    if cmd == "cti_link":
+        rel = args.get("relationship") or res.get("relationship") or "related-to"
+        return f"Linked, sir — {rel}."
+    if cmd == "cti_summary":
+        total = res.get("total", 0)
+        hours = res.get("window_hours", args.get("hours", 24))
+        if not total:
+            return f"Nothing new in the last {hours} hours, sir."
+        recent = res.get("recent") or []
+        names = ", ".join(
+            r.get("name", r.get("type", "?")) for r in recent[:3]
+        )
+        return (
+            f"{total} new objects in the last {hours} hours, sir — "
+            f"latest: {names}."
+        )
+    if cmd == "cti_list_indicators":
+        items = res.get("indicators") or []
+        if not items:
+            return "No recent indicators, sir."
+        return (
+            f"{len(items)} recent indicators, sir — "
+            + ", ".join(i.get("name", "?") for i in items[:4])
+            + "."
+        )
+    if cmd == "cti_open_panel":
+        return "Intelligence panel is up, sir."
+    return "Done, sir."
+
+
 class DesktopBridge:
     """Lazy LiveKit connection to the desktop-bridge control room.
 
@@ -1019,6 +1472,8 @@ class Assistant(Agent):
         self._room = room
         # Desktop control — lazy 2nd LiveKit connection to the PCs' bridge.
         self._desktop = DesktopBridge()
+        # OpenCTI — lazy GraphQL client; idle until the first CTI turn.
+        self._cti = OpenCTIClient()
         # Wake/sleep: dormant on connect, woken by "Hey Jarvis".
         self._awake = False
         # Set by the interim-transcript wake listener: the next turn is
@@ -1332,6 +1787,110 @@ class Assistant(Agent):
             "At your service, sir. "
             + " and ".join(online).capitalize()
             + " are both online."
+        )
+
+    async def _maybe_handle_cti(self, text: str) -> bool:
+        """Operate OpenCTI via the LLM intent router.
+
+        Mirrors `_maybe_handle_desktop`: broad keyword gate → LLM router
+        → OpenCTI GraphQL call → spoken result. Returns True when the
+        turn was handled (caller stops the turn).
+        """
+        if not text or not _CTI_HINT_RE.search(text):
+            return False
+
+        # Fast path — "open the intel panel" doesn't need an LLM call,
+        # just mount the widget. Cheaper and zero-latency.
+        if _CTI_OPEN_RE.search(text):
+            await self._open_cti_panel()
+            try:
+                await self.session.say("Intelligence panel is up, sir.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        routed = await _route_cti(text)
+        if routed is None:
+            return False
+        cmd = routed["cmd"]
+        args = routed["args"] or {}
+        say_hint = routed.get("say", "")
+
+        # Quick acknowledgement for ops that might take a moment.
+        info_cmds = {"cti_search", "cti_summary", "cti_list_indicators"}
+        if say_hint and cmd not in info_cmds:
+            try:
+                await self.session.say(say_hint)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Dispatch.
+        res: dict
+        try:
+            if cmd == "cti_search":
+                res = await self._cti.search(
+                    str(args.get("query", "")),
+                    int(args.get("limit") or 10),
+                )
+            elif cmd == "cti_add_observable":
+                res = await self._cti.add_observable(
+                    str(args.get("value", "")),
+                    str(args.get("observable_type", "")),
+                )
+            elif cmd == "cti_create_incident":
+                res = await self._cti.create_incident(
+                    str(args.get("name", "")),
+                    str(args.get("description", "")),
+                )
+            elif cmd == "cti_link":
+                res = await self._cti.link(
+                    str(args.get("from_id", "")),
+                    str(args.get("to_id", "")),
+                    str(args.get("relationship") or "related-to"),
+                )
+            elif cmd == "cti_summary":
+                res = await self._cti.summary(int(args.get("hours") or 24))
+            elif cmd == "cti_list_indicators":
+                res = await self._cti.list_indicators(
+                    int(args.get("limit") or 10)
+                )
+            elif cmd == "cti_open_panel":
+                await self._open_cti_panel(
+                    dashboard=args.get("dashboard"),
+                    path=args.get("path"),
+                )
+                res = {"opened": True}
+            else:
+                res = {"error": f"unknown cti command '{cmd}'"}
+        except Exception as exc:  # noqa: BLE001
+            logger.error("cti %s failed: %s", cmd, exc)
+            res = {"error": str(exc)}
+
+        try:
+            await self.session.say(_cti_reply(cmd, args, res))
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _open_cti_panel(
+        self, dashboard: str | None = None, path: str | None = None
+    ) -> None:
+        """Publish an `open_widget` for the cti panel on the jarvis-ui topic."""
+        payload: dict = {}
+        cti_url = os.environ.get("OPENCTI_URL", "").rstrip("/")
+        if cti_url:
+            payload["url"] = cti_url
+        if path:
+            payload["path"] = path
+        if dashboard:
+            payload["dashboard"] = dashboard
+        await self._publish_ui(
+            {
+                "type": "open_widget",
+                "kind": "cti",
+                "title": "Intelligence",
+                "payload": payload,
+            }
         )
 
     async def _maybe_handle_desktop(self, text: str) -> bool:
@@ -1725,6 +2284,11 @@ class Assistant(Agent):
         # Handled by regex (worker @function_tools never fire on
         # OpenJarvis); we speak our own confirmation, so stop the turn.
         if await self._maybe_handle_content(text):
+            raise StopResponse()
+
+        # Intelligence — OpenCTI graph operations. Runs BEFORE desktop so
+        # "log foo.com as suspicious" doesn't get mistaken for a file op.
+        if await self._maybe_handle_cti(text):
             raise StopResponse()
 
         # Desktop control — operate the user's Windows machines. Regex

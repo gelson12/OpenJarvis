@@ -244,4 +244,12 @@ try:
 except ImportError:
     pass
 
+# OpenCTI — Jarvis's intelligence / investigation layer (search the graph,
+# log observables, open incidents, link entities, summarise). Soft-skips
+# if httpx is not installed.
+try:
+    import openjarvis.tools.opencti  # noqa: F401
+except ImportError:
+    pass
+
 __all__ = ["BaseTool", "ToolExecutor", "ToolSpec"]

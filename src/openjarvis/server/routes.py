@@ -146,6 +146,16 @@ _TOOL_GROUP_TRIGGERS: dict[str, tuple[str, ...]] = {
         "on the rog", "on my", "open notepad", "run command",
         "list the folder", "list the directory", "read the file",
     ),
+    "opencti": (
+        "opencti", "cti", "intel", "intelligence", "threat",
+        "threats", "observable", "observables", "indicator",
+        "indicators", "incident", "incidents", "investigate",
+        "investigation", "adversary", "actor", "threat actor",
+        "ioc", "iocs", "stix", "kill chain", "campaign", "malware",
+        "suspicious domain", "suspicious ip", "suspicious url",
+        "log the domain", "log this", "phishing", "breach",
+        "indicators of compromise",
+    ),
     "web_search": (
         "search the web", "google", "google it", "look up", "look it up",
         "what is", "who is", "when did", "find out about",
@@ -198,6 +208,7 @@ def _build_group_caches() -> tuple[dict[str, list[dict]], dict[str, str]]:
         "weather_": "weather",
         "geocode_": "location",
         "desktop_": "desktop",
+        "opencti_": "opencti",
         "web_search": "web_search",
     }
     exact_to_group: dict[str, str] = {

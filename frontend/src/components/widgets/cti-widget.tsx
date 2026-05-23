@@ -1,0 +1,45 @@
+// The OpenCTI intelligence panel. An iframe pointing at a self-hosted
+// OpenCTI instance — the worker supplies the URL in the payload (so it
+// can deep-link a specific dashboard), with VITE_OPENCTI_URL as the
+// build-time fallback.
+//
+// Auth: OpenCTI sets a persistent session cookie on first login. After
+// the user has logged in once in the same browser, this iframe just
+// works. For unauthenticated embedding, deploy a public dashboard and
+// whitelist this frontend's host via APP__PUBLIC_DASHBOARD_AUTHORIZED_DOMAINS.
+
+import type { CTIPayload, WidgetComponentProps } from '@/lib/jarvis-ui/protocol';
+import { WidgetStatus } from './widget-status';
+
+function joinUrl(base: string, path?: string): string {
+  const b = base.replace(/\/+$/, '');
+  if (!path) return b;
+  const p = path.startsWith('/') ? path : `/${path}`;
+  return `${b}${p}`;
+}
+
+export function CTIWidget({ widget }: WidgetComponentProps) {
+  const data = widget.payload as CTIPayload | undefined;
+  const baseUrl = data?.url || import.meta.env.VITE_OPENCTI_URL || '';
+
+  if (!baseUrl) {
+    return (
+      <WidgetStatus text="OpenCTI URL not configured. Set VITE_OPENCTI_URL or pass `url` in the widget payload." />
+    );
+  }
+
+  const src = joinUrl(baseUrl, data?.path);
+
+  return (
+    <iframe
+      title="OpenCTI Intelligence"
+      src={src}
+      className="h-full w-full border-0"
+      loading="lazy"
+      referrerPolicy="no-referrer-when-downgrade"
+      // OpenCTI loads worker scripts, postMessage, and dashboard
+      // visualisations — give it the standard permissive iframe sandbox.
+      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads allow-popups-to-escape-sandbox"
+    />
+  );
+}
