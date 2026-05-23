@@ -2274,11 +2274,18 @@ class Assistant(Agent):
         # Jarvis", return to dormant on "goodbye Jarvis".
         if self._just_woke:
             # The interim-transcript listener already woke us mid-utterance
-            # — strip the wake word and answer whatever followed it.
+            # — answer whatever followed the wake word.
             self._just_woke = False
             rest = _WAKE_RE.sub("", text).strip(" ,.!?-")
             if rest:
-                new_message.content = [rest]
+                # Update local `text` so downstream regex handlers see the
+                # clean query. Deliberately DO NOT mutate
+                # new_message.content here — livekit-agents fires
+                # preemptive LLM generation on the transcribed text before
+                # on_user_turn_completed completes, and mutating the
+                # message invalidates the speculative result, adding
+                # whole-RTT latency to every wake turn. Modern LLMs cope
+                # with a leading "Hey Jarvis," prefix fine.
                 text = rest
             else:
                 await self.session.say(await self._wake_greeting())
@@ -2290,8 +2297,8 @@ class Assistant(Agent):
                 self._awake = True
                 rest = _WAKE_RE.sub("", text).strip(" ,.!?-")
                 if rest:
-                    # "Jarvis, what's the time" — answer what followed.
-                    new_message.content = [rest]
+                    # Same as above — update local text but don't mutate
+                    # new_message.content; preserves preemptive generation.
                     text = rest
                 else:
                     await self.session.say(await self._wake_greeting())
@@ -2447,12 +2454,28 @@ async def entrypoint(ctx: agents.JobContext):
         raise RuntimeError("TTS provider unavailable") from exc
 
     session = AgentSession(
+        # Preemptive generation fires a speculative LLM call mid-turn,
+        # *hoping* the chat context and tools won't change by the time
+        # `on_user_turn_completed` runs. OpenJarvis re-injects tools on
+        # every turn (see routes.py auto-inject), so the speculative call
+        # is ALWAYS thrown away — the framework logs:
+        #   "preemptive generation enabled but chat context or tools
+        #    have changed after on_user_turn_completed"
+        # …and we pay the latency of a wasted request without any speed-up.
+        # Disable it; voice latency drops by one full network round-trip.
+        preemptive_generation=False,
         vad=ctx.proc.userdata["vad"],
         stt=stt,
         llm=openai.LLM(
             model=model_name,
             base_url=f"{openjarvis_url}/v1",
             api_key=openjarvis_key,
+            # Per-attempt cap. Without this, a single hung upstream
+            # cloud-engine attempt can sit for tens of seconds before
+            # the framework gives up + retries — that's the visible
+            # 10-12s "Jarvis just sits there" gap reported by users.
+            # 8s is generous for normal completions but kills hangs fast.
+            timeout=8.0,
             extra_headers={
                 **_openjarvis_auth_headers(),
                 # Tell OpenJarvis to emit a STRICT OpenAI SSE stream
