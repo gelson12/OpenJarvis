@@ -441,9 +441,11 @@ def _clean_query(text: str) -> str:
         prev = q
         q = _QUERY_NOISE.sub(" ", q)
     q = re.sub(r"\s+", " ", q).strip(" ,.?!-\"'")
-    # Drop a dangling leading article left after the command word is gone
-    # ("play a video of cars" -> "a cars" -> "cars").
-    q = re.sub(r"^(?:a|an|the|some|my)\b\s*", "", q, flags=re.I)
+    # Drop a dangling leading article / filler pronoun left after the
+    # command word is gone ("play a video of cars" -> "a cars" -> "cars";
+    # "google me tom cruise" -> "me tom cruise" -> "tom cruise"). "me"
+    # added because "google me X" / "search me X" are common spoken forms.
+    q = re.sub(r"^(?:a|an|the|some|my|me|for\s+me)\b\s*", "", q, flags=re.I)
     return q
 
 
@@ -463,6 +465,17 @@ def _content_intent(text: str):
         return ("browser", url.group(1) if url else "")
     if url:
         return ("browser", url.group(1))
+
+    # "google map(s)" is unambiguous — must route to maps, NOT websearch.
+    # Without this, the bare "google" in _WEBSEARCH_RE swallows the phrase
+    # and we search the web for "map" (zero useful results). Checked
+    # before youtube/news/maps so "show me the google map" works without
+    # needing the _CONTENT_VERB gate that protects the bare "map".
+    if re.search(r"\bgoogle\s+maps?\b", low):
+        q = re.sub(r"\b(?:google\s+)?maps?\b|\bnavigation\b", " ", t, flags=re.I)
+        q = _clean_query(q)
+        q = re.sub(r"^(?:of|to|for|the|on)\s+", "", q, flags=re.I).strip()
+        return ("maps", q)
 
     if _YOUTUBE_RE.search(low):
         # The query can sit either side of "youtube" ("cars on youtube",
@@ -2454,16 +2467,12 @@ async def entrypoint(ctx: agents.JobContext):
         raise RuntimeError("TTS provider unavailable") from exc
 
     session = AgentSession(
-        # Preemptive generation fires a speculative LLM call mid-turn,
-        # *hoping* the chat context and tools won't change by the time
-        # `on_user_turn_completed` runs. OpenJarvis re-injects tools on
-        # every turn (see routes.py auto-inject), so the speculative call
-        # is ALWAYS thrown away — the framework logs:
-        #   "preemptive generation enabled but chat context or tools
-        #    have changed after on_user_turn_completed"
-        # …and we pay the latency of a wasted request without any speed-up.
-        # Disable it; voice latency drops by one full network round-trip.
-        preemptive_generation=False,
+        # NOTE: preemptive_generation left at its default (True). The
+        # wake-gate fix in commit 1e6dcc2 stops mutating
+        # new_message.content, so the framework's speculative mid-turn
+        # LLM call is no longer invalidated on wake turns and actually
+        # saves a round-trip. Setting this to False here would defeat
+        # that work.
         vad=ctx.proc.userdata["vad"],
         stt=stt,
         llm=openai.LLM(
