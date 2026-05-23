@@ -399,8 +399,16 @@ _CONTENT_VERB = re.compile(
 _QUERY_NOISE = re.compile(
     r"\b(?:hey |ok |okay )?jarvis\b"
     r"|\b(?:can|could|would|will)\s+you\b|\bplease\b|\bfor me\b"
+    # Polite request stems. The previous version only caught "I want to"
+    # / "I'd like to" — it dropped "I would like to google Tom Cruise"
+    # into the LLM as a junk search query ("I would like to Tom Cruise")
+    # because "I would like to" was left in. Now covers like/love/want/
+    # prefer in both contracted ("I'd") and uncontracted ("I would") form,
+    # plus "let's" / "let me".
     r"|\bi\s+(?:want|need|wanna)(?:\s+to|\s+you\s+to)?\b"
-    r"|\bi'?d\s+like(?:\s+to|\s+you\s+to)?\b"
+    r"|\bi\s+would\s+(?:like|love|want|prefer)(?:\s+to|\s+you\s+to)?\b"
+    r"|\bi'?d\s+(?:like|love|want|prefer)(?:\s+to|\s+you\s+to)?\b"
+    r"|\blet'?s\b|\blet\s+me\b"
     r"|\b(?:search(?:\s+the\s+(?:web|internet))?(?:\s+for)?|google|look\s+up"
     r"|web\s+search(?:\s+for)?|find(?:\s+me)?|show(?:\s+me)?|bring\s+up"
     r"|pull\s+up|put\s+up|open|play|get\s+me|display|watch|see)\b"
