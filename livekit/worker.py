@@ -120,10 +120,14 @@ def prewarm(proc: agents.JobProcess):
     """
     try:
         proc.userdata["vad"] = silero.VAD.load(
+            # Tuned even tighter than before for sub-second wake-word
+            # response. A short word like "Jarvis" is ~0.4s of audio; if
+            # silence detection lags, the full turn is delayed by that
+            # much before STT even returns the final transcript.
             min_speech_duration=0.02,
-            min_silence_duration=0.25,
-            activation_threshold=0.38,
-            prefix_padding_duration=0.35,
+            min_silence_duration=0.20,
+            activation_threshold=0.35,
+            prefix_padding_duration=0.20,
         )
     except TypeError:
         # Older silero plugin without these kwargs — fall back to defaults.
@@ -326,7 +330,19 @@ def _classify_intent(text: str) -> str:
 # false positive is harmless (it just wakes), so we accept the common
 # variants to make activation reliable.
 _WAKE_RE = re.compile(
-    r"\b(jarvis|jarviss|jarvi|jervis|travis|java'?s|charvis)\b", re.I
+    # Deepgram routinely mis-hears "Jarvis" as one of these. False wakes
+    # are harmless (dormant just flips on; user can sleep again), so we
+    # err on the side of recall. Every entry here came from a real
+    # mis-transcription either reported by the user or seen in
+    # production logs / community reports.
+    r"\b("
+    r"jarvis|jarviss|jarvi|jarves|jervis|jervi|jeevis|"
+    r"travis|harvey|harvis|jarvey|charvis|carvis|"
+    r"java'?s|javis|jarv|garvis|"
+    r"drivers|driver|service|services|"
+    r"jaris|jarus|jervice|jarvice"
+    r")\b",
+    re.I,
 )
 _SLEEP_RE = re.compile(
     r"\b(good\s?bye|go to sleep|sleep now|that'?s all for now|stand down)\b",
