@@ -27,8 +27,22 @@ const LOOKS: Record<string, StateLook> = {
   disconnected: { r: 108, g: 120, b: 142, spin: 0.0008, swirl: 0.0 },
 };
 
-const PARTICLE_COUNT = 150;
+export const PARTICLE_COUNT = 150;
 const LINKS_PER_NODE = 2;
+
+/**
+ * Live stats written by the active NeuralOrb each frame so external HUD
+ * components (e.g. the VoicePage `NODES` readout) can mirror the orb's
+ * real state instead of showing a hardcoded number.
+ *  - `active` : count of front-facing particles this frame (depth > 0.5)
+ *  - `total`  : PARTICLE_COUNT
+ *  - `level`  : smoothed mic/output RMS, 0..1
+ */
+export const orbStats = {
+  active: PARTICLE_COUNT,
+  total: PARTICLE_COUNT,
+  level: 0,
+};
 
 interface P3 {
   x: number;
@@ -191,6 +205,7 @@ export function NeuralOrb({
       const sx = new Float32Array(pts.length);
       const sy = new Float32Array(pts.length);
       const sd = new Float32Array(pts.length); // depth 0..1 (1 = nearest)
+      let activeFront = 0;
       for (let i = 0; i < pts.length; i++) {
         const p = pts[i];
         // per-particle swirl twists the sphere as it "thinks"
@@ -209,7 +224,12 @@ export function NeuralOrb({
         sx[i] = cx + x * r;
         sy[i] = cy + y * r;
         sd[i] = (z + 1.25) / 2.5;
+        if (sd[i] > 0.5) activeFront++;
       }
+
+      // Publish for external readouts (NODES HUD value, etc.)
+      orbStats.active = activeFront;
+      orbStats.level = level;
 
       // 1. neighbour links — the "neural" mesh
       ctx.lineWidth = 1;

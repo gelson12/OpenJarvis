@@ -93,9 +93,22 @@ export function AmbientBackground() {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
 
-      const cx = w / 2;
-      const cy = h / 2;
-      const maxR = Math.hypot(w, h) / 2;
+      // Dispersion origin — defaults to window centre, but VoicePage
+      // overrides it to the live orb position so the grid pulse-rings and
+      // intersection glow appear to *radiate from the orb itself*.
+      const css = getComputedStyle(document.documentElement);
+      const ox = parseFloat(css.getPropertyValue('--ambient-origin-x'));
+      const oy = parseFloat(css.getPropertyValue('--ambient-origin-y'));
+      const cx = Number.isFinite(ox) ? ox : w / 2;
+      const cy = Number.isFinite(oy) ? oy : h / 2;
+      // maxR from the chosen origin to the farthest screen corner so the
+      // pulse always reaches the edges no matter how off-centre we are.
+      const maxR = Math.max(
+        Math.hypot(cx, cy),
+        Math.hypot(w - cx, cy),
+        Math.hypot(cx, h - cy),
+        Math.hypot(w - cx, h - cy),
+      );
       // slow diagonal drift so the whole grid feels alive
       const driftX = ((t * 0.07) % CELL + CELL) % CELL;
       const driftY = ((t * 0.05) % CELL + CELL) % CELL;

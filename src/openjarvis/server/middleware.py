@@ -59,7 +59,17 @@ def create_security_middleware() -> Any:
                 "connect-src 'self' https://*.livekit.cloud "
                 "wss://*.livekit.cloud; "
                 "media-src 'self' blob: mediastream:; "
-                "worker-src 'self' blob:"
+                "worker-src 'self' blob:; "
+                # frame-src: voice widgets embed YouTube (nocookie) +
+                # vanilla youtube.com. Without this the iframe falls back
+                # to default-src 'self' and renders the browser's
+                # "content blocked" page.
+                "frame-src 'self' https://www.youtube-nocookie.com "
+                "https://www.youtube.com https://youtube.com; "
+                # img-src: YouTube thumbnails come from i.ytimg.com /
+                # i9.ytimg.com; result-card thumbnails from arbitrary
+                # https hosts. data: keeps inline placeholders working.
+                "img-src 'self' data: blob: https:"
             )
             return response
 
@@ -78,6 +88,9 @@ SECURITY_HEADERS = {
         "default-src 'self' 'unsafe-inline' 'unsafe-eval'; "
         "connect-src 'self' https://*.livekit.cloud wss://*.livekit.cloud; "
         "media-src 'self' blob: mediastream:; "
-        "worker-src 'self' blob:"
+        "worker-src 'self' blob:; "
+        "frame-src 'self' https://www.youtube-nocookie.com "
+        "https://www.youtube.com https://youtube.com; "
+        "img-src 'self' data: blob: https:"
     ),
 }

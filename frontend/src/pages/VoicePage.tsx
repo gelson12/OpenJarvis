@@ -15,7 +15,7 @@ import {
 } from '@livekit/components-react';
 import { Track, MediaDeviceFailure } from 'livekit-client';
 import { motion } from 'motion/react';
-import { NeuralOrb } from '../components/NeuralOrb';
+import { NeuralOrb, PARTICLE_COUNT, orbStats } from '../components/NeuralOrb';
 import { WidgetLayer } from '@/components/widgets/widget-layer';
 import { JarvisUIProvider } from '@/lib/jarvis-ui/store';
 
@@ -53,6 +53,19 @@ function useClock() {
     return () => clearInterval(id);
   }, []);
   return t.toTimeString().slice(0, 8);
+}
+
+/**
+ * Live "active nodes" readout, polled from the orb's render loop. Refreshed
+ * ~4×/s — fast enough to feel sensor-driven, slow enough to read.
+ */
+function useActiveNodes() {
+  const [n, setN] = useState(orbStats.active);
+  useEffect(() => {
+    const id = setInterval(() => setN(orbStats.active), 240);
+    return () => clearInterval(id);
+  }, []);
+  return n;
 }
 
 /** A single label / value row in a HUD column. */
@@ -141,6 +154,7 @@ function VoiceHud() {
   const segments = useTranscriptions();
   const look = CORE_BY_STATE[state] ?? CORE_BY_STATE.disconnected;
   const clock = useClock();
+  const activeNodes = useActiveNodes();
 
   return (
     <>
@@ -185,7 +199,11 @@ function VoiceHud() {
         transition={{ duration: 0.5 }}
       >
         <HudRow label="EXCHANGES" value={String(segments.length).padStart(3, '0')} />
-        <HudRow label="NODES" value="150" />
+        <HudRow
+          label="NODES"
+          value={`${String(activeNodes).padStart(3, '0')} / ${PARTICLE_COUNT}`}
+          glow={look.glow}
+        />
         <HudRow label="MODE" value="VOICE" glow={look.glow} />
       </motion.div>
     </>
@@ -249,7 +267,7 @@ function SelfView() {
   if (!cam) return null;
   return (
     <div
-      className="absolute bottom-4 right-4 h-28 w-40 overflow-hidden rounded-lg border"
+      className="absolute bottom-5 left-5 z-20 h-28 w-40 overflow-hidden rounded-lg border shadow-lg"
       style={{ borderColor: 'var(--color-accent, #1fd5f9)' }}
     >
       <VideoTrack trackRef={cam} className="h-full w-full object-cover" />
@@ -276,9 +294,101 @@ function UiCommandBridge() {
   return null;
 }
 
+/**
+ * Off-axis orbit ring — an elliptical guide pinned to the *original* flex
+ * centre. The orb has been translated down-left, so this ring now reads as
+ * the orb's natural orbit with the orb sitting off-axis on it. Without the
+ * ring the orb shift looks like a layout bug; with it, the asymmetry feels
+ * intentional and cinematic.
+ */
+function OffAxisOrbitRing({ glow }: { glow: string }) {
+  return (
+    <svg
+      aria-hidden="true"
+      className="pointer-events-none absolute inset-0 m-auto"
+      viewBox="-100 -100 200 200"
+      preserveAspectRatio="xMidYMid meet"
+      style={{
+        width: 'clamp(360px, 56vh, 580px)',
+        height: 'clamp(360px, 56vh, 580px)',
+      }}
+    >
+      <defs>
+        <radialGradient id="orbit-fade" cx="50%" cy="50%" r="50%">
+          <stop offset="60%" stopColor={glow} stopOpacity="0" />
+          <stop offset="100%" stopColor={glow} stopOpacity="0.18" />
+        </radialGradient>
+      </defs>
+      {/* outer elliptical orbit, slightly tilted */}
+      <g transform="rotate(-12)">
+        <ellipse
+          cx="0"
+          cy="0"
+          rx="92"
+          ry="62"
+          fill="none"
+          stroke={`${glow}55`}
+          strokeWidth="0.5"
+          strokeDasharray="1.4 3.2"
+        />
+        <ellipse
+          cx="0"
+          cy="0"
+          rx="78"
+          ry="50"
+          fill="none"
+          stroke={`${glow}28`}
+          strokeWidth="0.4"
+        />
+      </g>
+      {/* a soft anchor dot at the geometric centre — the "would-be" core */}
+      <circle cx="0" cy="0" r="1.4" fill={`${glow}aa`} />
+      <circle cx="0" cy="0" r="3" fill="none" stroke={`${glow}55`} strokeWidth="0.3" />
+      <circle cx="0" cy="0" r="50" fill="url(#orbit-fade)" />
+    </svg>
+  );
+}
+
+/**
+ * Publishes the orb's live screen-centre to CSS custom properties so
+ * `AmbientBackground` can radiate its grid pulse-rings from the orb's
+ * actual position (not window centre). Cleans up on unmount so other
+ * pages fall back to the default centred dispersion.
+ */
+function useAmbientOriginSync(ref: React.RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const root = document.documentElement;
+    const update = () => {
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      root.style.setProperty('--ambient-origin-x', `${cx.toFixed(1)}px`);
+      root.style.setProperty('--ambient-origin-y', `${cy.toFixed(1)}px`);
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    window.addEventListener('resize', update);
+    // Cheap heartbeat in case parent layout shifts without a resize event
+    // (sidebar collapse, panel open, etc.). 2 Hz is plenty for ambient.
+    const id = window.setInterval(update, 500);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', update);
+      window.clearInterval(id);
+      root.style.removeProperty('--ambient-origin-x');
+      root.style.removeProperty('--ambient-origin-y');
+    };
+  }, [ref]);
+}
+
 function VoiceSession({ onEnd }: { onEnd: () => void }) {
   const { state } = useVoiceAssistant();
   const look = CORE_BY_STATE[state] ?? CORE_BY_STATE.disconnected;
+  const orbWrapRef = useRef<HTMLDivElement>(null);
+  useAmbientOriginSync(orbWrapRef);
 
   return (
     <JarvisUIProvider>
@@ -295,9 +405,19 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
         transition={{ duration: 11, repeat: Infinity, ease: 'easeInOut' }}
       />
 
-      {/* Alive core */}
-      <div className="flex flex-1 items-center justify-center">
-        <AliveCore />
+      {/* Alive core — biased slightly down-and-left for a more cinematic,
+          rule-of-thirds composition. The OffAxisOrbitRing stays pinned to
+          the original geometric centre, so the orb now reads as sitting
+          off-axis on its own orbit instead of "misaligned". */}
+      <div className="relative flex flex-1 items-center justify-center">
+        <OffAxisOrbitRing glow={look.glow} />
+        <div
+          ref={orbWrapRef}
+          style={{ transform: 'translate(-4vw, 3vh)' }}
+          className="relative will-change-transform"
+        >
+          <AliveCore />
+        </div>
       </div>
 
       {/* Transcript */}
@@ -305,29 +425,34 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
         <Transcript />
       </div>
 
-      {/* Controls */}
-      <div className="mb-4 flex flex-wrap items-center justify-center gap-3">
-        <VoiceAssistantControlBar />
-        <TrackToggle
-          source={Track.Source.Camera}
-          showIcon
-          className="rounded-full px-4 py-2 text-sm font-medium"
-          style={{ background: 'var(--color-bg-secondary, #1e293b)', color: 'var(--color-text)' }}
-        >
-          Camera
-        </TrackToggle>
-        <StartAudio
-          label="🔊 Enable audio"
-          className="rounded-full px-4 py-2 text-sm font-medium"
-          style={{ background: 'var(--color-accent, #1fd5f9)', color: '#04121a' }}
-        />
-        <button
-          onClick={onEnd}
-          className="rounded-full px-5 py-2 text-sm font-medium transition-opacity hover:opacity-80"
-          style={{ background: 'var(--color-error, #e5484d)', color: 'white' }}
-        >
-          End session
-        </button>
+      {/* Controls — right-anchored to mirror the SYS TIME / right HUD
+          column. Combined with the bottom-left SelfView, the four corners
+          read as mirror-symmetric, and the off-axis orb breaks that
+          symmetry on purpose. */}
+      <div className="pointer-events-none absolute bottom-5 right-5 z-20 flex flex-col items-end gap-2">
+        <div className="pointer-events-auto flex flex-wrap items-center justify-end gap-2">
+          <VoiceAssistantControlBar />
+          <TrackToggle
+            source={Track.Source.Camera}
+            showIcon
+            className="rounded-full px-4 py-2 text-sm font-medium"
+            style={{ background: 'var(--color-bg-secondary, #1e293b)', color: 'var(--color-text)' }}
+          >
+            Camera
+          </TrackToggle>
+          <StartAudio
+            label="Enable audio"
+            className="rounded-full px-4 py-2 text-sm font-medium"
+            style={{ background: 'var(--color-accent, #1fd5f9)', color: '#04121a' }}
+          />
+          <button
+            onClick={onEnd}
+            className="rounded-full px-5 py-2 text-sm font-medium transition-opacity hover:opacity-80"
+            style={{ background: 'var(--color-error, #e5484d)', color: 'white' }}
+          >
+            End session
+          </button>
+        </div>
       </div>
 
         <RoomAudioRenderer />
