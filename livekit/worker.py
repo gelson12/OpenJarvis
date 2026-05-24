@@ -1823,12 +1823,347 @@ class DesktopBridge:
             self._pending.pop(cmd_id, None)
 
 
+# ── Mobile bridge (Android phone via mobile-bridge APK) ──────────────
+_MOBILE_TOPIC_CMD = "mobile-cmd"
+_MOBILE_TOPIC_RESULT = "mobile-result"
+_MOBILE_IDENTITY_PREFIX = "mobile-bridge-"
+
+
+class MobileBridge:
+    """Lazy LiveKit connection to the mobile-bridge control room.
+
+    Mirrors DesktopBridge but for the phone APK. Same control room,
+    different topics + identity prefix so the wire contract is cleanly
+    versioned away from the desktop-bridge.
+    """
+
+    def __init__(self) -> None:
+        self._room: rtc.Room | None = None
+        self._pending: dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _phone_from_identity(identity: str) -> str | None:
+        if not identity or not identity.startswith(_MOBILE_IDENTITY_PREFIX):
+            return None
+        return identity[len(_MOBILE_IDENTITY_PREFIX):].strip().lower() or None
+
+    def online_phones(self) -> list[str]:
+        if self._room is None:
+            return []
+        phones: set[str] = set()
+        for p in self._room.remote_participants.values():
+            name = self._phone_from_identity(getattr(p, "identity", "") or "")
+            if name:
+                phones.add(name)
+        return sorted(phones)
+
+    def is_online(self, phone: str) -> bool:
+        p = (phone or "").strip().lower()
+        if p in ("", "any", "all", "phone", "mobile"):
+            return bool(self.online_phones())
+        return p in set(self.online_phones())
+
+    async def _ensure(self) -> rtc.Room | None:
+        async with self._lock:
+            if self._room is not None:
+                return self._room
+            url = os.environ.get("LIVEKIT_URL", "")
+            key = os.environ.get("LIVEKIT_API_KEY", "")
+            secret = os.environ.get("LIVEKIT_API_SECRET", "")
+            if not (url and key and secret):
+                logger.warning("mobile bridge: LIVEKIT_* env not set")
+                return None
+            token = (
+                api.AccessToken(key, secret)
+                .with_identity(f"jarvis-worker-mob-{uuid.uuid4().hex[:8]}")
+                .with_grants(
+                    api.VideoGrants(
+                        room_join=True,
+                        room=_CONTROL_ROOM,
+                        can_publish=True,
+                        can_subscribe=True,
+                        can_publish_data=True,
+                    )
+                )
+                .to_jwt()
+            )
+            room = rtc.Room()
+
+            @room.on("data_received")
+            def _on_data(packet: rtc.DataPacket) -> None:  # noqa: ANN001
+                if packet.topic != _MOBILE_TOPIC_RESULT:
+                    return
+                try:
+                    msg = json.loads(bytes(packet.data).decode("utf-8"))
+                except Exception:  # noqa: BLE001
+                    return
+                fut = self._pending.pop(msg.get("id", ""), None)
+                if fut and not fut.done():
+                    fut.set_result(msg)
+
+            await room.connect(url, token)
+            self._room = room
+            logger.info("mobile bridge: connected to '%s'", _CONTROL_ROOM)
+            return room
+
+    async def send(
+        self, target: str, cmd: str, args: dict, timeout: float = 30.0
+    ) -> dict:
+        room = await self._ensure()
+        if room is None:
+            return {"error": "mobile bridge unavailable (LIVEKIT_* unset)"}
+        cmd_id = uuid.uuid4().hex
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[cmd_id] = fut
+        payload = json.dumps(
+            {"id": cmd_id, "target": target, "cmd": cmd, "args": args}
+        ).encode("utf-8")
+        try:
+            await room.local_participant.publish_data(
+                payload, reliable=True, topic=_MOBILE_TOPIC_CMD
+            )
+            msg = await asyncio.wait_for(fut, timeout)
+            return msg.get("result", {})
+        except asyncio.TimeoutError:
+            self._pending.pop(cmd_id, None)
+            return {
+                "error": f"no response from the '{target}' phone — is the "
+                f"Jarvis Mobile Bridge app open and connected?"
+            }
+        except Exception as exc:  # noqa: BLE001
+            self._pending.pop(cmd_id, None)
+            return {"error": str(exc)}
+
+
+# ── Mobile intent routing ────────────────────────────────────────────
+_MOBILE_HINT_RE = re.compile(
+    r"\b("
+    r"phone|mobile|cell|cellphone|smartphone|android|pixel|oneplus|samsung|"
+    r"text|texts|sms|"
+    r"call|dial|ring|"
+    r"contact|contacts|phonebook|phone\s+book|"
+    r"whatsapp|wapp|whats\s+app|"
+    r"battery|charge|charging|signal|reception|"
+    r"instagram|insta|tiktok|tik\s+tok|facebook|messenger|youtube|"
+    r"install|uninstall|"
+    r"app|apps"
+    r")\b",
+    re.I,
+)
+
+_MOBILE_MACHINE_RE = re.compile(
+    r"\b(?:on|via|through|using|in|to|from)\s+"
+    r"(?:my\s+|the\s+|this\s+)?"
+    r"(phone|mobile|cell|cellphone|smartphone|android|pixel|oneplus|samsung)\b"
+    r"|\bmy\s+(phone|mobile|cell|pixel|oneplus|samsung)\b",
+    re.I,
+)
+
+_BRIDGE_MOBILE_COMMANDS_GUIDE = """\
+Available mobile-bridge commands (the user's Android phone):
+
+  sms_list         {"limit": 10, "number_filter": "<optional>"}
+  sms_send         {"number": "<phone>", "message": "<text>"}
+  contacts_search  {"query": "<name>", "limit": 10}
+  dial             {"number": "<phone>"}                       # opens dialer
+  open_app         {"name": "<app name>" or "package": "<bundle id>"}
+  list_apps        {}                                          # for fuzzy resolution
+  install_app      {"package": "<bundle id>"}                  # opens Play Store
+  uninstall_app    {"package": "<bundle id>"}                  # opens uninstall dialog
+  open_url         {"url": "<full URL>"}                       # opens browser
+  whatsapp_send    {"number": "<phone>", "message": "<text>"}  # opens WhatsApp pre-filled
+  device_status    {}                                          # battery / model / signal
+  host_info        {}
+
+NOT supported (no public personal-account API exists): sending DMs on
+Instagram, Facebook Messenger, or TikTok; posting to those platforms.
+For those intents pick `open_app` with the app name OR `open_url` with
+a deep-link such as instagram.com/<user>, m.me/<user>, ig.me/<user>."""
+
+
+async def _route_mobile(text: str, phones_online: list[str]) -> dict | None:
+    """Turn a free-form spoken request into a structured mobile-bridge command."""
+    client = _get_router_client()
+    if client is None or not text:
+        return None
+    online = ", ".join(phones_online) if phones_online else "none right now"
+    system = (
+        "You translate ONE spoken request into ONE command for the user's "
+        "Android phone. Output strict JSON only — no prose, no code fences.\n\n"
+        "Schema. Either:\n"
+        '  {"mobile": false}   — when the request is NOT about operating '
+        "their phone.\n"
+        "Or:\n"
+        '  {"mobile": true, "phone": "<phone_name>"|"any", '
+        '"command": "<name>", "args": {...}, '
+        '"contact_query": "<name>"?, '
+        '"say": "<one short butler-voice sentence>"}\n\n'
+        f"{_BRIDGE_MOBILE_COMMANDS_GUIDE}\n\n"
+        "Rules:\n"
+        "- Default phone: 'any'. Phones online right now: " + online + ".\n"
+        "- If the user names a CONTACT instead of a phone number for sms_send"
+        " / dial / whatsapp_send, set `contact_query` to the name and leave "
+        '`args.number` empty — the worker will resolve it via contacts_search.\n'
+        "- For 'open <social app>' use open_app with the app name.\n"
+        "- For 'send Instagram DM / FB message / TikTok message': output\n"
+        '  {"mobile": true, "phone": "any", "command": "open_app", '
+        '"args": {"name": "<instagram|messenger|tiktok>"}, '
+        '"say": "I can\'t message <Platform> directly from here, sir — '
+        'opening the app for you."}\n'
+        "- `dial` opens the dialer (no auto-call); `whatsapp_send` opens "
+        "WhatsApp pre-filled (user taps send).\n"
+        "- `say` is one short butler sentence ('Texting Mum, sir.', "
+        "'On it, sir.').\n"
+        "- If conversation / question / unclear, output {\"mobile\": false}."
+    )
+    try:
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=_ROUTER_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+                max_tokens=400,
+                response_format={"type": "json_object"},
+            ),
+            timeout=6.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("mobile router LLM failed: %s", exc)
+        return None
+    raw = (resp.choices[0].message.content or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+    try:
+        data = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("mobile router non-JSON: %s — %r", exc, raw[:200])
+        return None
+    if not isinstance(data, dict) or not data.get("mobile"):
+        return None
+    cmd = (data.get("command") or "").strip()
+    if not cmd:
+        return None
+    return {
+        "phone": str(data.get("phone") or "any").strip().lower(),
+        "cmd": cmd,
+        "args": data.get("args") or {},
+        "contact_query": (data.get("contact_query") or "").strip(),
+        "say": (data.get("say") or "").strip(),
+    }
+
+
+def _mobile_reply(phone: str, cmd: str, args: dict, res: dict) -> str:
+    """Turn a mobile-bridge result dict into a butler-tone confirmation."""
+    if res.get("error"):
+        return f"That didn't work, sir — {res['error']}"
+    if cmd == "sms_send":
+        return "Texted them, sir."
+    if cmd == "sms_list":
+        messages = res.get("messages") or []
+        if not messages:
+            return "No recent messages, sir."
+        lines = []
+        for m in messages[:3]:
+            sender = m.get("from", "Unknown")
+            body = (m.get("body", "") or "").strip().replace("\n", " ")
+            if len(body) > 120:
+                body = body[:120] + "…"
+            lines.append(f"{sender}: {body}")
+        more = "" if len(messages) <= 3 else f" Plus {len(messages) - 3} more."
+        return "Your latest texts, sir. " + " ... ".join(lines) + more
+    if cmd == "contacts_search":
+        contacts = res.get("contacts") or []
+        if not contacts:
+            return "No contacts matched, sir."
+        if len(contacts) == 1:
+            c = contacts[0]
+            return f"That's {c.get('name', 'them')} at {c.get('number', '')}, sir."
+        names = ", ".join(c.get("name", "?") for c in contacts[:3])
+        return f"Found {len(contacts)} contacts, sir: {names}."
+    if cmd == "dial":
+        return "Dialler's up, sir — tap to call."
+    if cmd == "whatsapp_send":
+        return "WhatsApp's open and ready, sir — tap send."
+    if cmd == "open_app":
+        opened = res.get("opened") or args.get("name") or args.get("package")
+        return f"Opening {opened}, sir."
+    if cmd == "open_url":
+        return "On screen, sir."
+    if cmd == "list_apps":
+        apps = res.get("apps") or []
+        return f"You have {len(apps)} apps installed, sir."
+    if cmd == "install_app":
+        return "Play Store's up, sir — tap install."
+    if cmd == "uninstall_app":
+        return "Uninstall prompt's up, sir."
+    if cmd == "device_status":
+        bat = res.get("battery_percent")
+        charging = res.get("charging")
+        if bat is not None:
+            tail = " and charging" if charging else " and not charging"
+            return f"Battery is at {bat}%{tail}, sir."
+        return "Phone reports back, sir."
+    if cmd == "host_info":
+        model = res.get("model", "")
+        return f"That's your {model or phone}, sir." if model else f"Phone {phone} online, sir."
+    return f"Done on your {phone}, sir."
+
+
+# ── Telegram (worker-side via Bot API; no phone required) ────────────
+_TELEGRAM_RE = re.compile(
+    r"\b(?:telegram|tg)\b.*?\b(?:to|send|message|tell|ping)\b"
+    r"|\b(?:send|tell|message|ping)\b.*?\b(?:telegram|tg)\b",
+    re.I,
+)
+
+
+async def _extract_telegram_payload(text: str) -> dict | None:
+    """LLM-extract {contact, message} from a Telegram-send utterance."""
+    client = _get_router_client()
+    if client is None or not text:
+        return None
+    system = (
+        "Extract the recipient name and the message body from the user's "
+        "request to send a Telegram message. Output strict JSON only:\n"
+        '  {"contact": "<name>", "message": "<body>"}\n'
+        "Lowercase the contact name. Strip the verbs ('send', 'tell',\n"
+        "'telegram', 'message', etc.) from the message body."
+    )
+    try:
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=_ROUTER_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+                max_tokens=200,
+                response_format={"type": "json_object"},
+            ),
+            timeout=6.0,
+        )
+        data = json.loads((resp.choices[0].message.content or "").strip())
+        if not data.get("contact") or not data.get("message"):
+            return None
+        return data
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("telegram extractor failed: %s", exc)
+        return None
+
+
 class Assistant(Agent):
     def __init__(self, room: rtc.Room):
         super().__init__(instructions=AGENT_INSTRUCTION)
         self._room = room
         # Desktop control — lazy 2nd LiveKit connection to the PCs' bridge.
         self._desktop = DesktopBridge()
+        # Mobile control — Android phone via mobile-bridge APK (same room).
+        self._mobile = MobileBridge()
         # OpenCTI — Railway-hosted, reached via direct httpx (Path Y).
         # Lifecycle (spinup/spindown) goes through GitHub Actions
         # workflow_dispatch on the opencti-lifecycle workflow.
@@ -2834,6 +3169,141 @@ class Assistant(Agent):
             pass
         return True
 
+    async def _maybe_handle_mobile(self, text: str) -> bool:
+        """Operate the user's Android phone via the mobile-bridge APK.
+
+        Pipeline: broad hint gate → LLM router (free-form → structured
+        command) → optional contacts_search resolve → bridge.send →
+        speak butler-tone reply.
+        """
+        if not text or not _MOBILE_HINT_RE.search(text):
+            return False
+
+        try:
+            await self._mobile._ensure()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mobile control-room connect failed: %s", exc)
+        online = self._mobile.online_phones()
+        routed = await _route_mobile(text, online)
+        if routed is None:
+            return False
+
+        if not online:
+            try:
+                await self.session.say(
+                    "Your phone bridge isn't connected, sir — open Jarvis "
+                    "Mobile Bridge and connect."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        phone = routed["phone"] if routed.get("phone") != "any" else online[0]
+        cmd = routed["cmd"]
+        args = dict(routed.get("args") or {})
+
+        contact_query = routed.get("contact_query", "")
+        if (
+            cmd in ("sms_send", "dial", "whatsapp_send")
+            and not args.get("number")
+            and contact_query
+        ):
+            search = await self._mobile.send(
+                phone, "contacts_search",
+                {"query": contact_query, "limit": 3},
+                timeout=10.0,
+            )
+            contacts = search.get("contacts") or []
+            if not contacts:
+                try:
+                    await self.session.say(
+                        f"I couldn't find a contact for '{contact_query}', sir."
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return True
+            args["number"] = contacts[0]["number"]
+
+        say_hint = routed.get("say", "")
+        if say_hint:
+            try:
+                await self.session.say(say_hint)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            res = await self._mobile.send(phone, cmd, args, timeout=30.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("mobile send failed: %s", exc)
+            res = {"error": str(exc)}
+        try:
+            await self.session.say(_mobile_reply(phone, cmd, args, res))
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _maybe_handle_telegram(self, text: str) -> bool:
+        """Send a Telegram message via the official Bot API.
+
+        Worker-side only — does NOT need the phone bridge online.
+        Requires TELEGRAM_BOT_TOKEN env + TELEGRAM_CONTACTS_JSON env
+        mapping `{"<name lowercased>": <chat_id>, ...}`.
+        """
+        if not text or not _TELEGRAM_RE.search(text):
+            return False
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            try:
+                await self.session.say(
+                    "Telegram isn't configured, sir — the bot token is unset."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        extracted = await _extract_telegram_payload(text)
+        if not extracted:
+            return False
+        contact_name = extracted["contact"].lower().strip()
+        message = extracted["message"].strip()
+
+        try:
+            contacts = json.loads(
+                os.environ.get("TELEGRAM_CONTACTS_JSON", "{}") or "{}"
+            )
+        except Exception:  # noqa: BLE001
+            contacts = {}
+        chat_id = contacts.get(contact_name)
+        if not chat_id:
+            try:
+                await self.session.say(
+                    f"I don't have a Telegram chat id for '{contact_name}', sir."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat_id, "text": message},
+                )
+                r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("telegram send failed: %s", exc)
+            try:
+                await self.session.say("Telegram didn't accept that, sir.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        try:
+            await self.session.say(f"Telegrammed {contact_name}, sir.")
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
     async def show_widget(self, widget: str, title: str = "") -> str:
         """Display a floating widget panel on the user's JARVIS screen.
 
@@ -3322,6 +3792,15 @@ class Assistant(Agent):
         # fallback for when the routed LLM doesn't emit the desktop_control
         # tool call; we speak our own confirmation, so stop the turn.
         if await self._maybe_handle_desktop(text):
+            raise StopResponse()
+
+        # Mobile control — operate the user's Android phone via the
+        # mobile-bridge APK.
+        if await self._maybe_handle_mobile(text):
+            raise StopResponse()
+
+        # Telegram (worker-side Bot API; no phone bridge required).
+        if await self._maybe_handle_telegram(text):
             raise StopResponse()
 
         # Screen widgets — open/close panels on request (non-blocking).
