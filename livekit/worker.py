@@ -46,6 +46,7 @@ import base64
 import random
 import asyncio
 import logging
+from dataclasses import dataclass, field
 
 from datetime import datetime, timedelta, timezone
 
@@ -550,6 +551,80 @@ _VOL_UP = re.compile(
 )
 _VOL_SET = re.compile(r"\b(?:to|at)\s+(\d{1,3})\b", re.I)
 
+# Standalone volume intent — fires WITHOUT requiring an "on my laptop"
+# clause, so "mute" / "lower the volume" go through the disambiguation
+# router instead of falling into the content matcher. Conservative on
+# purpose: the bare word "volume" alone must not trigger ("what's the
+# volume of a sphere"); requires a verb or louder/quieter/mute.
+_VOLUME_INTENT_RE = re.compile(
+    r"\b("
+    r"mute|unmute|"
+    r"(?:turn|crank|bump|set|put)\s+(?:the\s+|down\s+|up\s+)?"
+    r"(?:volume|sound|audio|it|that|music)|"
+    r"(?:lower|raise|increase|decrease|reduce|boost|drop|bring\s+down|"
+    r"bring\s+up)\s+(?:the\s+)?(?:volume|sound|audio|it|that|music)|"
+    r"volume\s+(?:up|down|to|at)|"
+    r"(?:louder|quieter|softer)"
+    r")\b",
+    re.I,
+)
+
+# ── Clarification primitive ──────────────────────────────────────────
+# Generic "I asked a question, the next user turn is the answer" state.
+# Used today by volume disambiguation; reused later by camera selection,
+# app_open targeting, etc. Single-slot — a new clarification REPLACES any
+# previous one so the state machine never gets stuck. 30s expiry.
+
+_CANCEL_RE = re.compile(
+    r"\b(never\s*mind|nevermind|cancel|forget\s+it|skip\s+it|"
+    r"nothing|drop\s+it|stop)\b",
+    re.I,
+)
+
+_ORDINAL_RE: list[tuple[re.Pattern[str], int]] = [
+    (re.compile(r"\b(?:the\s+)?(?:first|1st|one|number\s*one)\b", re.I), 0),
+    (re.compile(r"\b(?:the\s+)?(?:second|2nd|two|number\s*two)\b", re.I), 1),
+    (re.compile(r"\b(?:the\s+)?(?:third|3rd|three|number\s*three)\b", re.I), 2),
+]
+
+_BOTH_RE = re.compile(r"\b(both|all|everything|every\s*one)\b", re.I)
+
+
+@dataclass
+class PendingClarification:
+    """One pending disambiguation question awaiting the user's answer.
+
+    Stored as a single slot on `Assistant`. The resumer dict on the
+    assistant maps `intent_kind` to the coroutine that finishes the
+    deferred action once an option is picked.
+    """
+    intent_kind: str
+    options: list[dict]
+    original_args: dict
+    prompt: str
+    created_at: float
+    expires_at: float
+
+
+def _derive_match_words(process_name: str) -> list[str]:
+    """Turn a process name into the words a user might say for it."""
+    name = (process_name or "").strip().lower()
+    base = re.sub(r"\.(exe|app|bin)$", "", name).strip()
+    if not base:
+        return []
+    out = {base}
+    if base in ("chrome", "msedge", "firefox", "opera", "brave"):
+        out.add("browser")
+    if base in ("vlc", "wmplayer", "mpc-hc", "mpv"):
+        out.add("media player")
+    if base == "wmplayer":
+        out.add("windows media player")
+    if base == "msedge":
+        out.add("edge")
+    if base == "spotify":
+        out.add("music")
+    return sorted(out)
+
 
 # A generous net for "this turn MIGHT be a desktop request". Matching here
 # only authorises the LLM router call — the router itself decides whether
@@ -598,6 +673,11 @@ Available bridge commands (use `command` and `args`):
   close_app         {"name": "<process name, e.g. chrome>"}
   volume            {"action": "up"|"down"|"mute"|"unmute"|"set",
                      "level": 0-100 (for 'set')}
+  audio_sessions    {}                              # list per-app audio sessions
+  app_volume        {"process_name": "<name>",
+                     "action": "up"|"down"|"mute"|"unmute"|"set",
+                     "level": 0-100 (for 'set'),
+                     "step": 0.0-1.0 (for up/down)}
   media_key         {"key": "play_pause"|"next"|"previous"|"stop"}
   play_media        {"query": "<song or video name>"}
   lock_workstation  {}
@@ -1573,6 +1653,25 @@ class Assistant(Agent):
         self._elab_task: asyncio.Task | None = None
         self._oj_base: str = ""
         self._oj_auth: dict = {}
+        # HUD widget inventory pushed from the frontend on jarvis-ui-state.
+        # Stays [] until the first publish lands. `_open_widgets_at == 0.0`
+        # means "no state ever received" — close-widget priority falls back
+        # to permissive mode in that gap.
+        self._open_widgets: list[dict] = []
+        self._open_widgets_at: float = 0.0
+        # Generic clarification slot for ambiguous intents.
+        self._pending_clarification: PendingClarification | None = None
+        self._clarification_resumers: dict[str, callable] = {}
+        self._clarification_resumers["volume"] = self._resume_volume
+
+    def _has_widget(self, kind: str) -> bool:
+        """True when a panel of `kind` is currently visible on the HUD."""
+        if not kind:
+            return False
+        target = kind.lower()
+        return any(
+            (w.get("kind") or "").lower() == target for w in self._open_widgets
+        )
 
     # ── Camera track capture ─────────────────────────────────────────
     def _wire_video(self, room: rtc.Room) -> None:
@@ -1791,6 +1890,294 @@ class Assistant(Agent):
             await self._publish_ui({"type": "close_widget", "kind": kind})
         else:
             await self._publish_ui({"type": "open_widget", "kind": kind})
+
+    # ── Close-widget priority ────────────────────────────────────────
+    async def _maybe_handle_close_widget(self, text: str) -> bool:
+        """Close a HUD panel that the user just named.
+
+        Runs BEFORE _maybe_handle_content so "close the YouTube" closes
+        the panel instead of triggering a YouTube search for the word
+        "Close." Guarded by the live widget inventory: only intercepts
+        when the named widget is actually visible.
+        """
+        if not text:
+            return False
+        if not _UI_CLOSE_RE.search(text):
+            return False
+        if _UI_OPEN_RE.search(text):
+            return False
+        if re.search(
+            r"\b(all|everything|every (widget|panel)|the (widgets|panels))\b",
+            text,
+            re.I,
+        ):
+            await self._publish_ui({"type": "close_all"})
+            try:
+                await self.session.say("Closing all panels, sir.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        kind = _widget_from_text(text)
+        if kind is None:
+            return False
+        known_state = self._open_widgets_at > 0.0
+        if known_state and not self._has_widget(kind):
+            return False
+        await self._publish_ui({"type": "close_widget", "kind": kind})
+        try:
+            await self.session.say(f"Closing the {kind} panel, sir.")
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    # ── Clarification resolver ───────────────────────────────────────
+    async def _maybe_resume_clarification(self, text: str) -> bool:
+        """If a clarification is pending, try to resolve `text` to an option."""
+        pc = self._pending_clarification
+        if pc is None:
+            return False
+        now = time.monotonic()
+        if now >= pc.expires_at:
+            logger.info("clarification expired: %s", pc.intent_kind)
+            self._pending_clarification = None
+            return False
+        if not text:
+            return False
+        if _CANCEL_RE.search(text):
+            self._pending_clarification = None
+            try:
+                await self.session.say("As you wish, sir.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        low = text.lower()
+        chosen: list[dict] = []
+        if pc.intent_kind == "volume" and _BOTH_RE.search(text):
+            chosen = list(pc.options)
+        if not chosen:
+            for opt in pc.options:
+                words = opt.get("match_words") or []
+                for w in words:
+                    if re.search(rf"\b{re.escape(w)}\b", low, re.I):
+                        chosen = [opt]
+                        break
+                if chosen:
+                    break
+        if not chosen:
+            for pattern, idx in _ORDINAL_RE:
+                if pattern.search(text) and idx < len(pc.options):
+                    chosen = [pc.options[idx]]
+                    break
+        if not chosen:
+            logger.info(
+                "clarification resume miss for %s: %r", pc.intent_kind, text[:120]
+            )
+            self._pending_clarification = None
+            return False
+        resumer = self._clarification_resumers.get(pc.intent_kind)
+        if resumer is None:
+            logger.warning(
+                "no resumer registered for clarification kind %s", pc.intent_kind
+            )
+            self._pending_clarification = None
+            return False
+        captured = pc
+        self._pending_clarification = None
+        try:
+            for opt in chosen:
+                await resumer(text, captured, opt)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("clarification resumer for %s failed: %s",
+                         captured.intent_kind, exc)
+        return True
+
+    # ── Volume disambiguation ────────────────────────────────────────
+    async def _maybe_handle_volume(self, text: str) -> bool:
+        """Volume command with HUD/desktop disambiguation."""
+        if not text or not _VOLUME_INTENT_RE.search(text):
+            return False
+        if _DESKTOP_MACHINE_RE.search(text):
+            return False
+
+        low = text.lower()
+        if re.search(r"\bunmute\b", low):
+            action_args: dict = {"action": "unmute"}
+        elif re.search(r"\bmute\b", low):
+            action_args = {"action": "mute"}
+        elif _VOL_SET.search(low) and re.search(
+            r"\b(volume|sound|audio)\b", low
+        ):
+            level = int(_VOL_SET.search(low).group(1))
+            action_args = {"action": "set", "level": max(0, min(100, level))}
+        elif _VOL_DOWN.search(low):
+            action_args = {"action": "down"}
+        elif _VOL_UP.search(low):
+            action_args = {"action": "up"}
+        else:
+            return False
+
+        wants_master = bool(
+            re.search(r"\b(master|all\s+sound|everything)\b", low)
+        )
+
+        candidates: list[dict] = []
+
+        # HUD audio widgets (visible panels that can produce sound).
+        audio_widget_kinds = {"youtube", "music", "browser"}
+        for w in self._open_widgets:
+            wkind = (w.get("kind") or "").lower()
+            if wkind not in audio_widget_kinds:
+                continue
+            title = (w.get("title") or wkind).strip() or wkind
+            match_words = {wkind, title.lower()}
+            if wkind == "youtube":
+                match_words.update({"youtube", "video", "the video", "panel"})
+            elif wkind == "music":
+                match_words.update({"music", "the music", "panel"})
+            elif wkind == "browser":
+                match_words.update({"browser", "the browser", "panel"})
+            candidates.append({
+                "label": title if wkind != "youtube" else "YouTube",
+                "target_kind": "widget",
+                "widget_kind": wkind,
+                "match_words": sorted(match_words),
+            })
+
+        # Per-app audio sessions on each online bridge (parallel).
+        try:
+            await self._desktop._ensure()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("control-room connect failed: %s", exc)
+        machines = self._desktop.online_machines()
+        if machines:
+            async def _enum(m: str) -> tuple[str, dict]:
+                try:
+                    res = await self._desktop.send(
+                        m, "audio_sessions", {}, timeout=4.0
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("audio_sessions on %s failed: %s", m, exc)
+                    res = {"sessions": []}
+                return m, res
+
+            try:
+                results = await asyncio.gather(
+                    *(_enum(m) for m in machines), return_exceptions=False
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("audio enumeration failed: %s", exc)
+                results = []
+
+            for machine, res in results:
+                for s in (res.get("sessions") or []):
+                    if not s.get("is_active"):
+                        continue
+                    proc = (s.get("process_name") or "").strip()
+                    if not proc:
+                        continue
+                    label = (s.get("display_name") or proc).strip() or proc
+                    match_words = set(_derive_match_words(proc))
+                    match_words.add(label.lower())
+                    candidates.append({
+                        "label": label,
+                        "target_kind": "session",
+                        "machine": machine,
+                        "process_name": proc,
+                        "match_words": sorted(w for w in match_words if w),
+                    })
+
+        if wants_master and machines:
+            for machine in machines:
+                candidates.append({
+                    "label": f"the {machine} master volume",
+                    "target_kind": "master",
+                    "machine": machine,
+                    "match_words": ["master", "everything", "all"],
+                })
+
+        if not candidates:
+            try:
+                await self.session.say("Nothing is currently playing, sir.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        if len(candidates) == 1:
+            await self._dispatch_volume(candidates[0], action_args)
+            return True
+
+        shown = candidates[:3]
+        labels = [c["label"] for c in shown]
+        if len(candidates) > 3:
+            tail = f", {labels[-1]}, or another one"
+            prompt = ", ".join(labels[:-1]) + tail + ", sir?"
+        elif len(labels) == 3:
+            prompt = f"{labels[0]}, {labels[1]}, or {labels[2]}, sir?"
+        else:
+            prompt = f"{labels[0]} or {labels[1]}, sir?"
+        self._pending_clarification = PendingClarification(
+            intent_kind="volume",
+            options=candidates,
+            original_args=action_args,
+            prompt=prompt,
+            created_at=time.monotonic(),
+            expires_at=time.monotonic() + 30.0,
+        )
+        try:
+            await self.session.say(prompt)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _dispatch_volume(self, option: dict, action_args: dict) -> None:
+        """Apply a parsed volume action to one resolved option."""
+        target_kind = option.get("target_kind")
+        action = action_args.get("action") or ""
+        if target_kind == "widget":
+            msg: dict = {
+                "type": "widget_volume",
+                "kind": option["widget_kind"],
+                "action": action if action in ("mute", "unmute", "set") else "set",
+            }
+            if action == "set":
+                msg["level"] = int(action_args.get("level") or 50)
+            elif action == "up":
+                msg["level"] = 100
+            elif action == "down":
+                msg["level"] = 25
+            await self._publish_ui(msg)
+        elif target_kind == "session":
+            await self._desktop.send(
+                option["machine"], "app_volume",
+                {"process_name": option["process_name"], **action_args},
+                timeout=8.0,
+            )
+        elif target_kind == "master":
+            await self._desktop.send(
+                option["machine"], "volume", action_args, timeout=8.0,
+            )
+        else:
+            logger.warning("dispatch_volume: unknown target_kind %r", target_kind)
+            return
+
+        verb_map = {
+            "mute": "Muting",
+            "unmute": "Unmuting",
+            "up": "Turning up",
+            "down": "Lowering",
+            "set": "Setting",
+        }
+        verb = verb_map.get(action, "Adjusting")
+        try:
+            await self.session.say(f"{verb} {option['label']}, sir.")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _resume_volume(
+        self, text: str, pc: PendingClarification, option: dict
+    ) -> None:
+        """Finish a deferred volume action once an option is chosen."""
+        await self._dispatch_volume(option, pc.original_args)
 
     async def _maybe_handle_content(self, text: str) -> bool:
         """Handle search / video / news / maps / browser intents by regex.
@@ -2363,6 +2750,24 @@ class Assistant(Agent):
                 await self.session.say("Goodbye, sir.")
                 raise StopResponse()
 
+        # Pending clarification — resolve before anything else. If we
+        # asked a disambiguation question last turn, this turn is the
+        # answer; resolves to a target and dispatches the deferred action.
+        if await self._maybe_resume_clarification(text):
+            raise StopResponse()
+
+        # Volume — disambiguates across HUD widgets and desktop apps.
+        # Runs BEFORE content + desktop so "mute" never falls into the
+        # YouTube content matcher and never needs "on my laptop".
+        if await self._maybe_handle_volume(text):
+            raise StopResponse()
+
+        # Close-widget priority — beats content router when a panel is
+        # actually open ("close the YouTube" → close panel, NOT search
+        # YouTube for "Close"). Guarded by live widget inventory.
+        if await self._maybe_handle_close_widget(text):
+            raise StopResponse()
+
         # Screen content — search / video / news / maps / live browser.
         # Handled by regex (worker @function_tools never fire on
         # OpenJarvis); we speak our own confirmation, so stop the turn.
@@ -2585,6 +2990,23 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception:  # noqa: BLE001
             return
         asyncio.create_task(assistant.handle_browser_event(msg))
+
+    # Reverse channel: the frontend pushes its open-widget inventory on
+    # `jarvis-ui-state` so the worker can answer "is the YouTube panel
+    # actually open?" — required by close-widget priority and volume
+    # disambiguation.
+    @ctx.room.on("data_received")
+    def _on_ui_state(packet: rtc.DataPacket) -> None:
+        if packet.topic != "jarvis-ui-state":
+            return
+        try:
+            msg = json.loads(bytes(packet.data).decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return
+        if msg.get("type") == "widget_state":
+            open_list = msg.get("open") or []
+            assistant._open_widgets = open_list if isinstance(open_list, list) else []
+            assistant._open_widgets_at = time.monotonic()
     # Proactive elaboration is OFF by default. The OpenJarvis dual-track
     # elaboration fires on every turn (not the "3+ coherent topics" the
     # user expects) and its Claude-CLI backend currently leaks raw status

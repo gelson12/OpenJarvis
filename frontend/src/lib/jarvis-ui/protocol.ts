@@ -9,6 +9,14 @@ export const JARVIS_UI_TOPIC = 'jarvis-ui';
 /** Data topic for the live remote-browser widget (frames + interactions). */
 export const JARVIS_BROWSER_TOPIC = 'jarvis-browser';
 
+/**
+ * Reverse channel: frontend → worker, publishing the live HUD widget
+ * inventory so the worker can disambiguate intents like "close the
+ * youtube" (close the panel that is actually open) or "mute" (target
+ * the visible audio widget vs a desktop process).
+ */
+export const JARVIS_UI_STATE_TOPIC = 'jarvis-ui-state';
+
 /** Every kind of floating panel JARVIS can place on screen. */
 export type WidgetKind =
   | 'clock'
@@ -103,7 +111,25 @@ export type JarvisUIMessage =
   | { type: 'close_widget'; id?: string; kind?: WidgetKind }
   | { type: 'update_widget'; id?: string; kind?: WidgetKind; payload?: unknown }
   | { type: 'focus_widget'; id?: string; kind?: WidgetKind }
-  | { type: 'close_all' };
+  | { type: 'close_all' }
+  | {
+      type: 'widget_volume';
+      kind: WidgetKind;
+      action: 'mute' | 'unmute' | 'set';
+      /** 0-100; required when action === 'set'. */
+      level?: number;
+    };
+
+/** A summary entry the frontend publishes on {@link JARVIS_UI_STATE_TOPIC}. */
+export interface OpenWidgetSummary {
+  id: string;
+  kind: WidgetKind;
+  title: string;
+}
+
+/** Messages the frontend sends to the worker on {@link JARVIS_UI_STATE_TOPIC}. */
+export type JarvisUIStateMessage =
+  | { type: 'widget_state'; open: OpenWidgetSummary[] };
 
 export const WIDGET_KINDS: WidgetKind[] = [
   'clock',
