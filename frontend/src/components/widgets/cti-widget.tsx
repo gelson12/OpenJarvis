@@ -1,12 +1,20 @@
 // The OpenCTI intelligence panel. An iframe pointing at a self-hosted
 // OpenCTI instance — the worker supplies the URL in the payload (so it
 // can deep-link a specific dashboard), with VITE_OPENCTI_URL as the
-// build-time fallback.
+// build-time fallback, and `http://localhost:8080` as the final default
+// (matches the laptop-Docker deployment recipe).
+//
+// localhost note: modern browsers (Chrome/Edge/Firefox) treat
+// http://localhost as a Secure Context, so this HTTPS-served page CAN
+// iframe http://localhost:8080 without mixed-content blocking. The
+// iframe therefore only resolves when the user views Jarvis from the
+// same machine that runs OpenCTI (the laptop). When viewing from
+// another device, the iframe shows a connection-refused state —
+// expected for the bridge-proxy architecture.
 //
 // Auth: OpenCTI sets a persistent session cookie on first login. After
 // the user has logged in once in the same browser, this iframe just
-// works. For unauthenticated embedding, deploy a public dashboard and
-// whitelist this frontend's host via APP__PUBLIC_DASHBOARD_AUTHORIZED_DOMAINS.
+// works.
 
 import type { CTIPayload, WidgetComponentProps } from '@/lib/jarvis-ui/protocol';
 import { WidgetStatus } from './widget-status';
@@ -20,7 +28,10 @@ function joinUrl(base: string, path?: string): string {
 
 export function CTIWidget({ widget }: WidgetComponentProps) {
   const data = widget.payload as CTIPayload | undefined;
-  const baseUrl = data?.url || import.meta.env.VITE_OPENCTI_URL || '';
+  const baseUrl =
+    data?.url ||
+    import.meta.env.VITE_OPENCTI_URL ||
+    'http://localhost:8080';
 
   if (!baseUrl) {
     return (

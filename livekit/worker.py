@@ -1086,56 +1086,93 @@ _OBSERVABLE_TYPE_MAP: dict[str, str] = {
 
 
 class OpenCTIClient:
-    """Thin async GraphQL client used by the worker's `_maybe_handle_cti`.
+    """GraphQL client that reaches a laptop-hosted OpenCTI via the bridge.
 
-    Lighter-weight than the backend's full `_OpenCTIClient` — we only need
-    the handful of operations the voice router emits. Lazy-initialised so
-    a deployment without `OPENCTI_URL` set just falls back to "OpenCTI
-    isn't configured, sir" instead of crashing.
+    OpenCTI runs locally on the user's laptop (Docker on http://localhost
+    :8080). To reach it from the cloud worker WITHOUT punching the laptop
+    onto the public internet, we tunnel the HTTP request over the
+    existing LiveKit data channel that the desktop-bridge already
+    listens on: the bridge proxies the request to localhost and ships
+    the response back the same way. Zero new infra, zero public
+    exposure of OpenCTI.
+
+    Env:
+      OPENCTI_URL              the URL the *bridge* uses (default
+                               'http://localhost:8080'); from the worker's
+                               POV this is the laptop's localhost
+      OPENCTI_TOKEN            admin/api token (required)
+      OPENCTI_BRIDGE_MACHINE   which desktop-bridge runs OpenCTI
+                               (default 'laptop')
+
+    Construct with a DesktopBridge reference so this client doesn't need
+    its own LiveKit connection.
     """
 
-    def __init__(self) -> None:
-        self._client: httpx.AsyncClient | None = None
-        self._lock = asyncio.Lock()
-
-    async def _ensure(self) -> httpx.AsyncClient | None:
-        async with self._lock:
-            if self._client is not None:
-                return self._client
-            url = os.environ.get("OPENCTI_URL", "").rstrip("/")
-            token = os.environ.get("OPENCTI_TOKEN", "")
-            if not (url and token):
-                logger.warning(
-                    "opencti: OPENCTI_URL / OPENCTI_TOKEN not set"
-                )
-                return None
-            self._client = httpx.AsyncClient(
-                base_url=url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                timeout=httpx.Timeout(30.0, connect=10.0),
-            )
-            logger.info("opencti: worker client connected to %s", url)
-            return self._client
+    def __init__(self, bridge: "DesktopBridge") -> None:
+        self._bridge = bridge
+        self._base_url = os.environ.get(
+            "OPENCTI_URL", "http://localhost:8080"
+        ).rstrip("/")
+        self._token = os.environ.get("OPENCTI_TOKEN", "")
+        self._machine = os.environ.get(
+            "OPENCTI_BRIDGE_MACHINE", "laptop"
+        )
 
     async def _gql(self, query: str, variables: dict | None = None) -> dict:
-        client = await self._ensure()
-        if client is None:
+        if not self._token:
             raise RuntimeError(
-                "OpenCTI unavailable — set OPENCTI_URL and OPENCTI_TOKEN "
-                "on the worker."
+                "OpenCTI unavailable — OPENCTI_TOKEN is not set on the worker"
             )
-        resp = await client.post(
-            "/graphql",
-            json={"query": query, "variables": variables or {}},
+        # Eagerly join the control room so presence is accurate before
+        # we decide whether the bridge that hosts OpenCTI is up.
+        try:
+            await self._bridge._ensure()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("opencti: control-room connect failed: %s", exc)
+        if not self._bridge.is_online(self._machine):
+            raise RuntimeError(
+                f"OpenCTI unavailable — the '{self._machine}' bridge is "
+                "offline (start desktop-bridge\\run.bat there)"
+            )
+        proxy_res = await self._bridge.send(
+            self._machine,
+            "http_proxy",
+            {
+                "base_url": self._base_url,
+                "method": "POST",
+                "path": "/graphql",
+                "headers": {
+                    "Authorization": f"Bearer {self._token}",
+                    "Content-Type": "application/json",
+                },
+                "body": {"query": query, "variables": variables or {}},
+                "timeout": 30.0,
+            },
+            timeout=40.0,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        if "errors" in data and data["errors"]:
-            raise RuntimeError(f"opencti errors: {data['errors'][:2]}")
-        return data.get("data") or {}
+        if not isinstance(proxy_res, dict) or proxy_res.get("error"):
+            err = (
+                proxy_res.get("error")
+                if isinstance(proxy_res, dict)
+                else "bridge proxy returned no dict"
+            )
+            raise RuntimeError(f"bridge proxy error: {err}")
+        status = proxy_res.get("status")
+        payload = proxy_res.get("json")
+        if payload is None:
+            try:
+                payload = json.loads(proxy_res.get("body") or "{}")
+            except Exception:  # noqa: BLE001
+                payload = {}
+        if status and status >= 400:
+            raise RuntimeError(
+                f"opencti HTTP {status}: {(proxy_res.get('body') or '')[:200]}"
+            )
+        if isinstance(payload, dict) and payload.get("errors"):
+            raise RuntimeError(f"opencti errors: {payload['errors'][:2]}")
+        return (
+            payload.get("data") or {} if isinstance(payload, dict) else {}
+        )
 
     # ── Operations ───────────────────────────────────────────────
 
@@ -1509,8 +1546,10 @@ class Assistant(Agent):
         self._room = room
         # Desktop control — lazy 2nd LiveKit connection to the PCs' bridge.
         self._desktop = DesktopBridge()
-        # OpenCTI — lazy GraphQL client; idle until the first CTI turn.
-        self._cti = OpenCTIClient()
+        # OpenCTI — reaches the laptop-hosted OpenCTI by proxying HTTP
+        # over the SAME desktop-bridge channel (zero public exposure of
+        # OpenCTI). Idle until the first CTI turn.
+        self._cti = OpenCTIClient(self._desktop)
         # Wake/sleep: dormant on connect, woken by "Hey Jarvis".
         self._awake = False
         # Set by the interim-transcript wake listener: the next turn is

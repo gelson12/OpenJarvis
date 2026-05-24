@@ -1,160 +1,214 @@
-# Deploying OpenCTI on Railway (Jarvis intel layer)
+# Deploying OpenCTI on YOUR LAPTOP (Jarvis intel layer)
 
-This is the deployment side of [Layer 1 of the OpenCTI integration plan](../).
-OpenCTI is a vendor-grade platform — **we do not fork it**, we just deploy
-the official containers and point Jarvis at them via env vars.
+This is the "Path B — bridge-proxy" deployment chosen 2026-05-24. OpenCTI
+runs **locally on the laptop in Docker**. The cloud OpenJarvis worker +
+backend talk to it by proxying every HTTP call over the **existing**
+LiveKit data channel that desktop-bridge already listens on — no public
+URL, no tunnel, no extra Railway services.
 
-## What you're deploying
+## Why this works (the trick)
 
-OpenCTI is a small constellation of services, not one container. The
-official spec is at <https://github.com/OpenCTI-Platform/docker>. On
-Railway, model each as a separate service in one project:
+The desktop-bridge gained a single new handler — `http_proxy` — that
+takes `{base_url, method, path, headers, body, timeout}` and runs the
+HTTP request against the laptop's `localhost`. The cloud side talks to
+OpenCTI as if it were on a public URL; the bridge transparently
+shuttles each request to `http://localhost:8080` and back.
 
-| Service | Image | Purpose |
-|---|---|---|
-| `opencti` | `opencti/platform:latest` | GraphQL API + Web UI (the one with a public hostname) |
-| `worker` | `opencti/worker:latest` | Async ingest workers (run 2–3 replicas) |
-| `connector-*` | `opencti/connector-*:latest` | Optional: import sources (MITRE ATT&CK, MISP feeds, CISA, AlienVault, etc.) |
-| `elasticsearch` | `docker.elastic.co/elasticsearch/elasticsearch:8.x` | Knowledge graph storage |
-| `redis` | `redis:7-alpine` | Live event stream |
-| `rabbitmq` | `rabbitmq:3-management` | Worker job queue |
-| `minio` | `minio/minio:latest` | File attachments / S3-compatible storage |
+For the iframe in the Jarvis HUD: modern browsers treat
+`http://localhost` as a **Secure Context**, so an HTTPS-served Jarvis
+frontend can iframe `http://localhost:8080` without mixed-content
+blocking — as long as the browser is on the same machine as OpenCTI
+(the laptop).
 
-Resource sizing on Railway (minimums — bump if ingest is heavy):
-
-- `opencti` platform: **2 vCPU / 4 GB RAM** (Node sets `--max-old-space-size`)
-- `elasticsearch`: **2 vCPU / 4 GB RAM**, persistent volume
-- `redis`: 1 GB RAM
-- `rabbitmq`: 1 GB RAM
-- `minio`: 256 MB + persistent volume
-
-## Step 1 — generate the secrets
-
-Run these once and **save the outputs in your secrets manager**:
-
-```bash
-# Admin login + API token. The token is what Jarvis uses to call GraphQL.
-python -c "import uuid; print('OPENCTI_ADMIN_TOKEN=' + str(uuid.uuid4()))"
-
-# A signing key for the platform.
-python -c "import uuid; print('APP__ADMIN__TOKEN=' + str(uuid.uuid4()))"
+```
+                       ┌────────────────────────┐
+                       │  laptop (Docker)        │
+                       │   opencti          :8080│ ◄──┐
+                       │   elasticsearch    :9200│    │ localhost
+                       │   redis            :6379│    │ HTTP
+                       │   rabbitmq         :5672│    │
+                       │   minio            :9000│    │
+                       │   desktop-bridge.py     │ ───┘
+                       └───────────┬────────────┘
+                                   │ outbound only
+                              jarvis-control
+                                LiveKit room
+                                   │
+              ┌────────────────────┴────────────────────┐
+              │                                          │
+   OpenJarvis backend (Railway)             OpenJarvis worker (Railway)
+   _OpenCTIClient.proxy_send()              OpenCTIClient via DesktopBridge
+              │                                          │
+              └─────────────────────┬────────────────────┘
+                                    │
+                            laptop browser
+                            iframes http://localhost:8080
+                                    │
+                             cti widget in HUD
 ```
 
-Generate also: `RABBITMQ_DEFAULT_PASS`, `MINIO_ROOT_PASSWORD`, `ELASTIC_PASSWORD`
-(strong randoms, 32+ chars).
+## Step 1 — install Docker Desktop on the laptop
 
-## Step 2 — `opencti` platform service env
+If you already have it, skip. Otherwise:
+<https://www.docker.com/products/docker-desktop/>. Sign in / launch
+Docker Desktop. Verify with:
+
+```powershell
+docker --version
+docker compose version
+```
+
+## Step 2 — fetch OpenCTI's official compose
+
+Pin to a tagged release (avoid `:latest` so an upstream change can't
+break you on a restart):
+
+```powershell
+cd C:\Users\Gelson\Downloads
+git clone --depth 1 --branch 6.4.7 https://github.com/OpenCTI-Platform/docker.git opencti-docker
+cd opencti-docker
+copy .env.sample .env
+```
+
+## Step 3 — fill in `.env`
+
+Open `.env` in your editor. The values you already generated:
 
 ```env
-NODE_OPTIONS=--max-old-space-size=8096
-APP__PORT=8080
-APP__BASE_URL=https://opencti-production-<your-id>.up.railway.app
-APP__BASE_PATH=
-APP__SESSION_COOKIE=false
+OPENCTI_ADMIN_EMAIL=gelson_m@hotmail.com
+OPENCTI_ADMIN_PASSWORD=LdxdGRhMkbwV8KcUiwsSRzYJ
+OPENCTI_ADMIN_TOKEN=e644bf12-cfc0-4844-a21d-5add52ae99bc
+OPENCTI_BASE_URL=http://localhost:8080
+OPENCTI_HEALTHCHECK_ACCESS_KEY=e644bf12-cfc0-4844-a21d-5add52ae99bc
 
-# First-run admin. Email becomes your username.
-OPENCTI_ADMIN_EMAIL=you@example.com
-OPENCTI_ADMIN_PASSWORD=<strong>
-OPENCTI_ADMIN_TOKEN=<uuid from step 1>
-
-# Iframe embedding from the Jarvis frontends.  Replace with the real
-# Railway hostnames once OpenJarvis + Friday_Jarvis2 are deployed.
-APP__PUBLIC_DASHBOARD_AUTHORIZED_DOMAINS=openjarvis-production-*.up.railway.app,friday-jarvis2-production-*.up.railway.app
-
-# Plumbing — point at the sibling Railway services
-ELASTICSEARCH__URL=http://${{Elasticsearch.RAILWAY_PRIVATE_DOMAIN}}:9200
-REDIS__HOSTNAME=${{Redis.RAILWAY_PRIVATE_DOMAIN}}
-REDIS__PORT=6379
-RABBITMQ__HOSTNAME=${{RabbitMQ.RAILWAY_PRIVATE_DOMAIN}}
-RABBITMQ__PORT=5672
-RABBITMQ__USERNAME=opencti
-RABBITMQ__PASSWORD=<rabbitmq pass>
-MINIO__ENDPOINT=${{MinIO.RAILWAY_PRIVATE_DOMAIN}}
-MINIO__PORT=9000
-MINIO__ACCESS_KEY=minioadmin
-MINIO__SECRET_KEY=<minio root pass>
+# Sidecars
+RABBITMQ_DEFAULT_USER=opencti
+RABBITMQ_DEFAULT_PASS=cpaarQaagtw7PfthweOZRCo1
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=rGSy7CBxgDl4OHw6q2C7nWEC
+ELASTIC_MEMORY_SIZE=2G
+CONNECTOR_HISTORY_ID=$(uuidgen)
+CONNECTOR_EXPORT_FILE_STIX_ID=$(uuidgen)
+CONNECTOR_EXPORT_FILE_CSV_ID=$(uuidgen)
+CONNECTOR_IMPORT_FILE_STIX_ID=$(uuidgen)
+CONNECTOR_IMPORT_DOCUMENT_ID=$(uuidgen)
+SMTP_HOSTNAME=
 ```
 
-Set the Railway service to **expose port 8080** publicly.
+For the `CONNECTOR_*_ID` lines that use `$(uuidgen)`: PowerShell can't
+expand that. Replace each line with a fresh UUID — same generator we
+used before:
 
-## Step 3 — `worker` service env
-
-Use the same image (`opencti/worker:latest`). Scale to 2–3 replicas.
-
-```env
-OPENCTI_URL=http://${{opencti.RAILWAY_PRIVATE_DOMAIN}}:8080
-OPENCTI_TOKEN=<same OPENCTI_ADMIN_TOKEN>
-WORKER_LOG_LEVEL=info
+```powershell
+1..5 | ForEach-Object { [guid]::NewGuid().ToString() }
 ```
 
-## Step 4 — sibling stores
+Paste the five UUIDs into the `CONNECTOR_*_ID` lines (one per line).
 
-- **Elasticsearch**: official image; set `discovery.type=single-node`,
-  `xpack.security.enabled=false` (private network only), give it a
-  persistent volume on `/usr/share/elasticsearch/data`.
-- **Redis**: official image; default config is fine.
-- **RabbitMQ**: set `RABBITMQ_DEFAULT_USER=opencti` and
-  `RABBITMQ_DEFAULT_PASS=<your pass>`.
-- **MinIO**: set `MINIO_ROOT_USER=minioadmin`,
-  `MINIO_ROOT_PASSWORD=<your pass>`; mount a volume on `/data`; pass
-  `server /data` as the command.
+## Step 4 — start it
 
-## Step 5 — point Jarvis at OpenCTI
+```powershell
+docker compose pull
+docker compose up -d
+```
 
-On the **OpenJarvis backend** Railway service:
+First pull is ~3 GB and 5–10 minutes. After it returns, give the
+platform another ~60–90 s to finish bootstrap, then check:
 
-| Var | Value |
+```powershell
+docker compose ps
+# All services should show "Up" and the opencti row "(healthy)"
+
+# Browser smoke test:
+start http://localhost:8080
+# Log in: gelson_m@hotmail.com / LdxdGRhMkbwV8KcUiwsSRzYJ
+```
+
+## Step 5 — confirm the desktop-bridge is up on the laptop
+
+The bridge-proxy needs the existing desktop-bridge running. Confirm
+either by checking Task Scheduler (`Get-ScheduledTask JarvisDesktopBridge`)
+or by looking for the python+wscript processes from the earlier setup.
+If it isn't running, start it via the scheduled task:
+
+```powershell
+Start-ScheduledTask -TaskName JarvisDesktopBridge
+```
+
+## Step 6 — wire env vars on the Railway OpenJarvis services
+
+The token + URL are now **internal** to the laptop, but the cloud needs
+to know how to address them through the bridge.
+
+### OpenJarvis backend (Railway service)
+
+| Variable | Value |
 |---|---|
-| `OPENCTI_URL` | `https://opencti-production-<id>.up.railway.app` |
-| `OPENCTI_TOKEN` | the `OPENCTI_ADMIN_TOKEN` you generated above |
+| `OPENCTI_URL` | `http://localhost:8080` |
+| `OPENCTI_TOKEN` | `e644bf12-cfc0-4844-a21d-5add52ae99bc` |
+| `OPENCTI_BRIDGE_MACHINE` | `laptop` |
+| `LIVEKIT_URL` | *(should already be set for the existing desktop-control tool)* |
+| `LIVEKIT_API_KEY` | *(ditto)* |
+| `LIVEKIT_API_SECRET` | *(ditto)* |
+| `JARVIS_CONTROL_ROOM` | `jarvis-control` *(default — only set if you changed it)* |
 
-On the **OpenJarvis livekit worker** service (same project, different
-service): set the **same two vars**.
+### OpenJarvis livekit worker (Railway service)
 
-On the **OpenJarvis frontend** Railway service:
-
-| Var | Value |
+| Variable | Value |
 |---|---|
-| `VITE_OPENCTI_URL` | `https://opencti-production-<id>.up.railway.app` |
+| `OPENCTI_URL` | `http://localhost:8080` |
+| `OPENCTI_TOKEN` | `e644bf12-cfc0-4844-a21d-5add52ae99bc` |
+| `OPENCTI_BRIDGE_MACHINE` | `laptop` |
 
-(Vite vars are baked at build time — redeploy the frontend after setting
-this.)
+(LiveKit env is already wired here — it's the agent's runtime.)
 
-## Step 6 — smoke test
+### OpenJarvis frontend (Railway service)
 
-After the OpenCTI platform comes up (give it 60–90 s on first boot):
+| Variable | Value |
+|---|---|
+| `VITE_OPENCTI_URL` | `http://localhost:8080` |
 
-```bash
-# 1. Health
-curl -sf https://opencti-production-<id>.up.railway.app/health
-# → expects 200
+Vite bakes this at **build time** — trigger a redeploy after setting.
 
-# 2. Token works
-curl -sH "Authorization: Bearer $OPENCTI_TOKEN" \
-  -X POST https://opencti-production-<id>.up.railway.app/graphql \
-  -H "Content-Type: application/json" \
-  -d '{"query":"{ me { name user_email }}"}'
-# → returns your admin user
-```
+Redeploy backend + worker + frontend, in any order.
 
-Once OpenJarvis is redeployed with the new env vars, try the voice
-loop:
+## Step 7 — voice smoke test
 
-- *"Hey Jarvis, what came in today?"* → spoken count of new objects (will
-  be 0 on a fresh deploy until you wire connectors).
-- *"Hey Jarvis, log foo.com as a suspicious domain"* → spoken "Logged,
-  sir." and an Observable in the OpenCTI UI's Observables view.
-- *"Hey Jarvis, open the intel panel"* → CTI widget appears on the HUD
-  with the OpenCTI UI inside.
+Wake Jarvis, then try in this order:
 
-## Out of scope (deliberate)
+1. *"Hey Jarvis, open the intel panel"*
+   → CTI widget appears on the HUD with the OpenCTI dashboard rendered
+   inside (you'll see the page you'd see at <http://localhost:8080>).
+2. *"Hey Jarvis, log foo.com as a suspicious domain"*
+   → spoken *"Logged foo.com as a domain, sir."* → refresh the
+   OpenCTI Observables view, the new domain is there.
+3. *"Hey Jarvis, what came in today?"*
+   → spoken count of new objects in the last 24 hours.
 
-- **Connectors** (ingest from MITRE ATT&CK / MISP / AlienVault OTX / CISA
-  KEV / VirusTotal / etc.): follow up once the platform is live. Each
-  connector is a separate Railway service running an
-  `opencti/connector-<name>` image with its own env. Start with
-  `connector-mitre` and `connector-cve` — they're zero-config.
-- **SSO via OIDC**: harden later. Until then, the iframe embed uses
-  OpenCTI's public-dashboards whitelist + a persistent session cookie.
-- **Backup of Elasticsearch / MinIO**: set up Railway snapshots on the
-  attached volumes before you trust it with real data.
+If voice says *"OpenCTI hiccup, sir — the 'laptop' bridge is offline"*,
+restart the scheduled task. If it says *"OpenCTI HTTP 401"*, double-
+check the `OPENCTI_TOKEN` matches on both sides.
+
+## Cost — actually free now
+
+| Item | Cost |
+|---|---|
+| Docker Desktop | $0 (personal use) |
+| OpenCTI software | $0 (AGPL) |
+| Laptop electricity for the containers | a few watts; rounding error |
+| **Additional Railway spend** | **$0** — no new Railway services |
+
+## Out of scope
+
+- **Connectors** (auto-ingest from MITRE ATT&CK / CISA KEV / AlienVault
+  / VirusTotal / etc.). The official compose already includes the basic
+  export/import connectors — add more by uncommenting the relevant
+  `connector-*` services in `docker-compose.yml`. Each has its own
+  `CONNECTOR_*_ID` (run the UUID generator again per new connector).
+- **Public access to OpenCTI from your phone / the ROG.** By design,
+  Path B keeps OpenCTI laptop-only. If you later want it reachable
+  elsewhere, add Tailscale Funnel on top — the bridge-proxy continues
+  to work unchanged.
+- **Persisting the OpenCTI data across laptop wipes.** Docker volumes
+  in the official compose handle this — `docker compose down` keeps
+  data, `docker compose down -v` wipes it.
