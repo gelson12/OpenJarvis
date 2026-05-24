@@ -58,6 +58,22 @@ from livekit.agents.utils.images import encode, EncodeOptions, ResizeOptions
 from livekit.plugins import openai, deepgram, silero, noise_cancellation
 from openai import AsyncOpenAI
 
+# Gemini Live (primary low-latency path). Imported lazily-guarded so a
+# missing google-genai install doesn't crash worker startup — the cascade
+# path stays usable on its own.
+try:
+    from livekit.plugins.google.realtime import RealtimeModel as _GeminiRealtimeModel
+    from google.genai import types as _genai_types
+    _REALTIME_AVAILABLE = True
+except Exception as _exc:  # noqa: BLE001
+    _GeminiRealtimeModel = None  # type: ignore[assignment]
+    _genai_types = None  # type: ignore[assignment]
+    _REALTIME_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "livekit-plugins-google / google-genai unavailable (%s) — "
+        "Gemini Live disabled, cascade only", _exc,
+    )
+
 import search_tools
 
 load_dotenv()
@@ -1037,7 +1053,14 @@ _CTI_HINT_RE = re.compile(
     r"kill\s?chain|campaign|malware|phishing|breach|"
     r"suspicious|"
     r"log\s+(?:the\s+|that\s+|this\s+)?(?:domain|ip|url|hash|email|file)|"
-    r"indicators\s+of\s+compromise"
+    r"indicators\s+of\s+compromise|"
+    # Lifecycle words — "activate / wake / boot / spin up / stand down /
+    # power down Global Eyes" etc. route into the CTI router for the
+    # spinup/spindown commands.
+    r"global\s*eyes|"
+    r"(?:activate|wake|boot|fire\s?up|spin\s?up|stand\s?down|"
+    r"power\s?down|shut\s?down|kill)\s+(?:the\s+)?"
+    r"(?:global\s*eyes|intel|intelligence|cti|opencti)"
     r")\b",
     re.I,
 )
@@ -1069,7 +1092,16 @@ Available OpenCTI commands (use `command` and `args`):
   cti_list_indicators {"limit": 10}
   cti_open_panel    {"dashboard": "<slug>", "path": "<optional URL path>"}
                     Mount the on-screen Intelligence panel; optional
-                    deep-link path like "/dashboard/threats"."""
+                    deep-link path like "/dashboard/threats".
+
+  cti_spinup        {}
+                    Boot the OpenCTI stack on Railway (~3 min cold start).
+                    Use for: "activate / wake / boot / spin up / fire up /
+                    start Global Eyes / intel / OpenCTI".
+  cti_spindown      {}
+                    Tear down the OpenCTI stack to stop the Railway bill.
+                    Use for: "stand down / power down / shut down / stop /
+                    kill / put away Global Eyes / intel / OpenCTI"."""
 
 
 _CTI_OPEN_RE = re.compile(
@@ -1166,93 +1198,66 @@ _OBSERVABLE_TYPE_MAP: dict[str, str] = {
 
 
 class OpenCTIClient:
-    """GraphQL client that reaches a laptop-hosted OpenCTI via the bridge.
+    """Async GraphQL client for a Railway-hosted OpenCTI.
 
-    OpenCTI runs locally on the user's laptop (Docker on http://localhost
-    :8080). To reach it from the cloud worker WITHOUT punching the laptop
-    onto the public internet, we tunnel the HTTP request over the
-    existing LiveKit data channel that the desktop-bridge already
-    listens on: the bridge proxies the request to localhost and ships
-    the response back the same way. Zero new infra, zero public
-    exposure of OpenCTI.
+    Path Y (chosen 2026-05-24): OpenCTI lives on Railway with a public
+    URL; the worker talks to it via direct httpx. The bridge `http_proxy`
+    handler is no longer in the CTI hot path (still useful for any future
+    localhost service). The class still accepts a DesktopBridge ref for
+    forward-compat with a possible Path Y+Z hybrid, but doesn't use it.
 
     Env:
-      OPENCTI_URL              the URL the *bridge* uses (default
-                               'http://localhost:8080'); from the worker's
-                               POV this is the laptop's localhost
-      OPENCTI_TOKEN            admin/api token (required)
-      OPENCTI_BRIDGE_MACHINE   which desktop-bridge runs OpenCTI
-                               (default 'laptop')
-
-    Construct with a DesktopBridge reference so this client doesn't need
-    its own LiveKit connection.
+      OPENCTI_URL      full Railway URL, e.g.
+                       'https://opencti-production-xx.up.railway.app'
+      OPENCTI_TOKEN    admin / API token
     """
 
     def __init__(self, bridge: "DesktopBridge") -> None:
-        self._bridge = bridge
-        self._base_url = os.environ.get(
-            "OPENCTI_URL", "http://localhost:8080"
-        ).rstrip("/")
+        self._bridge = bridge  # reserved for future hybrid mode
+        self._base_url = os.environ.get("OPENCTI_URL", "").rstrip("/")
         self._token = os.environ.get("OPENCTI_TOKEN", "")
-        self._machine = os.environ.get(
-            "OPENCTI_BRIDGE_MACHINE", "laptop"
-        )
+        self._client: httpx.AsyncClient | None = None
+        self._lock = asyncio.Lock()
 
-    async def _gql(self, query: str, variables: dict | None = None) -> dict:
-        if not self._token:
-            raise RuntimeError(
-                "OpenCTI unavailable — OPENCTI_TOKEN is not set on the worker"
-            )
-        # Eagerly join the control room so presence is accurate before
-        # we decide whether the bridge that hosts OpenCTI is up.
-        try:
-            await self._bridge._ensure()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("opencti: control-room connect failed: %s", exc)
-        if not self._bridge.is_online(self._machine):
-            raise RuntimeError(
-                f"OpenCTI unavailable — the '{self._machine}' bridge is "
-                "offline (start desktop-bridge\\run.bat there)"
-            )
-        proxy_res = await self._bridge.send(
-            self._machine,
-            "http_proxy",
-            {
-                "base_url": self._base_url,
-                "method": "POST",
-                "path": "/graphql",
-                "headers": {
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    async def _ensure(self) -> httpx.AsyncClient:
+        async with self._lock:
+            if self._client is not None:
+                return self._client
+            if not (self._base_url and self._token):
+                raise RuntimeError(
+                    "OpenCTI unavailable — OPENCTI_URL / OPENCTI_TOKEN "
+                    "are not set on the worker"
+                )
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url,
+                headers={
                     "Authorization": f"Bearer {self._token}",
                     "Content-Type": "application/json",
                 },
-                "body": {"query": query, "variables": variables or {}},
-                "timeout": 30.0,
-            },
-            timeout=40.0,
-        )
-        if not isinstance(proxy_res, dict) or proxy_res.get("error"):
-            err = (
-                proxy_res.get("error")
-                if isinstance(proxy_res, dict)
-                else "bridge proxy returned no dict"
+                # Generous connect timeout — a service warming up after
+                # cti_spinup may not accept connections for ~30 s; we
+                # want the auto-spin-up flow's poll-loop to surface that
+                # as a connect-refused, not a longer hang.
+                timeout=httpx.Timeout(30.0, connect=8.0),
             )
-            raise RuntimeError(f"bridge proxy error: {err}")
-        status = proxy_res.get("status")
-        payload = proxy_res.get("json")
-        if payload is None:
-            try:
-                payload = json.loads(proxy_res.get("body") or "{}")
-            except Exception:  # noqa: BLE001
-                payload = {}
-        if status and status >= 400:
-            raise RuntimeError(
-                f"opencti HTTP {status}: {(proxy_res.get('body') or '')[:200]}"
-            )
-        if isinstance(payload, dict) and payload.get("errors"):
-            raise RuntimeError(f"opencti errors: {payload['errors'][:2]}")
-        return (
-            payload.get("data") or {} if isinstance(payload, dict) else {}
+            logger.info("opencti: client initialised for %s", self._base_url)
+            return self._client
+
+    async def _gql(self, query: str, variables: dict | None = None) -> dict:
+        client = await self._ensure()
+        resp = await client.post(
+            "/graphql",
+            json={"query": query, "variables": variables or {}},
         )
+        resp.raise_for_status()
+        data = resp.json()
+        if "errors" in data and data["errors"]:
+            raise RuntimeError(f"opencti errors: {data['errors'][:2]}")
+        return data.get("data") or {}
 
     # ── Operations ───────────────────────────────────────────────
 
@@ -1505,7 +1510,127 @@ def _cti_reply(cmd: str, args: dict, res: dict) -> str:
         )
     if cmd == "cti_open_panel":
         return "Intelligence panel is up, sir."
+    if cmd == "cti_spinup":
+        return (
+            "On it, sir — Global Eyes coming online, give me about three "
+            "minutes."
+        )
+    if cmd == "cti_spindown":
+        return "Powering down Global Eyes, sir."
     return "Done, sir."
+
+
+# ── OpenCTI lifecycle (Path Y — Railway on-demand via GitHub Actions) ──
+# Voice "activate Global Eyes" fires this workflow with action=start;
+# "stand down Global Eyes" or the idle watchdog fires action=stop. The
+# workflow itself just runs the existing railway_schedule.py against the
+# OpenCTI service list (see Jarvis/.github/workflows/opencti-lifecycle.yml).
+
+# How long the idle watchdog waits after the last successful CTI op
+# before tearing down the Railway services. 180 s = 3 minutes (user-set).
+_CTI_IDLE_SECONDS = 180
+
+
+def _is_offline_error(exc: BaseException) -> bool:
+    """Heuristic: does this exception look like the OpenCTI platform is
+    not currently reachable? Used by the auto-spin-up path to decide
+    whether to attempt a transparent recovery instead of speaking the
+    error verbatim."""
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+            httpx.PoolTimeout,
+        ),
+    ):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        # 502 / 503 / 504 from Railway's edge while a container boots.
+        return exc.response.status_code in (502, 503, 504)
+    msg = str(exc).lower()
+    return any(
+        tok in msg
+        for tok in (
+            "connect", "connection refused", "no route",
+            "name or service not known", "temporarily unavailable",
+            "502", "503", "504",
+        )
+    )
+
+
+class GitHubDispatchClient:
+    """Fires a workflow_dispatch on the OpenCTI lifecycle workflow.
+
+    Env (set on the worker service):
+      GITHUB_DISPATCH_TOKEN     PAT with `repo` + `workflow` scopes
+      GITHUB_DISPATCH_OWNER     GitHub user / org (default 'gelson12')
+      GITHUB_DISPATCH_REPO      Repo name      (default 'friday_jarvis2')
+      GITHUB_DISPATCH_WORKFLOW  Workflow file  (default 'opencti-lifecycle.yml')
+      GITHUB_DISPATCH_REF       Branch to run against (default 'main')
+    """
+
+    def __init__(self) -> None:
+        self._token = os.environ.get("GITHUB_DISPATCH_TOKEN", "")
+        self._owner = os.environ.get("GITHUB_DISPATCH_OWNER", "gelson12")
+        self._repo = os.environ.get(
+            "GITHUB_DISPATCH_REPO", "friday_jarvis2"
+        )
+        self._workflow = os.environ.get(
+            "GITHUB_DISPATCH_WORKFLOW", "opencti-lifecycle.yml"
+        )
+        self._ref = os.environ.get("GITHUB_DISPATCH_REF", "main")
+        self._client: httpx.AsyncClient | None = None
+        self._lock = asyncio.Lock()
+
+    async def _ensure(self) -> httpx.AsyncClient | None:
+        async with self._lock:
+            if self._client is not None:
+                return self._client
+            if not self._token:
+                logger.warning(
+                    "gh dispatch: GITHUB_DISPATCH_TOKEN not set; OpenCTI "
+                    "lifecycle commands will fail until you add it"
+                )
+                return None
+            self._client = httpx.AsyncClient(
+                base_url="https://api.github.com",
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {self._token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=httpx.Timeout(15.0, connect=10.0),
+            )
+            logger.info(
+                "gh dispatch: ready (%s/%s :: %s on %s)",
+                self._owner, self._repo, self._workflow, self._ref,
+            )
+            return self._client
+
+    async def dispatch(self, action: str) -> tuple[bool, str]:
+        """Fire `action` (start|stop) → (ok, message)."""
+        if action not in ("start", "stop"):
+            return False, f"invalid action '{action}'"
+        client = await self._ensure()
+        if client is None:
+            return False, "GITHUB_DISPATCH_TOKEN is not set on the worker"
+        try:
+            resp = await client.post(
+                f"/repos/{self._owner}/{self._repo}/actions/workflows/"
+                f"{self._workflow}/dispatches",
+                json={"ref": self._ref, "inputs": {"action": action}},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"gh dispatch network error: {exc}"
+        if resp.status_code == 204:
+            return True, ""
+        return False, (
+            f"gh dispatch returned {resp.status_code}: "
+            f"{resp.text[:200]}"
+        )
 
 
 class DesktopBridge:
@@ -1626,10 +1751,15 @@ class Assistant(Agent):
         self._room = room
         # Desktop control — lazy 2nd LiveKit connection to the PCs' bridge.
         self._desktop = DesktopBridge()
-        # OpenCTI — reaches the laptop-hosted OpenCTI by proxying HTTP
-        # over the SAME desktop-bridge channel (zero public exposure of
-        # OpenCTI). Idle until the first CTI turn.
+        # OpenCTI — Railway-hosted, reached via direct httpx (Path Y).
+        # Lifecycle (spinup/spindown) goes through GitHub Actions
+        # workflow_dispatch on the opencti-lifecycle workflow.
         self._cti = OpenCTIClient(self._desktop)
+        self._gh = GitHubDispatchClient()
+        # Lifecycle state — see _cti_spinup, _cti_idle_watch.
+        self._cti_up: bool = False
+        self._cti_last_active: float = 0.0
+        self._cti_idle_task: asyncio.Task | None = None
         # Wake/sleep: dormant on connect, woken by "Hey Jarvis".
         self._awake = False
         # Set by the interim-transcript wake listener: the next turn is
@@ -2287,47 +2417,94 @@ class Assistant(Agent):
             except Exception:  # noqa: BLE001
                 pass
 
-        # Dispatch.
-        res: dict
-        try:
+        # Lifecycle commands — no auto-spinup wrapper (they ARE the
+        # lifecycle). Spinup also spawns the idle watchdog.
+        if cmd == "cti_spinup":
+            await self._cti_spinup()
+            return True
+        if cmd == "cti_spindown":
+            await self._cti_spindown()
+            return True
+
+        # Dispatch — wrapped so auto-spinup can recover from "offline"
+        # exceptions transparently on the user's first request.
+        async def _run() -> dict:
             if cmd == "cti_search":
-                res = await self._cti.search(
+                return await self._cti.search(
                     str(args.get("query", "")),
                     int(args.get("limit") or 10),
                 )
-            elif cmd == "cti_add_observable":
-                res = await self._cti.add_observable(
+            if cmd == "cti_add_observable":
+                return await self._cti.add_observable(
                     str(args.get("value", "")),
                     str(args.get("observable_type", "")),
                 )
-            elif cmd == "cti_create_incident":
-                res = await self._cti.create_incident(
+            if cmd == "cti_create_incident":
+                return await self._cti.create_incident(
                     str(args.get("name", "")),
                     str(args.get("description", "")),
                 )
-            elif cmd == "cti_link":
-                res = await self._cti.link(
+            if cmd == "cti_link":
+                return await self._cti.link(
                     str(args.get("from_id", "")),
                     str(args.get("to_id", "")),
                     str(args.get("relationship") or "related-to"),
                 )
-            elif cmd == "cti_summary":
-                res = await self._cti.summary(int(args.get("hours") or 24))
-            elif cmd == "cti_list_indicators":
-                res = await self._cti.list_indicators(
+            if cmd == "cti_summary":
+                return await self._cti.summary(
+                    int(args.get("hours") or 24)
+                )
+            if cmd == "cti_list_indicators":
+                return await self._cti.list_indicators(
                     int(args.get("limit") or 10)
                 )
-            elif cmd == "cti_open_panel":
+            if cmd == "cti_open_panel":
                 await self._open_cti_panel(
                     dashboard=args.get("dashboard"),
                     path=args.get("path"),
                 )
-                res = {"opened": True}
-            else:
-                res = {"error": f"unknown cti command '{cmd}'"}
+                return {"opened": True}
+            return {"error": f"unknown cti command '{cmd}'"}
+
+        res: dict
+        try:
+            res = await _run()
         except Exception as exc:  # noqa: BLE001
-            logger.error("cti %s failed: %s", cmd, exc)
-            res = {"error": str(exc)}
+            # Auto-spinup: detect "service is offline" exceptions and
+            # bring OpenCTI up, then retry the original op once.
+            if _is_offline_error(exc):
+                logger.info(
+                    "cti %s hit offline error (%s) — auto-spinup",
+                    cmd, exc,
+                )
+                try:
+                    await self.session.say(
+                        "Bringing Global Eyes online first, sir — one moment."
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                up = await self._cti_spinup(quiet=True)
+                if up:
+                    try:
+                        res = await _run()
+                    except Exception as exc2:  # noqa: BLE001
+                        logger.error(
+                            "cti %s retry after auto-spinup failed: %s",
+                            cmd, exc2,
+                        )
+                        res = {"error": f"retry after spinup failed: {exc2}"}
+                else:
+                    res = {
+                        "error": "auto-spinup did not complete in time"
+                    }
+            else:
+                logger.error("cti %s failed: %s", cmd, exc)
+                res = {"error": str(exc)}
+
+        # Stamp activity on success so the idle watchdog starts the
+        # clock from the most recent real use.
+        if isinstance(res, dict) and not res.get("error"):
+            self._cti_last_active = time.time()
 
         try:
             await self.session.say(_cti_reply(cmd, args, res))
@@ -2355,6 +2532,141 @@ class Assistant(Agent):
                 "payload": payload,
             }
         )
+
+    # ── CTI lifecycle (Path Y on-demand) ────────────────────────────
+
+    async def _cti_spinup(self, quiet: bool = False) -> bool:
+        """Trigger the OpenCTI lifecycle workflow with action=start, then
+        poll until healthy. ``quiet`` skips the ack speech (used by the
+        auto-spinup path which already spoke its own line).
+
+        Returns True when the platform answered a GraphQL ping within
+        the deadline, False otherwise.
+        """
+        ok, why = await self._gh.dispatch("start")
+        if not ok:
+            try:
+                await self.session.say(
+                    f"I couldn't kick off the spin-up, sir — {why}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
+        if not quiet:
+            try:
+                await self.session.say(
+                    "On it, sir — Global Eyes coming online, give me "
+                    "about three minutes."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        healthy = await self._wait_until_cti_healthy()
+        if healthy:
+            self._cti_up = True
+            self._cti_last_active = time.time()
+            # Spawn the idle watchdog if it isn't already running.
+            if (
+                self._cti_idle_task is None
+                or self._cti_idle_task.done()
+            ):
+                self._cti_idle_task = asyncio.create_task(
+                    self._cti_idle_watch()
+                )
+            try:
+                if not quiet:
+                    await self.session.say("Global Eyes are online, sir.")
+                await self._open_cti_panel()
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                await self.session.say(
+                    "Global Eyes didn't come up in time, sir — check the "
+                    "Railway dashboard."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return healthy
+
+    async def _cti_spindown(self) -> None:
+        """Trigger the OpenCTI lifecycle workflow with action=stop and
+        clean up local state. Idempotent."""
+        # Mark down immediately so the watchdog loop exits this tick.
+        self._cti_up = False
+        if self._cti_idle_task is not None:
+            self._cti_idle_task.cancel()
+            self._cti_idle_task = None
+        ok, why = await self._gh.dispatch("stop")
+        if not ok:
+            try:
+                await self.session.say(
+                    f"Couldn't fire the spin-down, sir — {why}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            await self._publish_ui(
+                {"type": "close_widget", "kind": "cti"}
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await self.session.say("Powering down Global Eyes, sir.")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _wait_until_cti_healthy(
+        self, deadline_s: float = 420.0
+    ) -> bool:
+        """Poll OpenCTI's GraphQL ping every 10 s up to ``deadline_s``.
+        Returns True on the first success, False on deadline."""
+        end = time.time() + deadline_s
+        attempts = 0
+        while time.time() < end:
+            attempts += 1
+            try:
+                # Tiny GraphQL ping — succeeds the moment the platform
+                # is serving requests and the admin token is accepted.
+                await self._cti._gql("{ me { name } }")
+                logger.info(
+                    "cti healthy after %d probes (%.1fs)",
+                    attempts, deadline_s - (end - time.time()),
+                )
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("cti probe %d not yet healthy: %s", attempts, exc)
+            await asyncio.sleep(10.0)
+        return False
+
+    async def _cti_idle_watch(self) -> None:
+        """Background watchdog: if no CTI activity for `_CTI_IDLE_SECONDS`
+        seconds while the platform is up, announce + spin it down."""
+        try:
+            while self._cti_up:
+                await asyncio.sleep(30.0)
+                if not self._cti_up:
+                    return
+                idle = time.time() - self._cti_last_active
+                if idle >= _CTI_IDLE_SECONDS:
+                    minutes = max(1, int(_CTI_IDLE_SECONDS // 60))
+                    word = "minute" if minutes == 1 else "minutes"
+                    try:
+                        await self.session.say(
+                            f"Global Eyes has been idle for over "
+                            f"{minutes} {word}, sir — powering down to "
+                            "save computational resources."
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await self._cti_spindown()
+                    return
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.error("cti idle watch crashed: %s", exc)
 
     async def _maybe_handle_desktop(self, text: str) -> bool:
         """Operate the user's Windows machines via the LLM intent router.
@@ -2861,9 +3173,73 @@ class Assistant(Agent):
                 )
 
 
-async def entrypoint(ctx: agents.JobContext):
-    await ctx.connect()
+# ── Voice provider selection ──────────────────────────────────────────
+# Default: try Gemini Live first (one bidirectional audio WebSocket →
+# ~300 ms TTFA), fall back to the Deepgram → OpenJarvis → Aura cascade
+# (~1 s+ TTFA, but full OpenJarvis tool surface). OPENJARVIS_VOICE_PROVIDER
+# overrides: `realtime` skips the cascade (debug), `cascade` skips Live
+# (kill switch), `auto` (default) tries Live then falls back.
 
+def _voice_provider_pref() -> str:
+    pref = os.environ.get("OPENJARVIS_VOICE_PROVIDER", "auto").strip().lower()
+    if pref in ("auto", "realtime", "cascade"):
+        return pref
+    return "auto"
+
+
+def _realtime_enabled() -> bool:
+    if not _REALTIME_AVAILABLE:
+        return False
+    pref = _voice_provider_pref()
+    if pref == "cascade":
+        return False
+    # `realtime` forces it on (even without a key, so we surface the auth
+    # error rather than silently falling back); `auto` requires a key.
+    if pref == "realtime":
+        return True
+    return bool(
+        os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    )
+
+
+def _build_realtime_session(ctx: agents.JobContext) -> AgentSession:
+    """AgentSession driven by Gemini Live (audio in + audio out, no STT/TTS).
+
+    Voice id defaults to Charon (deep male — closest free analogue to the
+    Deepgram Aura 'aura-orion-en' butler tone). Audio transcription on
+    both ends is REQUIRED so `user_input_transcribed` events still fire —
+    every regex intent handler + the interim-wake listener depend on
+    transcript text.
+    """
+    model_id = os.environ.get(
+        "OPENJARVIS_REALTIME_MODEL",
+        "gemini-2.5-flash-native-audio-preview-12-2025",
+    )
+    voice = os.environ.get("OPENJARVIS_REALTIME_VOICE", "Charon")
+    api_key = (
+        os.environ.get("GOOGLE_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or None
+    )
+    rt_llm = _GeminiRealtimeModel(
+        model=model_id,
+        api_key=api_key,
+        voice=voice,
+        modalities=[_genai_types.Modality.AUDIO],
+        input_audio_transcription=_genai_types.AudioTranscriptionConfig(),
+        output_audio_transcription=_genai_types.AudioTranscriptionConfig(),
+        temperature=0.7,
+    )
+    return AgentSession(
+        vad=ctx.proc.userdata["vad"],
+        llm=rt_llm,
+    )
+
+
+def _build_cascade_session(ctx: agents.JobContext) -> AgentSession:
+    """The original Deepgram STT → OpenJarvis LLM proxy → Deepgram Aura
+    TTS pipeline. Used as primary when OPENJARVIS_VOICE_PROVIDER=cascade
+    or as fallback when Gemini Live fails to start."""
     openjarvis_url = os.environ.get(
         "OPENJARVIS_URL", "http://localhost:8000"
     ).rstrip("/")
@@ -2871,11 +3247,10 @@ async def entrypoint(ctx: agents.JobContext):
     model_name = os.environ.get("OPENJARVIS_MODEL", "openrouter/auto")
 
     # STT with wake-word boosting. "Jarvis" is an uncommon proper noun
-    # Deepgram routinely mis-hears (Travis/Jervis/service…), which is why
-    # waking took several tries. We boost it via Deepgram's keyword API —
-    # trying the nova-3 (`keyterms`) and nova-2 (`keywords`) forms in
-    # turn, falling back to a plain STT so the worker never fails to
-    # start on an API mismatch.
+    # Deepgram routinely mis-hears (Travis/Jervis/service…). We boost it
+    # via Deepgram's keyword API — trying the nova-3 (`keyterms`) and
+    # nova-2 (`keywords`) forms in turn, falling back to a plain STT so
+    # the worker never fails to start on an API mismatch.
     if not os.environ.get("DEEPGRAM_API_KEY"):
         raise RuntimeError(
             "DEEPGRAM_API_KEY is not set — Deepgram STT/TTS cannot start"
@@ -2910,54 +3285,36 @@ async def entrypoint(ctx: agents.JobContext):
         logger.error("Deepgram TTS init failed: %s", exc)
         raise RuntimeError("TTS provider unavailable") from exc
 
-    session = AgentSession(
+    return AgentSession(
         # NOTE: preemptive_generation left at its default (True). The
         # wake-gate fix in commit 1e6dcc2 stops mutating
         # new_message.content, so the framework's speculative mid-turn
         # LLM call is no longer invalidated on wake turns and actually
-        # saves a round-trip. Setting this to False here would defeat
-        # that work.
+        # saves a round-trip.
         vad=ctx.proc.userdata["vad"],
         stt=stt,
         llm=openai.LLM(
             model=model_name,
             base_url=f"{openjarvis_url}/v1",
             api_key=openjarvis_key,
-            # Per-attempt cap. Without this, a single hung upstream
-            # cloud-engine attempt can sit for tens of seconds before
-            # the framework gives up + retries — that's the visible
-            # 10-12s "Jarvis just sits there" gap reported by users.
-            # 8s is generous for normal completions but kills hangs fast.
             timeout=8.0,
             extra_headers={
                 **_openjarvis_auth_headers(),
-                # Tell OpenJarvis to emit a STRICT OpenAI SSE stream
-                # (only chat chunks + [DONE]) — the LiveKit LLM client
-                # crashes on OpenJarvis's custom `event:` UI events.
                 "X-OpenJarvis-Stream": "openai",
-                # FAST PATH — skip the agent orchestrator; stream the
-                # engine token-by-token. Cuts seconds off each voice turn.
                 "X-OpenJarvis-Direct": "true",
             },
         ),
         tts=tts,
     )
 
-    assistant = Assistant(ctx.room)
-    # BVC noise cancellation can over-suppress quiet speech; allow opting
-    # out with OPENJARVIS_NOISE_CANCEL=0 if user turns are being missed.
-    _nc = None
-    if os.environ.get("OPENJARVIS_NOISE_CANCEL", "1").lower() not in (
-        "0",
-        "false",
-        "no",
-    ):
-        _nc = noise_cancellation.BVC()
-    # Interim-transcript wake listener — wakes the agent the moment
-    # Deepgram emits "Jarvis" in ANY transcript (interim OR final), not
-    # only on a fully-endpointed turn. This is what makes waking reliable:
-    # a short or mis-finalised "Jarvis" still has many partial transcripts
-    # to match against. A false wake is harmless (dormant just flips on).
+
+def _attach_wake_listener(session: AgentSession, assistant: "Assistant") -> None:
+    """Interim-transcript wake listener — wakes the agent the moment the
+    transcriber emits "Jarvis" in ANY transcript (interim OR final), not
+    only on a fully-endpointed turn. Works identically on the cascade
+    (Deepgram) and the realtime (Gemini Live) paths — both emit
+    `user_input_transcribed` with `.transcript` + `.is_final`."""
+
     @session.on("user_input_transcribed")
     def _on_user_transcript(ev) -> None:  # noqa: ANN001
         if assistant._awake:
@@ -2968,16 +3325,84 @@ async def entrypoint(ctx: agents.JobContext):
             assistant._just_woke = True
             logger.info("wake: matched on transcript %r", text[:60])
 
-    await session.start(
-        room=ctx.room,
-        agent=assistant,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=_nc,
-            # Required for the worker to receive the user's camera +
-            # screen-share tracks (default off → no video reaches us).
-            video_enabled=True,
-        ),
+
+async def entrypoint(ctx: agents.JobContext):
+    await ctx.connect()
+
+    openjarvis_url = os.environ.get(
+        "OPENJARVIS_URL", "http://localhost:8000"
+    ).rstrip("/")
+
+    assistant = Assistant(ctx.room)
+
+    # BVC noise cancellation can over-suppress quiet speech; allow opting
+    # out with OPENJARVIS_NOISE_CANCEL=0 if user turns are being missed.
+    _nc = None
+    if os.environ.get("OPENJARVIS_NOISE_CANCEL", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    ):
+        _nc = noise_cancellation.BVC()
+
+    room_input_options = RoomInputOptions(
+        noise_cancellation=_nc,
+        # Required for the worker to receive the user's camera +
+        # screen-share tracks (default off → no video reaches us).
+        video_enabled=True,
     )
+
+    session: AgentSession | None = None
+    used_provider = "cascade"
+
+    if _realtime_enabled():
+        try:
+            session = _build_realtime_session(ctx)
+            _attach_wake_listener(session, assistant)
+            # Bound the Live handshake. Typical connect is < 2 s; an 8 s
+            # cap kills hangs (bad key, region trouble) fast so the
+            # cascade fallback can take over within one session lifetime.
+            await asyncio.wait_for(
+                session.start(
+                    room=ctx.room,
+                    agent=assistant,
+                    room_input_options=room_input_options,
+                ),
+                timeout=8.0,
+            )
+            used_provider = "realtime"
+            logger.info(
+                "voice: Gemini Live ACTIVE (model=%s, voice=%s)",
+                os.environ.get(
+                    "OPENJARVIS_REALTIME_MODEL",
+                    "gemini-2.5-flash-native-audio-preview-12-2025",
+                ),
+                os.environ.get("OPENJARVIS_REALTIME_VOICE", "Charon"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "voice: Gemini Live failed (%s) — falling back to cascade",
+                exc,
+            )
+            if session is not None:
+                try:
+                    await session.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+            session = None
+
+    if session is None:
+        session = _build_cascade_session(ctx)
+        _attach_wake_listener(session, assistant)
+        await session.start(
+            room=ctx.room,
+            agent=assistant,
+            room_input_options=room_input_options,
+        )
+        used_provider = "cascade"
+        logger.info(
+            "voice: cascade ACTIVE (Deepgram → OpenJarvis → Aura)"
+        )
 
     # Relay live-browser interactions (click / scroll / key / navigate)
     # from the browser widget back to the worker's Playwright page.

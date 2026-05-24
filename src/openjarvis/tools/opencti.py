@@ -1,34 +1,33 @@
 """OpenCTI integration — Jarvis's intelligence/investigation layer.
 
-Wraps a laptop-hosted OpenCTI instance (https://github.com/OpenCTI-Platform/opencti)
-through its GraphQL API. OpenCTI runs locally on the user's laptop
-(Docker on http://localhost:8080); to reach it from the cloud backend
-without punching the laptop onto the public internet we proxy every
-HTTP call over the SAME LiveKit data channel the desktop-bridge already
-listens on — the bridge runs the request against localhost and ships
-the response back. Zero new infra, zero public exposure of OpenCTI.
+Wraps a Railway-hosted OpenCTI instance (https://github.com/OpenCTI-Platform/opencti)
+through its GraphQL API. Operations cover the day-to-day analyst loop:
+search the knowledge graph, log new observables, open incidents, link
+entities, summarise what came in over the last N hours, list indicators.
 
-Operations cover the day-to-day analyst loop: search the knowledge
-graph, log new observables, open incidents, link entities, and
-summarise what came in over the last N hours.
+The deeper UI experience lives in the LiveKit worker — this tool is the
+server-side counterpart so an OpenJarvis chat turn (HTTP / agent stream)
+can also drive OpenCTI. Mirrors the structure of ``shell_exec.py`` /
+the simpler half of ``desktop_bridge.py``: lazy httpx client on a
+background daemon thread + asyncio loop, sync ``execute()`` that
+marshals work onto that loop, graceful degradation when env vars are
+missing.
 
-This is the server-side counterpart of the LiveKit worker's
-``OpenCTIClient``. Same shape, different sync/async glue:
-``desktop_bridge.py``'s ``_DesktopBridgeSession`` already proves we can
-own a long-lived LiveKit room from a sync ``execute()`` via a daemon
-thread + asyncio loop; we use the same trick to proxy HTTP.
+Path Y (chosen 2026-05-24): OpenCTI lives on Railway, reached over a
+public URL — no bridge proxy needed for the CTI path. The Railway
+services start in 'Removed deployment' state and are spun up on-demand
+by the worker (see ``GitHubDispatchClient`` in livekit/worker.py); a
+3-minute idle watchdog tears them down again to keep the bill near $0.
 
 Required env (on the OpenJarvis backend service):
-  - ``OPENCTI_URL``              the URL the *bridge* hits, default
-                                 ``http://localhost:8080``
-  - ``OPENCTI_TOKEN``            admin/api token (required)
-  - ``OPENCTI_BRIDGE_MACHINE``   which desktop-bridge runs OpenCTI
-                                 (default ``laptop``)
-  - ``LIVEKIT_URL`` / ``LIVEKIT_API_KEY`` / ``LIVEKIT_API_SECRET``
-                                 to join the desktop-bridge control room
+  - ``OPENCTI_URL``    full Railway URL, e.g.
+                       ``https://opencti-production-xx.up.railway.app``
+  - ``OPENCTI_TOKEN``  admin / API token (same value as OpenCTI's
+                       ``OPENCTI_ADMIN_TOKEN`` env var)
 
 This tool degrades to ``ToolResult(success=False)`` with a clear message
-when env vars are missing or the bridge is offline, rather than raising.
+when env vars are missing or the platform isn't reachable, rather than
+raising.
 """
 
 from __future__ import annotations
@@ -38,7 +37,6 @@ import json
 import logging
 import os
 import threading
-import uuid
 from typing import Any
 
 from openjarvis.core.registry import ToolRegistry
@@ -85,34 +83,18 @@ def _normalise_observable_type(t: str) -> str:
     return _OBSERVABLE_TYPE_MAP.get((t or "").strip().lower(), t or "")
 
 
-_CONTROL_ROOM = os.environ.get("JARVIS_CONTROL_ROOM", "jarvis-control")
-_TOPIC_CMD = "desktop-cmd"
-_TOPIC_RESULT = "desktop-result"
-
-
 class _OpenCTIClient:
-    """Bridge-proxied OpenCTI client owning a LiveKit room on a bg loop.
+    """Background-thread asyncio loop owning a long-lived httpx client.
 
-    ToolRegistry tools dispatch ``execute()`` from a thread pool — but
-    LiveKit ``rtc.Room`` is async and needs a persistent event loop. So
-    we own a daemon thread running its own asyncio loop, join the
-    desktop-bridge control room once, and proxy every GraphQL call over
-    its data channel. Mirrors ``desktop_bridge.py``'s
-    ``_DesktopBridgeSession`` design.
+    ToolRegistry tools dispatch ``execute()`` from a thread pool, so we
+    need our own loop to run async httpx calls and keep the connection
+    pool warm across requests.
     """
 
     def __init__(self) -> None:
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._room: Any = None  # rtc.Room — created lazily on bg loop
-        self._pending: dict[str, asyncio.Future] = {}
+        self._client: Any = None  # httpx.AsyncClient — created lazily
         self._connect_lock: asyncio.Lock | None = None
-        self._base_url = os.environ.get(
-            "OPENCTI_URL", "http://localhost:8080"
-        ).rstrip("/")
-        self._token = os.environ.get("OPENCTI_TOKEN", "")
-        self._machine = os.environ.get(
-            "OPENCTI_BRIDGE_MACHINE", "laptop"
-        )
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         if self._loop is not None:
@@ -129,148 +111,47 @@ class _OpenCTIClient:
         self._loop = loop
         return loop
 
-    async def _ensure_room(self) -> Any:
-        # Lazy import so a stripped-down deployment without `livekit`
-        # still imports this module cleanly (the executor returns a
-        # clear error instead of failing at import time).
-        from livekit import api, rtc
+    async def _ensure_client(self) -> Any:
+        # Imported lazily so a deployment without httpx still imports the
+        # tool module (the call-site reports a clean error instead).
+        import httpx
 
         if self._connect_lock is None:
             self._connect_lock = asyncio.Lock()
         async with self._connect_lock:
-            if self._room is not None:
-                return self._room
-            url = os.environ.get("LIVEKIT_URL", "")
-            key = os.environ.get("LIVEKIT_API_KEY", "")
-            secret = os.environ.get("LIVEKIT_API_SECRET", "")
-            if not (url and key and secret):
+            if self._client is not None:
+                return self._client
+            url = os.environ.get("OPENCTI_URL", "").rstrip("/")
+            token = os.environ.get("OPENCTI_TOKEN", "")
+            if not (url and token):
                 raise RuntimeError(
-                    "LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET "
-                    "are not set on the OpenJarvis backend service"
+                    "OPENCTI_URL / OPENCTI_TOKEN are not set on the "
+                    "OpenJarvis backend service"
                 )
-            if not self._token:
-                raise RuntimeError(
-                    "OPENCTI_TOKEN is not set on the OpenJarvis backend "
-                    "service"
-                )
-            token = (
-                api.AccessToken(key, secret)
-                .with_identity(f"openjarvis-cti-{uuid.uuid4().hex[:8]}")
-                .with_grants(
-                    api.VideoGrants(
-                        room_join=True,
-                        room=_CONTROL_ROOM,
-                        can_publish=True,
-                        can_subscribe=True,
-                        can_publish_data=True,
-                    )
-                )
-                .to_jwt()
-            )
-            room = rtc.Room()
-
-            @room.on("data_received")
-            def _on_data(packet: "rtc.DataPacket") -> None:  # noqa: ANN001
-                if packet.topic != _TOPIC_RESULT:
-                    return
-                try:
-                    msg = json.loads(bytes(packet.data).decode("utf-8"))
-                except Exception:  # noqa: BLE001
-                    return
-                fut = self._pending.pop(msg.get("id", ""), None)
-                if fut is not None and not fut.done():
-                    fut.set_result(msg)
-
-            await room.connect(url, token)
-            self._room = room
-            logger.info(
-                "opencti: bridge-proxy joined '%s' (target=%s, url=%s)",
-                _CONTROL_ROOM, self._machine, self._base_url,
-            )
-            return room
-
-    def _online_machines(self) -> list[str]:
-        if self._room is None:
-            return []
-        ms: set[str] = set()
-        for p in self._room.remote_participants.values():
-            ident = getattr(p, "identity", "") or ""
-            if ident.startswith("desktop-bridge-"):
-                ms.add(ident[len("desktop-bridge-"):].strip().lower())
-        return sorted(m for m in ms if m)
-
-    async def _proxy_send(self, args: dict, timeout: float) -> dict:
-        room = await self._ensure_room()
-        if self._machine not in self._online_machines():
-            raise RuntimeError(
-                f"the '{self._machine}' bridge is offline — start "
-                "desktop-bridge\\run.bat on that machine"
-            )
-        cmd_id = uuid.uuid4().hex
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[cmd_id] = fut
-        payload = json.dumps(
-            {
-                "id": cmd_id,
-                "target": self._machine,
-                "cmd": "http_proxy",
-                "args": args,
-            }
-        ).encode("utf-8")
-        try:
-            await room.local_participant.publish_data(
-                payload, reliable=True, topic=_TOPIC_CMD
-            )
-            msg = await asyncio.wait_for(fut, timeout)
-            return msg.get("result", {}) or {}
-        except asyncio.TimeoutError:
-            return {
-                "error": (
-                    f"no response from the '{self._machine}' bridge"
-                )
-            }
-        finally:
-            self._pending.pop(cmd_id, None)
-
-    async def _gql(self, query: str, variables: dict | None = None) -> dict:
-        res = await self._proxy_send(
-            {
-                "base_url": self._base_url,
-                "method": "POST",
-                "path": "/graphql",
-                "headers": {
-                    "Authorization": f"Bearer {self._token}",
+            self._client = httpx.AsyncClient(
+                base_url=url,
+                headers={
+                    "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
                 },
-                "body": {"query": query, "variables": variables or {}},
-                "timeout": 30.0,
-            },
-            timeout=40.0,
+                timeout=httpx.Timeout(30.0, connect=8.0),
+            )
+            logger.info("opencti: client initialised for %s", url)
+            return self._client
+
+    async def _gql(self, query: str, variables: dict | None = None) -> dict:
+        client = await self._ensure_client()
+        resp = await client.post(
+            "/graphql",
+            json={"query": query, "variables": variables or {}},
         )
-        if not isinstance(res, dict) or res.get("error"):
-            err = (
-                res.get("error")
-                if isinstance(res, dict) else "no dict"
-            )
-            raise RuntimeError(f"bridge proxy error: {err}")
-        status = res.get("status")
-        payload = res.get("json")
-        if payload is None:
-            try:
-                payload = json.loads(res.get("body") or "{}")
-            except Exception:  # noqa: BLE001
-                payload = {}
-        if status and status >= 400:
+        resp.raise_for_status()
+        data = resp.json()
+        if "errors" in data and data["errors"]:
             raise RuntimeError(
-                f"opencti HTTP {status}: {(res.get('body') or '')[:200]}"
+                f"opencti graphql errors: {data['errors'][:2]}"
             )
-        if isinstance(payload, dict) and payload.get("errors"):
-            raise RuntimeError(
-                f"opencti graphql errors: {payload['errors'][:2]}"
-            )
-        return (
-            payload.get("data") or {} if isinstance(payload, dict) else {}
-        )
+        return data.get("data") or {}
 
     def submit(self, coro_fn, timeout: float = 30.0) -> dict:
         """Sync entry point — run a coroutine factory on the bg loop."""
@@ -286,8 +167,6 @@ _client = _OpenCTIClient()
 
 
 async def _op_search(query: str, limit: int = 10) -> dict:
-    # Searches across STIX core objects — entities, observables,
-    # indicators, incidents, reports, threat actors, malware, etc.
     gql = """
     query Search($search: String, $count: Int) {
       stixCoreObjects(search: $search, first: $count) {
@@ -326,16 +205,9 @@ async def _op_search(query: str, limit: int = 10) -> dict:
 
 
 async def _op_add_observable(value: str, stix_type: str) -> dict:
-    # Single-flight observable creation. We rely on OpenCTI's upsert
-    # behaviour — repeat calls with the same value return the existing
-    # object instead of duplicating.
     obs_type = _normalise_observable_type(stix_type)
     if not obs_type:
         raise RuntimeError(f"unknown observable type '{stix_type}'")
-
-    # The input field name depends on the type — OpenCTI's StixCyberObservableAddInput
-    # is a union with one named field per type. Map the canonical STIX type
-    # name to its input key.
     type_to_input_key: dict[str, str] = {
         "Domain-Name": "DomainName",
         "Hostname": "Hostname",
@@ -349,33 +221,27 @@ async def _op_add_observable(value: str, stix_type: str) -> dict:
         "Windows-Registry-Key": "WindowsRegistryKey",
     }
     key = type_to_input_key.get(obs_type, obs_type.replace("-", ""))
-
-    # The value field on the input is named "value" for most types but
-    # "key" for registry, "name" for files — keep it simple and pass
-    # "value" by default; OpenCTI will reject if mis-shaped.
     inner: dict[str, Any]
     if obs_type == "StixFile":
-        inner = {"name": value, "hashes": [{"algorithm": "Unknown", "hash": value}]}
+        inner = {
+            "name": value,
+            "hashes": [{"algorithm": "Unknown", "hash": value}],
+        }
     elif obs_type == "Windows-Registry-Key":
         inner = {"attribute_key": value}
     else:
         inner = {"value": value}
 
-    gql = f"""
-    mutation AddObs($input: StixCyberObservableAddInput!) {{
-      stixCyberObservableAdd(input: $input) {{
+    gql = """
+    mutation AddObs($input: StixCyberObservableAddInput!) {
+      stixCyberObservableAdd(input: $input) {
         id
         observable_value
         entity_type
-      }}
-    }}
-    """
-    variables = {
-        "input": {
-            "type": obs_type,
-            key: inner,
-        }
+      }
     }
+    """
+    variables = {"input": {"type": obs_type, key: inner}}
     data = await _client._gql(gql, variables)
     obs = data.get("stixCyberObservableAdd") or {}
     return {
@@ -431,8 +297,6 @@ async def _op_link(
 
 
 async def _op_summary(hours: int = 24) -> dict:
-    # Lightweight rollup: counts of new core objects in the window, plus
-    # the most recent few names. A real "what happened today" digest.
     gql = """
     query Summary($filters: FilterGroup) {
       stixCoreObjects(filters: $filters, first: 8, orderBy: created_at, orderMode: desc) {
@@ -446,7 +310,6 @@ async def _op_summary(hours: int = 24) -> dict:
       }
     }
     """
-    # ISO 8601 cutoff `hours` ago.
     from datetime import datetime, timedelta, timezone
 
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
@@ -546,9 +409,7 @@ class OpenCTIControlTool(BaseTool):
                     },
                     "query": {
                         "type": "string",
-                        "description": (
-                            "For 'search': the search string."
-                        ),
+                        "description": "For 'search': the search string.",
                     },
                     "value": {
                         "type": "string",
