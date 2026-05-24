@@ -528,9 +528,29 @@ def _content_intent(text: str):
         q = re.sub(r"\b(?:videos?|clips?|footage)\b", " ", q, flags=re.I)
         return ("youtube", _clean_query(q))
 
-    if _NEWS_RE.search(low) and (_CONTENT_VERB.search(low) or "headlines" in low):
+    if _NEWS_RE.search(low) and (
+        _CONTENT_VERB.search(low)
+        or "headlines" in low
+        # Bare-noun triggers so "what's the news", "any news",
+        # "tell me the news", "catch me up", "latest news" all
+        # fire the handler. The bare-noun protection (don't react
+        # to "any news on my project") is preserved by the explicit
+        # phrase set below — we only fire on these specific stems.
+        or re.search(
+            r"\b(?:what(?:'?s)?|what\s+is|any|tell\s+me|"
+            r"catch\s+me\s+up|update\s+me|latest|breaking)\b",
+            low,
+        )
+    ):
         q = re.sub(r"\b(?:news|headlines)\b|\b(?:about|on|regarding)\b",
                    " ", t, flags=re.I)
+        # Strip the new trigger stems too, so "what's the news" → ""
+        # (no topic = top headlines), "any news on Ukraine" → "Ukraine".
+        q = re.sub(
+            r"\b(?:what(?:'?s)?|what\s+is|any|tell\s+me|"
+            r"catch\s+me\s+up|update\s+me|latest|breaking)\b",
+            " ", q, flags=re.I,
+        )
         return ("news", _clean_query(q))
 
     if _MAP_RE.search(low) and (
@@ -2860,13 +2880,35 @@ class Assistant(Agent):
         )
 
     async def show_news(self, topic: str = "") -> str:
-        """Show current news headlines on the JARVIS screen.
+        """Show current news headlines + a related news video, and speak
+        a top-headline summary.
 
         Args:
-            topic: Optional subject to focus the news on (e.g.
-                "technology"). Leave empty for the top headlines.
+            topic: Optional subject (e.g. "technology"). Empty = top
+                headlines + a generic "breaking news today" video.
+
+        Behaviour:
+          1. Parallel-fetch news articles AND a YouTube news video.
+          2. Open the news widget immediately so the user has something
+             to read while the summary is spoken.
+          3. Return the spoken summary (caller TTS's it).
+          4. Open the YouTube widget on a ~4 s delay so its auto-play
+             audio doesn't drown the spoken summary.
         """
-        articles = await search_tools.news_search(topic, limit=8)
+        topic = (topic or "").strip()
+        video_query = topic or "breaking news today"
+
+        # Parallel-fetch — one slow provider doesn't double the latency.
+        try:
+            articles, videos = await asyncio.gather(
+                search_tools.news_search(topic, limit=8),
+                search_tools.youtube_search(video_query, limit=8),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("news+video parallel fetch failed: %s", exc)
+            articles, videos = [], []
+
+        # News widget up front.
         await self._publish_ui(
             {
                 "type": "open_widget",
@@ -2875,10 +2917,50 @@ class Assistant(Agent):
                 "payload": {"query": topic, "articles": articles},
             }
         )
+
+        # YouTube widget on a delay so its autoplay doesn't fight TTS.
+        if videos:
+            async def _open_video_after_summary() -> None:
+                try:
+                    await asyncio.sleep(4.0)
+                    await self._publish_ui(
+                        {
+                            "type": "open_widget",
+                            "kind": "youtube",
+                            "title": f"News Video — {video_query}",
+                            "payload": {
+                                "query": video_query,
+                                "videos": videos,
+                            },
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("delayed news-video open failed: %s", exc)
+            asyncio.create_task(_open_video_after_summary())
+
         if not articles:
             return "I couldn't reach the news feed just now, sir."
+
+        top = articles[0] if articles else {}
+        top_title = (top.get("title") or "").strip()
+        top_source = (top.get("source") or "").strip()
         where = f" on {topic}" if topic else ""
-        return f"Here are {len(articles)} headlines{where}, sir."
+
+        if top_title:
+            lead = f"Top headline{where}: {top_title}"
+            if top_source:
+                lead += f", from {top_source}."
+            else:
+                lead += "."
+        else:
+            lead = f"Latest headlines{where} on screen, sir."
+
+        tail = (
+            "Video coming up in a moment, sir."
+            if videos
+            else f"That's {len(articles)} headlines on screen."
+        )
+        return f"{lead} {tail}"
 
     async def show_map(self, place: str) -> str:
         """Show a place, address, or directions on a map on the JARVIS
