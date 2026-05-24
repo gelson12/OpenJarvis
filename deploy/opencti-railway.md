@@ -184,11 +184,18 @@ you can also manually trigger it from there to smoke-test (Step 8).
 | `Global Eyes didn't come up in time, sir` | 7-min healthy probe deadline exceeded | Cold start sometimes takes longer; redeploy `elasticsearch` first; bump `_CTI_HEALTHY_DEADLINE` if persistent |
 | Idle watchdog firing too aggressively | Default is 3 min from last CTI op | Edit `_CTI_IDLE_SECONDS` in `livekit/worker.py` |
 
+## OSINT connectors (Phase 2)
+
+The 7 free OSINT connectors (MITRE ATT&CK, CISA KEV, URLhaus,
+AlienVault OTX, AbuseIPDB, VirusTotal, Shodan InternetDB) are
+documented separately in [`opencti-connectors.md`](opencti-connectors.md).
+They live in the same Railway project and are added to the lifecycle
+workflow's `--services` list so they spin up/down with the core stack.
+
 ## Out of scope (still)
 
-- **Custom OpenCTI connectors** (MITRE ATT&CK / CISA KEV / VirusTotal
-  auto-ingest). Each is a separate Railway service with its own image.
-  Add after the lifecycle proves stable.
+- **Paid Shodan API connector** (separate from the keyless
+  InternetDB tier). Out of scope for this phase.
 - **SSO between Jarvis ↔ OpenCTI.** The public-dashboards whitelist
   covers the embed case; full OIDC is a later hardening step.
 - **Configurable idle threshold via voice.** Constant for now; edit
