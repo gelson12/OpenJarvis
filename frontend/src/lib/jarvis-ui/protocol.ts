@@ -29,7 +29,8 @@ export type WidgetKind =
   | 'browser'
   | 'apps'
   | 'system'
-  | 'cti';
+  | 'cti'
+  | 'site';
 
 /** A live widget panel rendered on screen. */
 export interface WidgetInstance {
@@ -105,6 +106,12 @@ export interface CTIPayload {
   dashboard?: string;
 }
 
+/** `site` widget payload — a v0.dev generated website preview URL. */
+export interface SitePayload {
+  url: string;     // e.g. "https://abc123.vusercontent.net"
+  prompt: string;  // original user request (for header subtitle)
+}
+
 /** Commands the worker sends to the browser on {@link JARVIS_UI_TOPIC}. */
 export type JarvisUIMessage =
   | { type: 'open_widget'; kind: WidgetKind; title?: string; payload?: unknown; id?: string }
@@ -143,6 +150,7 @@ export const WIDGET_KINDS: WidgetKind[] = [
   'apps',
   'system',
   'cti',
+  'site',
 ];
 
 /** Default panel size per widget kind, in CSS pixels. */
@@ -158,6 +166,7 @@ export const WIDGET_DEFAULT_SIZE: Record<WidgetKind, { w: number; h: number }> =
   apps: { w: 380, h: 320 },
   system: { w: 340, h: 260 },
   cti: { w: 900, h: 640 },
+  site: { w: 900, h: 640 },
 };
 
 /** Default header text per widget kind. */
@@ -173,4 +182,5 @@ export const WIDGET_DEFAULT_TITLE: Record<WidgetKind, string> = {
   apps: 'Apps & Services',
   system: 'System Status',
   cti: 'Intelligence',
+  site: 'Generated Site',
 };

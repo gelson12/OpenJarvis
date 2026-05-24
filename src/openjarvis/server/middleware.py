@@ -51,10 +51,15 @@ def _build_csp() -> str:
         "media-src 'self' blob: mediastream:; "
         "worker-src 'self' blob:; "
         # frame-src: voice widgets embed YouTube (nocookie) + vanilla
-        # youtube.com. Without this the iframe falls back to default-src
-        # 'self' and renders the browser's "content blocked" page.
+        # youtube.com, plus v0.dev / Vercel-hosted previews for the
+        # voice-driven website generator (see livekit/worker.py
+        # build_website). Without this the iframe falls back to
+        # default-src 'self' and renders the browser's "content
+        # blocked" page.
         "frame-src 'self' https://www.youtube-nocookie.com "
-        "https://www.youtube.com https://youtube.com; "
+        "https://www.youtube.com https://youtube.com "
+        "https://*.vusercontent.net https://v0.dev "
+        "https://*.vercel.app; "
         # img-src: YouTube thumbnails come from i.ytimg.com / i9.ytimg.com;
         # result-card thumbnails from arbitrary https hosts. data: keeps
         # inline placeholders working.
