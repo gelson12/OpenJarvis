@@ -405,15 +405,13 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
         transition={{ duration: 11, repeat: Infinity, ease: 'easeInOut' }}
       />
 
-      {/* Alive core — biased slightly down-and-left for a more cinematic,
-          rule-of-thirds composition. The OffAxisOrbitRing stays pinned to
-          the original geometric centre, so the orb now reads as sitting
-          off-axis on its own orbit instead of "misaligned". */}
+      {/* Alive core — centred on the flex axis. The orbit ring is now
+          concentric with the orb so it reads as a halo / orbital frame
+          rather than a "fake centre" for an off-axis core. */}
       <div className="relative flex flex-1 items-center justify-center">
         <OffAxisOrbitRing glow={look.glow} />
         <div
           ref={orbWrapRef}
-          style={{ transform: 'translate(-4vw, 3vh)' }}
           className="relative will-change-transform"
         >
           <AliveCore />
