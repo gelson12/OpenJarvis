@@ -275,17 +275,69 @@ function SelfView() {
   );
 }
 
+// Fullscreen mirrored camera preview shown while gesture mode is active —
+// fills the central HUD area in place of the orb so the user can see
+// their own hand while driving the UI with hand gestures. The gesture
+// recogniser itself runs from a detached off-screen video in
+// useGestureControl, so this component is purely presentational.
+function GestureModeView() {
+  const tracks = useTracks([Track.Source.Camera]);
+  const cam = tracks.find((t) => t.participant?.isLocal && t.publication);
+  if (!cam) {
+    // Camera enable command may still be in flight — show a hint.
+    return (
+      <div
+        className="hud-mono text-sm uppercase tracking-[0.34em]"
+        style={{ color: 'var(--color-accent, #1fd5f9)' }}
+      >
+        Camera warming up…
+      </div>
+    );
+  }
+  return (
+    <div className="pointer-events-none relative flex h-full w-full items-center justify-center p-6">
+      <div
+        className="relative h-full w-full overflow-hidden rounded-2xl border-2 shadow-[0_0_40px_rgba(31,213,249,0.25)]"
+        style={{
+          borderColor: 'var(--color-accent, #1fd5f9)',
+          maxHeight: 'min(80vh, 900px)',
+          maxWidth: 'min(95%, 1600px)',
+        }}
+      >
+        <VideoTrack
+          trackRef={cam}
+          className="h-full w-full object-cover"
+          // Selfie mirror — wave right hand, it goes right on screen.
+          style={{ transform: 'scaleX(-1)' }}
+        />
+        <div
+          className="hud-mono absolute left-4 top-3 rounded bg-black/55 px-2 py-1 text-[10px] uppercase tracking-[0.28em] backdrop-blur"
+          style={{ color: 'var(--color-accent, #1fd5f9)' }}
+        >
+          ● Gesture Mode — say &ldquo;turn off gesture mode&rdquo; to exit
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Receives structured UI commands from the worker over the LiveKit data
-// channel (topic "ui-command"). Today: voice-controlled camera toggle —
-// the worker parses the camera on/off intent server-side and sends a
-// structured command, so we never parse transcription text here.
-function UiCommandBridge() {
+// channel (topic "ui-command"). Today: voice-controlled camera toggle +
+// gesture mode toggle. The worker parses the intents server-side and
+// sends structured JSON; we never parse transcription text here.
+function UiCommandBridge({
+  onGestureMode,
+}: {
+  onGestureMode: (enabled: boolean) => void;
+}) {
   const { localParticipant } = useLocalParticipant();
   useDataChannel('ui-command', (msg) => {
     try {
       const data = JSON.parse(new TextDecoder().decode(msg.payload));
       if (data?.type === 'camera') {
         void localParticipant.setCameraEnabled(Boolean(data.enabled));
+      } else if (data?.type === 'gesture_mode') {
+        onGestureMode(Boolean(data.enabled));
       }
     } catch {
       // Malformed / unknown command — ignore.
@@ -389,6 +441,10 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
   const look = CORE_BY_STATE[state] ?? CORE_BY_STATE.disconnected;
   const orbWrapRef = useRef<HTMLDivElement>(null);
   useAmbientOriginSync(orbWrapRef);
+  // Ephemeral session state — toggled by the worker's gesture-mode
+  // voice intent via UiCommandBridge. Resets on disconnect (which is
+  // the desired default; user re-arms each session like wake-word).
+  const [gestureMode, setGestureMode] = useState(false);
 
   return (
     <JarvisUIProvider>
@@ -405,17 +461,26 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
         transition={{ duration: 11, repeat: Infinity, ease: 'easeInOut' }}
       />
 
-      {/* Alive core — centred on the flex axis. The orbit ring is now
+      {/* Alive core — centred on the flex axis. The orbit ring is
           concentric with the orb so it reads as a halo / orbital frame
-          rather than a "fake centre" for an off-axis core. */}
+          rather than a "fake centre" for an off-axis core.
+          When gesture mode is active, the orb is replaced by a
+          mirrored fullscreen camera preview so the user can see their
+          hand while driving the UI with gesture controls. */}
       <div className="relative flex flex-1 items-center justify-center">
-        <OffAxisOrbitRing glow={look.glow} />
-        <div
-          ref={orbWrapRef}
-          className="relative will-change-transform"
-        >
-          <AliveCore />
-        </div>
+        {gestureMode ? (
+          <GestureModeView />
+        ) : (
+          <>
+            <OffAxisOrbitRing glow={look.glow} />
+            <div
+              ref={orbWrapRef}
+              className="relative will-change-transform"
+            >
+              <AliveCore />
+            </div>
+          </>
+        )}
       </div>
 
       {/* Transcript */}
@@ -454,8 +519,10 @@ function VoiceSession({ onEnd }: { onEnd: () => void }) {
       </div>
 
         <RoomAudioRenderer />
-        <SelfView />
-        <UiCommandBridge />
+        {/* SelfView hides while gesture mode is on — avoid double
+            camera display (fullscreen GestureModeView covers it). */}
+        {!gestureMode && <SelfView />}
+        <UiCommandBridge onGestureMode={setGestureMode} />
         {/* Floating voice-summoned widgets + gesture cursor. */}
         <WidgetLayer />
       </div>

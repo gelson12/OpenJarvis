@@ -182,6 +182,29 @@ def _camera_intent(text: str):
     return None
 
 
+# Matches the noun-phrase only. Conservative — requires the exact two-word
+# phrase so a stray "gesture" in conversation doesn't toggle the mode.
+_GESTURE_MODE_RE = re.compile(
+    r"\b(gesture\s+mode|hand\s+tracking|gesture\s+control)\b", re.I
+)
+
+
+def _gesture_mode_intent(text: str):
+    """Return True (turn on), False (turn off), or None (not a gesture-mode cmd).
+
+    Reuses _CAM_ON / _CAM_OFF as the polarity vocabulary so the toggle
+    phrasing stays uniform across modes ("turn on", "enable", "start"
+    etc.). 'off' wins if both polarities appear.
+    """
+    if not text or not _GESTURE_MODE_RE.search(text):
+        return None
+    if _CAM_OFF.search(text):
+        return False
+    if _CAM_ON.search(text):
+        return True
+    return None
+
+
 # ── Camera vision (Task 3) ───────────────────────────────────────────
 # On a vision phrase ("what do you see", "look at this", …) the worker
 # samples ONE frame from the user's camera track, asks an OpenRouter
@@ -3123,6 +3146,34 @@ class Assistant(Agent):
                 elab_id = self._pending_elab_id
                 self._pending_elab_id = None
                 asyncio.create_task(self._elab_dismiss(elab_id))
+
+        # 0) Gesture mode — must run BEFORE the bare camera intent so
+        #    phrasings like "turn on the camera gesture mode" claim as
+        #    gesture-mode (which enables the camera as a side effect)
+        #    instead of just toggling the camera.
+        gesture_want = _gesture_mode_intent(text)
+        if gesture_want is not None:
+            try:
+                # Camera state piggybacks gesture mode. Send camera FIRST
+                # so the recognizer's track-availability gate flips before
+                # the frontend tries to render the fullscreen preview.
+                await self._room.local_participant.publish_data(
+                    json.dumps({"type": "camera", "enabled": gesture_want}).encode(),
+                    reliable=True,
+                    topic=UI_COMMAND_TOPIC,
+                )
+                await self._room.local_participant.publish_data(
+                    json.dumps({"type": "gesture_mode", "enabled": gesture_want}).encode(),
+                    reliable=True,
+                    topic=UI_COMMAND_TOPIC,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("gesture_mode publish failed: %s", exc)
+                return
+            await self.session.say(
+                "Gesture mode on, sir." if gesture_want else "Gesture mode off, sir."
+            )
+            raise StopResponse()
 
         # 1) Camera on/off — structured command, short-circuit the turn.
         want = _camera_intent(text)
