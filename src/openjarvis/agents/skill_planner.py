@@ -102,17 +102,11 @@ def find_matching_skill(query: str, *, threshold: float = 0.35) -> Optional[Skil
             # SkillManager may already have been discovered at startup;
             # try to access its in-memory state directly.
             pass
-        # Prefer iterating registered skills via the manager's public API.
+        # SkillManager keeps manifests in self._skills (no public accessor).
         manifests: List[Any] = []
-        for attr in ("get_all", "list_skills", "all_skills", "skills"):
-            obj = getattr(manager, attr, None)
-            if callable(obj):
-                manifests = list(obj()) or []
-                if manifests:
-                    break
-            elif isinstance(obj, (list, dict)) and obj:
-                manifests = list(obj.values()) if isinstance(obj, dict) else list(obj)
-                break
+        _sd = getattr(manager, "_skills", None)
+        if isinstance(_sd, dict):
+            manifests = list(_sd.values())
     except Exception as exc:
         logger.debug("skill_planner: discover failed: %s", exc)
         return None

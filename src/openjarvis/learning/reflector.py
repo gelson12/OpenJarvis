@@ -160,10 +160,17 @@ def _call_engine(system: str, user: str, *, max_tokens: int = 400,
         logger.debug("reflector: no engine available (set_engine not called yet)")
         return None
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+    # OpenJarvis's InferenceEngine.generate expects a list of Message objects
+    # (not raw dicts).  Build them via the canonical core.types factories.
+    try:
+        from openjarvis.core.types import Message, Role
+        messages = [
+            Message(role=Role.SYSTEM, content=system),
+            Message(role=Role.USER, content=user),
+        ]
+    except Exception as exc:
+        logger.debug("reflector: Message import failed: %s", exc)
+        return None
     kwargs: Dict[str, Any] = {"max_tokens": max_tokens, "temperature": temperature}
     if model_override:
         kwargs["model"] = model_override

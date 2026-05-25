@@ -290,20 +290,20 @@ def create_app(
                 "openjarvis.skills_autoload bundled_dir=%s exists=%s toml_files=%d",
                 bundled_dir, bundled_dir.exists(), toml_count,
             )
+            # Also do a direct discover_skills() call to confirm load_skill
+            # isn't silently failing on every TOML (its try/except swallows
+            # all parse errors).
+            try:
+                from openjarvis.skills.loader import discover_skills as _discover_skills
+                direct_count = len(_discover_skills(bundled_dir))
+                logger.warning("openjarvis.skills_autoload direct_discover_count=%d", direct_count)
+            except Exception as _e:
+                logger.warning("openjarvis.skills_autoload direct_discover_FAILED: %s", _e)
             mgr.discover(paths=[bundled_dir])
             app.state.skill_manager = mgr
-            count = 0
-            for attr in ("get_all", "list_skills", "all_skills", "skills"):
-                obj = getattr(mgr, attr, None)
-                if callable(obj):
-                    try:
-                        count = len(list(obj()) or [])
-                        break
-                    except Exception:
-                        continue
-                elif isinstance(obj, (list, dict)) and obj:
-                    count = len(obj)
-                    break
+            # SkillManager stores manifests in self._skills (private-by-convention,
+            # no public accessor exists).
+            count = len(getattr(mgr, "_skills", {}) or {})
             logger.warning("openjarvis.skills_autoload loaded_count=%d", count)
         except Exception as exc:
             logger.warning("openjarvis.skills_autoload_FAILED: %s", exc, exc_info=True)

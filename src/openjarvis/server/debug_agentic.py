@@ -92,22 +92,12 @@ def _probe_skills(app_state: Any) -> Dict[str, Any]:
             import openjarvis.skills as _skills_pkg
             _bundled = _Path(_skills_pkg.__file__).parent / "data"
             mgr.discover(paths=[_bundled])
-        manifests: List[Any] = []
-        for attr in ("get_all", "list_skills", "all_skills", "skills"):
-            obj = getattr(mgr, attr, None)
-            if callable(obj):
-                try:
-                    manifests = list(obj()) or []
-                    if manifests:
-                        break
-                except Exception:
-                    continue
-            elif isinstance(obj, dict) and obj:
-                manifests = list(obj.values())
-                break
-            elif isinstance(obj, list) and obj:
-                manifests = list(obj)
-                break
+        # SkillManager stores manifests in self._skills (no public accessor).
+        _skills_dict = getattr(mgr, "_skills", None)
+        if isinstance(_skills_dict, dict):
+            manifests = list(_skills_dict.values())
+        else:
+            manifests = []
         out["loaded"] = True
         out["count"] = len(manifests)
         out["sample"] = [
@@ -191,8 +181,10 @@ def _probe_reflector(app_state: Any) -> Dict[str, Any]:
         # ALSO directly test engine.generate without the reflector wrapper
         # so we can see exactly what InstrumentedEngine returns.
         try:
+            from openjarvis.core.types import Message, Role
+            _probe_msgs = [Message(role=Role.USER, content="Say 'pong' and nothing else.")]
             raw_result = engine.generate(
-                [{"role": "user", "content": "Say 'pong' and nothing else."}],
+                _probe_msgs,
                 max_tokens=10,
                 temperature=0,
             ) if engine is not None else None
