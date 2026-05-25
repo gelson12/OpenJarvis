@@ -47,19 +47,28 @@ def _build_csp() -> str:
 
     return (
         "default-src 'self' 'unsafe-inline' 'unsafe-eval'; "
-        f"connect-src 'self' https://*.livekit.cloud wss://*.livekit.cloud{extra}; "
+        # connect-src: LiveKit signalling + Nominatim (OSM geocoder used
+        # by the maps widget to resolve a spoken place name to a bbox).
+        # Without nominatim.openstreetmap.org listed here, the maps
+        # widget's geocode fetch is blocked by CSP and falls through to
+        # the "no map results" state.
+        f"connect-src 'self' https://*.livekit.cloud wss://*.livekit.cloud "
+        f"https://nominatim.openstreetmap.org{extra}; "
         "media-src 'self' blob: mediastream:; "
         "worker-src 'self' blob:; "
         # frame-src: voice widgets embed YouTube (nocookie) + vanilla
         # youtube.com, plus v0.dev / Vercel-hosted previews for the
         # voice-driven website generator (see livekit/worker.py
-        # build_website). Without this the iframe falls back to
-        # default-src 'self' and renders the browser's "content
-        # blocked" page.
+        # build_website), plus openstreetmap.org for the maps widget
+        # iframe (Google's keyless embed is blocked at the source as of
+        # 2024, so we use OSM/Nominatim instead — see maps-widget.tsx).
+        # Without this the iframe falls back to default-src 'self' and
+        # renders the browser's "This content is blocked" page.
         "frame-src 'self' https://www.youtube-nocookie.com "
         "https://www.youtube.com https://youtube.com "
         "https://*.vusercontent.net https://v0.dev "
-        "https://*.vercel.app; "
+        "https://*.vercel.app "
+        "https://www.openstreetmap.org; "
         # img-src: YouTube thumbnails come from i.ytimg.com / i9.ytimg.com;
         # result-card thumbnails from arbitrary https hosts. data: keeps
         # inline placeholders working.
