@@ -82,6 +82,7 @@ except Exception as _exc:  # noqa: BLE001
 
 import search_tools
 from resource_ledger import ResourceLedger
+from hermes_router import HermesRouter, enabled as _hermes_route_enabled, should_route as _hermes_should_route
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -2094,6 +2095,11 @@ class Assistant(Agent):
         # Cache of "is any audio session active on this machine?" so we
         # don't re-enumerate on every turn. (mono time, busy-set).
         self._desktop_audio_busy_cache: tuple[float, set[str]] | None = None
+        # Hermes selective router — multi-step queries go to Hermes for the
+        # full Tier 1+2 agentic stack (planner, reflector, distiller, goals,
+        # tool-sentinel).  Routine turns still hit the OpenJarvis backend.
+        # Env-gated by OPENJARVIS_HERMES_ROUTE; off by default.
+        self._hermes_router: HermesRouter = HermesRouter()
 
     def _has_widget(self, kind: str) -> bool:
         """True when a panel of `kind` is currently visible on the HUD."""
@@ -4132,6 +4138,23 @@ class Assistant(Agent):
                 self._awake = False
                 await self.session.say("Goodbye, sir.")
                 raise StopResponse()
+
+        # Hermes selective routing — multi-step queries go to Hermes for the
+        # full Tier 1+2 agentic stack (planner decomposes into subtasks,
+        # reflector critiques after, goals injected from vault, etc.).
+        # Routine turns fall through to the normal OpenJarvis backend below,
+        # which keeps its fast cadence and existing intent handlers intact.
+        # Env-gated by OPENJARVIS_HERMES_ROUTE=selective.  Failure to reach
+        # Hermes → fall through silently (no degradation).
+        if _hermes_route_enabled() and _hermes_should_route(text):
+            answer = await self._hermes_router.call(
+                user_text=text,
+                session_id=getattr(self._room, "name", "") or "openjarvis-voice",
+            )
+            if answer:
+                await self.session.say(answer)
+                raise StopResponse()
+            # else: silent fall-through to OpenJarvis backend path.
 
         # Pending clarification — resolve before anything else. If we
         # asked a disambiguation question last turn, this turn is the
