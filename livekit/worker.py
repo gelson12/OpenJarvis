@@ -4094,17 +4094,28 @@ class Assistant(Agent):
 
 
 # ── Voice provider selection ──────────────────────────────────────────
-# Default: try Gemini Live first (one bidirectional audio WebSocket →
-# ~300 ms TTFA), fall back to the Deepgram → OpenJarvis → Aura cascade
-# (~1 s+ TTFA, but full OpenJarvis tool surface). OPENJARVIS_VOICE_PROVIDER
-# overrides: `realtime` skips the cascade (debug), `cascade` skips Live
-# (kill switch), `auto` (default) tries Live then falls back.
+# Default: cascade (Deepgram STT → OpenJarvis → Aura TTS, ~1 s TTFA).
+# Reason it's no longer `auto`: Gemini Live answers FROM AUDIO directly,
+# bypassing the worker's regex intent handlers — so "show me the news"
+# got a hallucinated "Displaying the latest news headlines" with NO
+# widget actually opened, because `_maybe_handle_content` never fired
+# before Gemini started speaking. Cascade gives the worker first crack
+# at every turn (intent handlers fire BEFORE the LLM), at the cost of
+# ~700 ms more latency.
+#
+# OPENJARVIS_VOICE_PROVIDER overrides:
+#   - `cascade`  (default) — Deepgram + OpenJarvis + Aura
+#   - `realtime`           — Gemini Live (low-latency, but intent handlers
+#                            fire too late; widgets won't open)
+#   - `auto`               — try Live, fall back to cascade on failure
+#                            (PRE-FIX behaviour; opt back in if you know
+#                            you don't need widget intents on this session)
 
 def _voice_provider_pref() -> str:
-    pref = os.environ.get("OPENJARVIS_VOICE_PROVIDER", "auto").strip().lower()
+    pref = os.environ.get("OPENJARVIS_VOICE_PROVIDER", "cascade").strip().lower()
     if pref in ("auto", "realtime", "cascade"):
         return pref
-    return "auto"
+    return "cascade"
 
 
 def _realtime_enabled() -> bool:
