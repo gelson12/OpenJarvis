@@ -82,7 +82,16 @@ def find_matching_skill(query: str, *, threshold: float = 0.35) -> Optional[Skil
         return None
 
     try:
-        manager = SkillManager()
+        # SkillManager requires an EventBus; create a throwaway one for the
+        # planner's read-only discovery.
+        try:
+            from openjarvis.core.bus import EventBus
+            _bus = EventBus()
+        except Exception:
+            _bus = None
+        manager = SkillManager(_bus) if _bus is not None else None
+        if manager is None:
+            return None
         try:
             manager.discover()
         except Exception:

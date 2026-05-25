@@ -277,7 +277,20 @@ def create_app(
             return
         try:
             from openjarvis.skills.manager import SkillManager
-            mgr = SkillManager()
+            # SkillManager requires an EventBus.  Reuse the app's bus when
+            # available; otherwise instantiate a throwaway local bus so
+            # discovery still completes.
+            bus = getattr(app.state, "bus", None)
+            if bus is None:
+                try:
+                    from openjarvis.core.bus import EventBus
+                    bus = EventBus()
+                except Exception:
+                    bus = None
+            mgr = SkillManager(bus) if bus is not None else None
+            if mgr is None:
+                logger.warning("Skills auto-load skipped: no EventBus available")
+                return
             mgr.discover()
             # Count skills if the manager exposes a way to introspect.
             count = 0
