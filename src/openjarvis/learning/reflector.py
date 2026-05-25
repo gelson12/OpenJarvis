@@ -154,11 +154,11 @@ def _call_engine(system: str, user: str, *, max_tokens: int = 400,
     The debug endpoint passes request.app.state.engine directly so the
     probe works even if set_engine hasn't fired yet.
 
-    Model resolution: OPENJARVIS_REFLECTOR_MODEL env > "auto" (lets
-    the engine pick).  OpenJarvis's InferenceEngine.generate requires
-    a model= parameter.
+    Model resolution: OPENJARVIS_REFLECTOR_MODEL env > "openrouter/auto"
+    (the OpenJarvis-wide default when clients don't specify).
+    OpenJarvis's InferenceEngine.generate requires a model= parameter.
     """
-    model = os.environ.get("OPENJARVIS_REFLECTOR_MODEL", "").strip() or "auto"
+    model = os.environ.get("OPENJARVIS_REFLECTOR_MODEL", "").strip() or "openrouter/auto"
     eng = engine if engine is not None else _ENGINE
     if eng is None:
         logger.debug("reflector: no engine available (set_engine not called yet)")
