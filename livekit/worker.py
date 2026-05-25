@@ -596,6 +596,59 @@ def _content_intent(text: str):
     return None
 
 
+# ── Bridge lifecycle (status + cold-start) ──────────────────────────
+# Distinct from `_DESKTOP_HINT_RE` (which fires on file/app/volume verbs).
+# These match utterances ABOUT the bridge itself — "are the bridges
+# online?", "is the laptop bridge up?", "start the bridge on the rog".
+#
+# Two sub-intents are accepted:
+#   STATUS  — "are/is X online/up/down/connected", "bridge status",
+#             "which machines are online"
+#   START   — "start/wake/launch/boot the bridge", "spin up the laptop"
+#
+# Conservative on purpose: the bare word "bridge" is far too generic
+# ("Tower Bridge", "build a bridge to X"); we require an explicit
+# connectivity verb (online/up/down/...) OR a start verb.
+_BRIDGE_LIFECYCLE_STATUS_RE = re.compile(
+    r"\b("
+    r"(?:are|is)\s+(?:the\s+|my\s+|our\s+)?(?:bridges?|laptop|rog|pc|"
+    r"desktop|computer|machine)s?(?:\s+(?:bridges?|connection))?\s+"
+    r"(?:online|offline|up|down|connected|alive|running|reachable|live)|"
+    r"(?:bridges?|connections?)\s+status|"
+    r"(?:which|what)\s+(?:bridges?|machines?|computers?)\s+(?:are\s+)?"
+    r"(?:online|connected|up|alive|reachable|live)"
+    r")\b",
+    re.I,
+)
+_BRIDGE_LIFECYCLE_START_RE = re.compile(
+    r"\b(?:start|launch|wake|spin\s*up|bring\s+up|fire\s+up|boot|"
+    r"kick\s+off|wake\s+up|switch\s+on|turn\s+on)\s+"
+    r"(?:the\s+|my\s+|our\s+)?"
+    r"(?:bridges?|desktop[\s\-]bridges?|run\.?\s*bat|"
+    r"(?:laptop|rog|pc|desktop|computer|machine)(?:\s+bridges?)?)"
+    r"\b",
+    re.I,
+)
+
+
+def _bridge_lifecycle_target(text: str) -> str:
+    """Pick the target machine for a bridge-lifecycle utterance.
+
+    Returns one of the machine labels ('laptop' / 'rog' / 'pc' / 'desktop'
+    / 'computer' / 'machine') if explicitly named, else 'all' for a
+    broadcast question like "are the bridges online?". The labels mirror
+    those the user actually says — `DesktopBridge.is_online()` collapses
+    'pc'/'desktop'/'computer'/'machine'/'any'/'all' to "any online".
+    """
+    low = (text or "").lower()
+    for label in ("laptop", "rog"):
+        if re.search(rf"\b{label}\b", low):
+            return label
+    if re.search(r"\b(pc|desktop|computer|machine)\b", low):
+        return "any"
+    return "all"
+
+
 # ── Desktop control (operate the user's Windows machines) ────────────
 # A `desktop-bridge` process runs on each Windows machine (laptop, ROG),
 # connects OUTBOUND to LiveKit, and sits in the JARVIS_CONTROL_ROOM. We
@@ -2342,6 +2395,122 @@ class Assistant(Agent):
             pass
         return True
 
+    # ── Bridge lifecycle (status + cold-start) ───────────────────────
+    async def _maybe_handle_bridge_lifecycle(self, text: str) -> bool:
+        """Answer "are the bridges online?" / "start the bridge on X".
+
+        Runs BEFORE `_maybe_handle_desktop` so "is the laptop online" gets
+        a presence answer instead of being routed as a desktop COMMAND.
+        Cold-start case is honest about its limits: if the named bridge
+        is offline, the worker has no way to start its process from the
+        cloud (the bridge is the path), so we tell the user that — no
+        fake confirmations.
+
+        Returns True when the turn was handled (caller stops the turn).
+        """
+        if not text:
+            return False
+        is_status = bool(_BRIDGE_LIFECYCLE_STATUS_RE.search(text))
+        is_start = bool(_BRIDGE_LIFECYCLE_START_RE.search(text))
+        if not (is_status or is_start):
+            return False
+
+        # Refresh the control-room connection so presence is fresh.
+        try:
+            await self._desktop._ensure()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bridge-lifecycle: control-room connect failed: %s", exc)
+
+        online = self._desktop.online_machines()
+        target = _bridge_lifecycle_target(text)
+
+        # STATUS sub-intent — name what's online and what isn't.
+        if is_status and not is_start:
+            if target in ("all", "any"):
+                if not online:
+                    msg = (
+                        "No bridges are online right now, sir. The "
+                        "scheduled task on the PC should bring it back "
+                        "at next logon, or start `run.bat` manually."
+                    )
+                elif len(online) == 1:
+                    msg = f"Only the {online[0]} bridge is online, sir."
+                else:
+                    msg = (
+                        " and ".join(m.capitalize() for m in online)
+                        + " are both online, sir."
+                    )
+            else:
+                if self._desktop.is_online(target):
+                    msg = f"The {target} bridge is online, sir."
+                else:
+                    others = [m for m in online if m != target]
+                    if others:
+                        msg = (
+                            f"The {target} bridge is offline, sir — "
+                            f"{', '.join(others)} is still up."
+                        )
+                    else:
+                        msg = (
+                            f"The {target} bridge is offline, sir, "
+                            "and nothing else is online either."
+                        )
+            try:
+                await self.session.say(msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        # START sub-intent — cold-start the bridge process on a PC.
+        # The hard constraint: if the bridge is offline, the cloud worker
+        # has NO channel to that PC (the bridge IS the channel). So all
+        # we can do is:
+        #   - confirm if it's already online (idempotent ack)
+        #   - explain honestly if it isn't, and point at the boot-start
+        #     task that should bring it back without intervention.
+        # Wake-on-LAN via mobile-bridge is the planned escape hatch
+        # (Phase 0D, deferred); when it lands, this branch will fire it.
+        if target in ("all", "any"):
+            if not online:
+                msg = (
+                    "I can't reach any of your PCs right now, sir — the "
+                    "bridges aren't online, and the worker has no "
+                    "channel to wake them from the cloud. Wake one "
+                    "manually, or rely on the boot-start task at next "
+                    "logon."
+                )
+            else:
+                msg = (
+                    " and ".join(m.capitalize() for m in online)
+                    + " are already online, sir."
+                )
+            try:
+                await self.session.say(msg)
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        if self._desktop.is_online(target):
+            try:
+                await self.session.say(
+                    f"The {target} bridge is already online, sir."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
+        # Specific machine, offline. Honest refusal.
+        try:
+            await self.session.say(
+                f"I can't reach the {target}, sir — the bridge isn't "
+                "online, and from the cloud I have no channel to wake "
+                "it. The scheduled task should restart it at next "
+                "logon; otherwise launch `run.bat` on the machine."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
     # ── Clarification resolver ───────────────────────────────────────
     async def _maybe_resume_clarification(self, text: str) -> bool:
         """If a clarification is pending, try to resolve `text` to an option."""
@@ -3792,6 +3961,12 @@ class Assistant(Agent):
         # actually open ("close the YouTube" → close panel, NOT search
         # YouTube for "Close"). Guarded by live widget inventory.
         if await self._maybe_handle_close_widget(text):
+            raise StopResponse()
+
+        # Bridge lifecycle — "are the bridges online?" / "start the
+        # bridge on the laptop". Runs BEFORE the desktop router so
+        # "is the laptop online" gets a presence answer, not a command.
+        if await self._maybe_handle_bridge_lifecycle(text):
             raise StopResponse()
 
         # Screen content — search / video / news / maps / live browser.
