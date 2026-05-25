@@ -2013,6 +2013,33 @@ _APK_BUILD_RE = re.compile(
     r")\b",
     re.I,
 )
+# Dedicated mobile-bridge phrasings shortcut around the "which repo?"
+# follow-up — they always mean the fixed mobile-bridge module inside
+# gelson12/friday_jarvis2.
+_APK_MOBILE_BRIDGE_RE = re.compile(
+    r"\bmobile[\s-]?bridge\b|\bphone\s+app\b", re.I,
+)
+# "from <owner>/<repo>" or "from github.com/<owner>/<repo>" — captures
+# the repo when the user names one. Owner constrained to GitHub's
+# username rules (no dots, no leading dash).
+_APK_REPO_RE = re.compile(
+    r"\b(?:from|on|out\s+of|using)\s+"
+    r"(?:https?://)?(?:github\.com/)?"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?)"
+    r"\s*[/ ]\s*"
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,99})",
+    re.I,
+)
+# Parsed verbatim from a follow-up answer to "which repo, sir?".
+# Looser than the leading-"from" version so the user can just say
+# "gelson12 slash weather-app" or "github.com/foo/bar".
+_APK_REPO_BARE_RE = re.compile(
+    r"(?:https?://)?(?:github\.com/)?"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?)"
+    r"\s*(?:/|\bslash\b|\s)\s*"
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,99})",
+    re.I,
+)
 INSPIRING_CAT_URL = os.environ.get(
     "INSPIRING_CAT_URL",
     "https://inspiring-cat-production.up.railway.app",
@@ -2024,6 +2051,12 @@ MOBILE_BRIDGE_BUILD_SCRIPT_URL = os.environ.get(
     "MOBILE_BRIDGE_BUILD_SCRIPT_URL",
     f"https://raw.githubusercontent.com/{MOBILE_BRIDGE_REPO}"
     "/main/scripts/build-mobile-bridge-apk.sh",
+)
+# Where all voice-built APKs are released: single repo we control,
+# single cleanup workflow, single PAT to manage. Source repo can be
+# anything; releases always land here.
+APK_RELEASE_REPO = os.environ.get(
+    "APK_RELEASE_REPO", MOBILE_BRIDGE_REPO,
 )
 
 
@@ -2088,6 +2121,13 @@ class Assistant(Agent):
         self._clarification_resumers: dict[str, callable] = {}
         self._clarification_resumers["volume"] = self._resume_volume
         self._clarification_resumers["content"] = self._resume_content
+        # APK build is its own one-shot follow-up — a free-form repo
+        # answer ("gelson12 slash weather-app") doesn't fit the
+        # option-picker shape PendingClarification uses. 30s TTL is
+        # enforced inside _maybe_handle_apk_repo_followup.
+        self._apk_awaiting_repo: bool = False
+        self._apk_awaiting_repo_at: float = 0.0
+        self._apk_build_active: bool = False
         # Desktop master volumes we auto-muted at the start of this turn.
         # Mirrors `_auto_muted_kinds` but for OS-level mute on each PC, so
         # we can unmute exactly what we muted at end-of-turn.
@@ -3389,15 +3429,25 @@ class Assistant(Agent):
         return True
 
     async def _maybe_handle_apk_build(self, text: str) -> bool:
-        """Voice-triggered rebuild of the mobile-bridge APK.
+        """Voice-triggered Android APK build via inspiring-cat.
 
-        Fires the same /tasks shell pipeline used manually to produce
-        the first APK: submit a curl|bash that fetches
-        scripts/build-mobile-bridge-apk.sh from the friday_jarvis2 repo
-        and runs it on VS-Code-inspiring-cat. The script publishes the
-        APK as a GitHub release; this method spawns a background poller
-        that watches for the new release tag and speaks the download
-        URL when it appears (~10-15 min later).
+        Two flavours share this handler:
+
+        1. Dedicated mobile-bridge ("rebuild the mobile bridge" /
+           "compile the phone app") → always builds the mobile-bridge
+           module in gelson12/friday_jarvis2; legacy tag prefix
+           `mobile-bridge-v0.1.0-` (the auto-delete workflow already
+           catches it).
+
+        2. Generic ("build the apk from <owner>/<repo>") → clones the
+           named GitHub repo, builds the root Android project, releases
+           under `voice-apk-<owner>-<repo>-<timestamp>` on
+           gelson12/friday_jarvis2 (single release host = single
+           cleanup workflow). If the user didn't name a repo, we set a
+           one-shot follow-up flag and ask "which repo, sir?" — the
+           next turn is consumed by _maybe_handle_apk_repo_followup.
+
+        Guarded so a double-trigger doesn't fire two builds in parallel.
         """
         if not text or not _APK_BUILD_RE.search(text):
             return False
@@ -3410,20 +3460,112 @@ class Assistant(Agent):
             except Exception:  # noqa: BLE001
                 pass
             return True
+
+        # Dedicated mobile-bridge shortcut — never asks for a repo.
+        if _APK_MOBILE_BRIDGE_RE.search(text):
+            await self._launch_apk_build(
+                source_repo=MOBILE_BRIDGE_REPO,
+                module_dir="mobile-bridge",
+                tag_prefix="mobile-bridge-v0.1.0-",
+                speak_name="mobile-bridge APK",
+            )
+            return True
+
+        # Generic flow — try to extract a github owner/repo from the
+        # utterance ("build the apk from gelson12/weather-app").
+        m = _APK_REPO_RE.search(text)
+        if m:
+            owner, repo = m.group(1), m.group(2)
+            await self._launch_generic_apk_build(owner, repo)
+            return True
+
+        # No repo named — ask back and consume the next user turn.
+        self._apk_awaiting_repo = True
+        self._apk_awaiting_repo_at = time.monotonic()
+        try:
+            await self.session.say(
+                "Which repo, sir? I need owner slash name — for example, "
+                "gelson12 slash weather-app."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _maybe_handle_apk_repo_followup(self, text: str) -> bool:
+        """One-shot follow-up consumer for "which repo, sir?".
+
+        Runs BEFORE every other handler so a free-form "owner/repo"
+        reply doesn't get routed into the content matcher. 30s TTL;
+        cancellable with "never mind".
+        """
+        if not getattr(self, "_apk_awaiting_repo", False):
+            return False
+        if time.monotonic() - getattr(self, "_apk_awaiting_repo_at", 0.0) > 30:
+            self._apk_awaiting_repo = False
+            return False
+        if not text:
+            return False
+        if _CANCEL_RE.search(text):
+            self._apk_awaiting_repo = False
+            try:
+                await self.session.say("As you wish, sir.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        m = _APK_REPO_BARE_RE.search(text)
+        if not m:
+            logger.info("apk repo follow-up miss: %r", text[:120])
+            try:
+                await self.session.say(
+                    "I didn't catch the repo, sir. Try again with "
+                    "owner slash name."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        self._apk_awaiting_repo = False
+        owner, repo = m.group(1), m.group(2)
+        await self._launch_generic_apk_build(owner, repo)
+        return True
+
+    async def _launch_generic_apk_build(self, owner: str, repo: str) -> None:
+        """Speak the ack + spawn the build worker for an arbitrary repo."""
+        slug = re.sub(r"[^a-z0-9]+", "-", f"{owner}-{repo}".lower()).strip("-")
+        tag_prefix = f"voice-apk-{slug}-"
+        await self._launch_apk_build(
+            source_repo=f"{owner}/{repo}",
+            module_dir="",
+            tag_prefix=tag_prefix,
+            speak_name=f"APK from {owner} slash {repo}",
+        )
+
+    async def _launch_apk_build(
+        self,
+        *,
+        source_repo: str,
+        module_dir: str,
+        tag_prefix: str,
+        speak_name: str,
+    ) -> None:
+        """Set the active flag, speak the ack, and spawn the worker."""
         self._apk_build_active = True
         try:
             await self.session.say(
-                "Building the mobile-bridge APK on inspiring-cat, sir — "
+                f"Building the {speak_name} on inspiring-cat, sir — "
                 "this takes about 10 to 15 minutes. I'll announce the "
                 "download link when it's ready."
             )
         except Exception:  # noqa: BLE001
             pass
-        asyncio.create_task(self._apk_build_worker())
-        return True
+        asyncio.create_task(self._apk_build_worker(
+            source_repo=source_repo,
+            module_dir=module_dir,
+            tag_prefix=tag_prefix,
+        ))
 
-    async def _latest_apk_tag(self) -> str | None:
-        url = f"https://api.github.com/repos/{MOBILE_BRIDGE_REPO}/releases"
+    async def _latest_apk_tag(self, tag_prefix: str) -> str | None:
+        """Return the latest release tag on APK_RELEASE_REPO matching prefix."""
+        url = f"https://api.github.com/repos/{APK_RELEASE_REPO}/releases"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
@@ -3432,20 +3574,42 @@ class Assistant(Agent):
                 resp.raise_for_status()
                 for rel in resp.json():
                     tag = rel.get("tag_name") or ""
-                    if tag.startswith("mobile-bridge-"):
+                    if tag.startswith(tag_prefix):
                         return tag
         except Exception as exc:  # noqa: BLE001
             logger.warning("apk-tag fetch failed: %s", exc)
         return None
 
-    async def _apk_build_worker(self) -> None:
+    async def _apk_build_worker(
+        self,
+        *,
+        source_repo: str,
+        module_dir: str,
+        tag_prefix: str,
+    ) -> None:
+        """Background task: submit build, poll for release, speak URL."""
         try:
-            before = await self._latest_apk_tag()
-            logger.info("apk build: starting (before_tag=%s)", before)
+            before = await self._latest_apk_tag(tag_prefix)
+            logger.info(
+                "apk build: starting source=%s module=%r prefix=%s before=%s",
+                source_repo, module_dir, tag_prefix, before,
+            )
 
+            owner, _, name = source_repo.partition("/")
+            source_url = f"https://github.com/{source_repo}.git"
+            # The build script reads these env vars. APK_MODULE_DIR is
+            # empty for repos whose Android project is at the root.
+            env_exports = (
+                f"export SOURCE_REPO_URL='{source_url}' "
+                f"REPO_OWNER='{owner}' REPO_NAME='{name}' "
+                f"APK_MODULE_DIR='{module_dir}' "
+                f"TAG_PREFIX='{tag_prefix}' "
+                f"RELEASE_REPO='{APK_RELEASE_REPO}';"
+            )
             cmd = (
-                f"nohup bash -c 'curl -fsSL {MOBILE_BRIDGE_BUILD_SCRIPT_URL} | "
-                f"bash > /tmp/mb-build.log 2>&1' "
+                f"nohup bash -c '{env_exports} curl -fsSL "
+                f"{MOBILE_BRIDGE_BUILD_SCRIPT_URL} | bash "
+                f"> /tmp/mb-build.log 2>&1' "
                 f"> /tmp/mb-launcher.log 2>&1 < /dev/null & "
                 f"disown $!; echo \"launched pid=$!\""
             )
@@ -3465,7 +3629,7 @@ class Assistant(Agent):
             new_tag: str | None = None
             while time.monotonic() < deadline:
                 await asyncio.sleep(30)
-                tag = await self._latest_apk_tag()
+                tag = await self._latest_apk_tag(tag_prefix)
                 if tag and tag != before:
                     new_tag = tag
                     break
@@ -3481,14 +3645,15 @@ class Assistant(Agent):
                 return
 
             release_url = (
-                f"https://github.com/{MOBILE_BRIDGE_REPO}"
+                f"https://github.com/{APK_RELEASE_REPO}"
                 f"/releases/tag/{new_tag}"
             )
             try:
-                short = new_tag.replace("mobile-bridge-v0.1.0-", "build ")
+                short = new_tag[len(tag_prefix):] or "build"
                 await self.session.say(
                     f"Your APK is ready, sir — {short}. "
-                    "The release page is on the panel."
+                    "The release page is on the panel. "
+                    "It will be deleted in 24 hours."
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -3499,7 +3664,7 @@ class Assistant(Agent):
                     "title": f"APK: {new_tag}",
                     "payload": {
                         "url": release_url,
-                        "prompt": "Mobile Bridge APK",
+                        "prompt": f"APK build from {source_repo}",
                     },
                 })
             except Exception as exc:  # noqa: BLE001
@@ -4160,6 +4325,13 @@ class Assistant(Agent):
         # asked a disambiguation question last turn, this turn is the
         # answer; resolves to a target and dispatches the deferred action.
         if await self._maybe_resume_clarification(text):
+            raise StopResponse()
+
+        # APK build repo follow-up — consume "owner/repo" answer when
+        # we just asked "which repo, sir?". Runs immediately after the
+        # generic clarification slot so a free-form reply never falls
+        # through to the content matcher.
+        if await self._maybe_handle_apk_repo_followup(text):
             raise StopResponse()
 
         # Volume — disambiguates across HUD widgets and desktop apps.
