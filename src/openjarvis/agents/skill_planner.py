@@ -86,7 +86,7 @@ def find_matching_skill(query: str, *, threshold: float = 0.35) -> Optional[Skil
         # planner's read-only discovery.  discover() with no paths loads
         # zero skills — we must point it at the bundled data dir.
         try:
-            from openjarvis.core.bus import EventBus
+            from openjarvis.core.events import EventBus
             _bus = EventBus()
         except Exception:
             _bus = None

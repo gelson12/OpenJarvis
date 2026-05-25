@@ -75,7 +75,7 @@ def _probe_skills(app_state: Any) -> Dict[str, Any]:
         bus = getattr(app_state, "bus", None)
         if bus is None:
             try:
-                from openjarvis.core.bus import EventBus
+                from openjarvis.core.events import EventBus
                 bus = EventBus()
             except Exception as e:
                 out["error"] = f"bus unavailable: {e}"
@@ -187,6 +187,22 @@ def _probe_reflector(app_state: Any) -> Dict[str, Any]:
         # hasn't fired yet (e.g. testing immediately after deploy).
         t0 = time.time()
         engine = getattr(app_state, "engine", None)
+        out["engine_class"] = type(engine).__name__ if engine is not None else "None"
+        # ALSO directly test engine.generate without the reflector wrapper
+        # so we can see exactly what InstrumentedEngine returns.
+        try:
+            raw_result = engine.generate(
+                [{"role": "user", "content": "Say 'pong' and nothing else."}],
+                max_tokens=10,
+                temperature=0,
+            ) if engine is not None else None
+            out["direct_engine_test"] = {
+                "type": type(raw_result).__name__,
+                "keys": list(raw_result.keys()) if isinstance(raw_result, dict) else None,
+                "preview": str(raw_result)[:200],
+            }
+        except Exception as exc:
+            out["direct_engine_test"] = {"error": f"{type(exc).__name__}: {exc}"}
         raw = _ref._call_engine(
             _ref._REFLECT_SYSTEM,
             _ref._build_user_prompt(

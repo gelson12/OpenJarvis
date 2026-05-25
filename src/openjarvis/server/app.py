@@ -279,7 +279,7 @@ def create_app(
     ):
         try:
             from openjarvis.skills.manager import SkillManager
-            from openjarvis.core.bus import EventBus
+            from openjarvis.core.events import EventBus
             bus = getattr(app.state, "bus", None) or EventBus()
             mgr = SkillManager(bus)
             from pathlib import Path as _Path
