@@ -27,6 +27,7 @@ from accommodation.models import (
     Quote,
     SearchQuery,
 )
+from accommodation.providers.apify_airbnb import ApifyAirbnbProvider
 from accommodation.providers.base import Provider, ProviderError
 from accommodation.providers.liteapi import LiteApiProvider
 
@@ -62,7 +63,14 @@ class AccommodationService:
                 providers.append(LiteApiProvider())
             except ProviderError as e:
                 _log.warning("liteapi disabled: %s", e)
-        # Future providers register here.
+        if os.environ.get("APIFY_TOKEN", "").strip():
+            try:
+                providers.append(ApifyAirbnbProvider())
+            except ProviderError as e:
+                _log.warning("apify-airbnb disabled: %s", e)
+        # Future providers (booking_com, homestay, expedia_rapid) register here
+        # when their respective application approvals land — see
+        # `brain/Accommodation Booking — Provider Matrix` in the vault.
         if not providers:
             return None
         return cls(aggregator=Aggregator(providers))
