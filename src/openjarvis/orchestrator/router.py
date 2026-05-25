@@ -644,6 +644,11 @@ async def run_all(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Default OpenJarvis model
         tasks.append(call_openjarvis_default(messages))
 
+        # Python 3.11+ requires Tasks (not bare coroutines) for asyncio.wait.
+        # Wrap each coroutine explicitly — fixes
+        # "TypeError: Passing coroutines is forbidden, use tasks explicitly."
+        tasks = [asyncio.create_task(t) if asyncio.iscoroutine(t) else t for t in tasks]
+
         # OPTION C HYBRID: Wait 4s to gather ALL responses (not just the first)
         done, pending = await asyncio.wait(
             tasks, timeout=4.0, return_when=asyncio.ALL_COMPLETED

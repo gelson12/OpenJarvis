@@ -83,7 +83,8 @@ def find_matching_skill(query: str, *, threshold: float = 0.35) -> Optional[Skil
 
     try:
         # SkillManager requires an EventBus; create a throwaway one for the
-        # planner's read-only discovery.
+        # planner's read-only discovery.  discover() with no paths loads
+        # zero skills — we must point it at the bundled data dir.
         try:
             from openjarvis.core.bus import EventBus
             _bus = EventBus()
@@ -93,7 +94,10 @@ def find_matching_skill(query: str, *, threshold: float = 0.35) -> Optional[Skil
         if manager is None:
             return None
         try:
-            manager.discover()
+            from pathlib import Path as _Path
+            import openjarvis.skills as _skills_pkg
+            _bundled = _Path(_skills_pkg.__file__).parent / "data"
+            manager.discover(paths=[_bundled])
         except Exception:
             # SkillManager may already have been discovered at startup;
             # try to access its in-memory state directly.

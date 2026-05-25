@@ -269,6 +269,20 @@ def create_app(
         except Exception as exc:
             logger.warning("Elaboration hydration skipped: %s", exc)
 
+    # Round 2.1 — wire the engine reference into the reflector module so it
+    # can call the real InferenceEngine for post-turn critiques without
+    # needing the per-request app context.  Fires once at startup; the
+    # reflector then re-uses the same engine instance for the lifetime of
+    # the process.
+    @app.on_event("startup")
+    async def _wire_reflector_engine() -> None:
+        try:
+            from openjarvis.learning import reflector as _ref
+            _ref.set_engine(getattr(app.state, "engine", None))
+            logger.info("openjarvis.reflector.engine_wired ok")
+        except Exception as exc:
+            logger.warning("Reflector engine wiring skipped: %s", exc)
+
     # Round 1.1 — Skills auto-load.  When OPENJARVIS_SKILLS_AUTOLOAD_ENABLED=true,
     # discover all TOML/MD skills at startup so the skill_planner short-circuit
     # (Round 3.3) and the agent's tool-list both see them.  Best-effort; never
@@ -295,7 +309,17 @@ def create_app(
             if mgr is None:
                 logger.warning("Skills auto-load skipped: no EventBus available")
                 return
-            mgr.discover()
+            # SkillManager.discover() loads zero skills when paths=None.
+            # Resolve the bundled `src/openjarvis/skills/data/` dir which
+            # ships 17 TOML skill recipes (backup-files, calendar-prep,
+            # code-lint, daily-digest, email-draft, etc.).
+            from pathlib import Path as _Path
+            import openjarvis.skills as _skills_pkg
+            bundled_dir = _Path(_skills_pkg.__file__).parent / "data"
+            mgr.discover(paths=[bundled_dir])
+            # Cache the manager on app.state so the request-time tool
+            # registry + skill_planner can reuse it without re-discovering.
+            app.state.skill_manager = mgr
             # Count skills if the manager exposes a way to introspect.
             count = 0
             for attr in ("get_all", "list_skills", "all_skills", "skills"):

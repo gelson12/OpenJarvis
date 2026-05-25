@@ -146,6 +146,15 @@ def _save(data: Dict[str, Any]) -> None:
             path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as exc:
         logger.warning("goal_tracker: save failed: %s", exc)
+    # Invalidate the system-prompt-block snapshot so the next turn picks
+    # up the new/changed goals immediately (instead of waiting for the
+    # 60-second TTL to expire).
+    try:
+        with _SNAPSHOT_LOCK:
+            _SNAPSHOT["ts"] = 0.0
+            _SNAPSHOT["active"] = []
+    except Exception:
+        pass
 
 
 def _make_id(text: str, ts: float) -> str:

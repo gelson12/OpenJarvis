@@ -131,18 +131,34 @@ def _normalize(parsed: Dict[str, Any]) -> Dict[str, Any]:
 # Engine call — uses OpenJarvis's engine.generate directly
 # ---------------------------------------------------------------------------
 
+# Engine instance reference — populated by app.py startup so we have
+# access to the real InferenceEngine on app.state.engine without needing
+# the request context.  Without this, the module-level _ENGINE is None
+# and reflection silently no-ops (logged at debug).
+_ENGINE: Any = None
+
+
+def set_engine(engine: Any) -> None:
+    """Called from server/app.py startup so the reflector can call the
+    real InferenceEngine instance (which lives on app.state.engine and
+    isn't reachable via a module-level import)."""
+    global _ENGINE
+    _ENGINE = engine
+
+
 def _call_engine(system: str, user: str, *, max_tokens: int = 400,
-                 temperature: float = 0.2) -> Optional[str]:
-    """Best-effort engine call. Returns text or None."""
+                 temperature: float = 0.2, engine: Any = None) -> Optional[str]:
+    """Best-effort engine call. Returns text or None.
+
+    `engine` overrides the module-level _ENGINE (set by app.py startup).
+    The debug endpoint passes request.app.state.engine directly so the
+    probe works even if set_engine hasn't fired yet.
+    """
     model_override = os.environ.get("OPENJARVIS_REFLECTOR_MODEL", "").strip() or None
-    try:
-        from openjarvis.engine import generate  # public name in engine/_stubs.py
-    except Exception:
-        try:
-            from openjarvis.engine._stubs import generate
-        except Exception as exc:
-            logger.debug("reflector: engine import failed: %s", exc)
-            return None
+    eng = engine if engine is not None else _ENGINE
+    if eng is None:
+        logger.debug("reflector: no engine available (set_engine not called yet)")
+        return None
 
     messages = [
         {"role": "system", "content": system},
@@ -153,17 +169,15 @@ def _call_engine(system: str, user: str, *, max_tokens: int = 400,
         kwargs["model"] = model_override
 
     try:
-        result = generate(messages, **kwargs)
+        result = eng.generate(messages, **kwargs)
     except Exception as exc:
         logger.debug("reflector: engine.generate failed: %s", exc)
         return None
 
-    # engine.generate may return a string or a dict/object depending on
-    # OpenJarvis's engine adapter shape — handle both.
-    if isinstance(result, str):
-        return result.strip() or None
+    # engine.generate returns a dict with "content" key per OpenJarvis
+    # InferenceEngine contract (see engine/_stubs.py).
     if isinstance(result, dict):
-        for k in ("text", "content", "output", "response", "answer"):
+        for k in ("content", "text", "output", "response", "answer"):
             v = result.get(k)
             if isinstance(v, str) and v.strip():
                 return v
@@ -173,6 +187,8 @@ def _call_engine(system: str, user: str, *, max_tokens: int = 400,
             content = msg.get("content")
             if isinstance(content, str) and content.strip():
                 return content
+    if isinstance(result, str):
+        return result.strip() or None
     # Some engines return an object with .choices[0].message.content
     try:
         return result.choices[0].message.content

@@ -80,8 +80,18 @@ def _probe_skills(app_state: Any) -> Dict[str, Any]:
             except Exception as e:
                 out["error"] = f"bus unavailable: {e}"
                 return out
-        mgr = SkillManager(bus)
-        mgr.discover()
+        # Prefer the cached singleton from app.state (populated by the
+        # startup hook); fall back to a fresh discover so the probe still
+        # works pre-cache.
+        cached = getattr(app_state, "skill_manager", None)
+        if cached is not None:
+            mgr = cached
+        else:
+            mgr = SkillManager(bus)
+            from pathlib import Path as _Path
+            import openjarvis.skills as _skills_pkg
+            _bundled = _Path(_skills_pkg.__file__).parent / "data"
+            mgr.discover(paths=[_bundled])
         manifests: List[Any] = []
         for attr in ("get_all", "list_skills", "all_skills", "skills"):
             obj = getattr(mgr, attr, None)
@@ -163,7 +173,7 @@ def _probe_skill_planner() -> Dict[str, Any]:
     return out
 
 
-def _probe_reflector() -> Dict[str, Any]:
+def _probe_reflector(app_state: Any) -> Dict[str, Any]:
     """Fire a synchronous reflection call to verify the engine path works."""
     out: Dict[str, Any] = {"enabled": False, "sync_test_ok": False}
     try:
@@ -173,7 +183,10 @@ def _probe_reflector() -> Dict[str, Any]:
             out["note"] = "OPENJARVIS_REFLECTOR_ENABLED is false"
             return out
         # Run the engine call SYNCHRONOUSLY (not via reflect_async background).
+        # Pass the engine explicitly so the probe works even if set_engine
+        # hasn't fired yet (e.g. testing immediately after deploy).
         t0 = time.time()
+        engine = getattr(app_state, "engine", None)
         raw = _ref._call_engine(
             _ref._REFLECT_SYSTEM,
             _ref._build_user_prompt(
@@ -181,6 +194,7 @@ def _probe_reflector() -> Dict[str, Any]:
                 "2+2 equals 4.",
                 domain="debug-probe",
             ),
+            engine=engine,
         )
         elapsed_ms = int((time.time() - t0) * 1000)
         if not raw:
@@ -310,7 +324,7 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
     skills_block = _probe_skills(app_state)
     goal_block = _probe_goal_tracker()
     skill_planner_block = _probe_skill_planner()
-    reflector_block = _probe_reflector()
+    reflector_block = _probe_reflector(app_state)
     orchestrator_block = await _probe_orchestrator()
     distiller_block = _probe_distiller()
     evolver_block = _probe_prompt_evolver()
