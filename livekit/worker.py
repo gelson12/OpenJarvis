@@ -1999,6 +1999,33 @@ class DesktopBridge:
             self._pending.pop(cmd_id, None)
 
 
+# ── APK build (rebuild mobile-bridge APK via VS-Code-inspiring-cat) ─
+# Voice command fires the same /tasks shell pipeline used to produce
+# the first APK manually: curl|bash a build script from the
+# friday_jarvis2 repo, run it on the inspiring-cat container, publish
+# the APK as a GitHub release. ~10-15 min end-to-end.
+_APK_BUILD_RE = re.compile(
+    r"\b("
+    r"(?:build|rebuild|compile|make|create)\s+"
+    r"(?:me\s+|us\s+)?(?:the\s+|a\s+|an\s+)?"
+    r"(?:mobile[\s-]?bridge|android(?:\s+app)?|apk|phone\s+app)"
+    r")\b",
+    re.I,
+)
+INSPIRING_CAT_URL = os.environ.get(
+    "INSPIRING_CAT_URL",
+    "https://inspiring-cat-production.up.railway.app",
+).rstrip("/")
+MOBILE_BRIDGE_REPO = os.environ.get(
+    "MOBILE_BRIDGE_REPO", "gelson12/friday_jarvis2",
+)
+MOBILE_BRIDGE_BUILD_SCRIPT_URL = os.environ.get(
+    "MOBILE_BRIDGE_BUILD_SCRIPT_URL",
+    f"https://raw.githubusercontent.com/{MOBILE_BRIDGE_REPO}"
+    "/main/scripts/build-mobile-bridge-apk.sh",
+)
+
+
 class Assistant(Agent):
     def __init__(self, room: rtc.Room):
         super().__init__(instructions=AGENT_INSTRUCTION)
@@ -3355,6 +3382,135 @@ class Assistant(Agent):
             pass
         return True
 
+    async def _maybe_handle_apk_build(self, text: str) -> bool:
+        """Voice-triggered rebuild of the mobile-bridge APK.
+
+        Fires the same /tasks shell pipeline used manually to produce
+        the first APK: submit a curl|bash that fetches
+        scripts/build-mobile-bridge-apk.sh from the friday_jarvis2 repo
+        and runs it on VS-Code-inspiring-cat. The script publishes the
+        APK as a GitHub release; this method spawns a background poller
+        that watches for the new release tag and speaks the download
+        URL when it appears (~10-15 min later).
+        """
+        if not text or not _APK_BUILD_RE.search(text):
+            return False
+        if getattr(self, "_apk_build_active", False):
+            try:
+                await self.session.say(
+                    "A build is already running, sir — I'll let you "
+                    "know when it's done."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        self._apk_build_active = True
+        try:
+            await self.session.say(
+                "Building the mobile-bridge APK on inspiring-cat, sir — "
+                "this takes about 10 to 15 minutes. I'll announce the "
+                "download link when it's ready."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        asyncio.create_task(self._apk_build_worker())
+        return True
+
+    async def _latest_apk_tag(self) -> str | None:
+        url = f"https://api.github.com/repos/{MOBILE_BRIDGE_REPO}/releases"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    url, headers={"Accept": "application/vnd.github+json"}
+                )
+                resp.raise_for_status()
+                for rel in resp.json():
+                    tag = rel.get("tag_name") or ""
+                    if tag.startswith("mobile-bridge-"):
+                        return tag
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("apk-tag fetch failed: %s", exc)
+        return None
+
+    async def _apk_build_worker(self) -> None:
+        try:
+            before = await self._latest_apk_tag()
+            logger.info("apk build: starting (before_tag=%s)", before)
+
+            cmd = (
+                f"nohup bash -c 'curl -fsSL {MOBILE_BRIDGE_BUILD_SCRIPT_URL} | "
+                f"bash > /tmp/mb-build.log 2>&1' "
+                f"> /tmp/mb-launcher.log 2>&1 < /dev/null & "
+                f"disown $!; echo \"launched pid=$!\""
+            )
+            payload = {
+                "type": "shell",
+                "payload": {"command": cmd, "cwd": "/workspace"},
+            }
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.post(
+                    f"{INSPIRING_CAT_URL}/tasks", json=payload
+                )
+                r.raise_for_status()
+                launch_resp = r.json()
+            logger.info("apk build launcher accepted: %s", launch_resp)
+
+            deadline = time.monotonic() + 25 * 60
+            new_tag: str | None = None
+            while time.monotonic() < deadline:
+                await asyncio.sleep(30)
+                tag = await self._latest_apk_tag()
+                if tag and tag != before:
+                    new_tag = tag
+                    break
+
+            if not new_tag:
+                try:
+                    await self.session.say(
+                        "The APK build didn't finish within 25 minutes, "
+                        "sir — check the inspiring-cat log."
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+            release_url = (
+                f"https://github.com/{MOBILE_BRIDGE_REPO}"
+                f"/releases/tag/{new_tag}"
+            )
+            try:
+                short = new_tag.replace("mobile-bridge-v0.1.0-", "build ")
+                await self.session.say(
+                    f"Your APK is ready, sir — {short}. "
+                    "The release page is on the panel."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await self._publish_ui({
+                    "type": "open_widget",
+                    "kind": "site",
+                    "title": f"APK: {new_tag}",
+                    "payload": {
+                        "url": release_url,
+                        "prompt": "Mobile Bridge APK",
+                    },
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("apk site widget open failed: %s", exc)
+
+        except Exception as exc:  # noqa: BLE001
+            logger.error("apk build worker failed: %s", exc)
+            try:
+                await self.session.say(
+                    "The APK build hit an error, sir — "
+                    "check the inspiring-cat logs."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            self._apk_build_active = False
+
     async def show_widget(self, widget: str, title: str = "") -> str:
         """Display a floating widget panel on the user's JARVIS screen.
 
@@ -4016,6 +4172,13 @@ class Assistant(Agent):
         # fallback for when the routed LLM doesn't emit the desktop_control
         # tool call; we speak our own confirmation, so stop the turn.
         if await self._maybe_handle_desktop(text):
+            raise StopResponse()
+
+        # APK build (voice-triggered rebuild of mobile-bridge). Fires
+        # the same /tasks shell pipeline used to produce the first APK;
+        # runs ~10-15 min on inspiring-cat and publishes the result as
+        # a GitHub release.
+        if await self._maybe_handle_apk_build(text):
             raise StopResponse()
 
         # Screen widgets — open/close panels on request (non-blocking).
