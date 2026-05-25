@@ -53,7 +53,13 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from dotenv import load_dotenv
 from livekit import agents, rtc, api
-from livekit.agents import AgentSession, Agent, RoomInputOptions, StopResponse
+from livekit.agents import (
+    AgentSession,
+    Agent,
+    RoomInputOptions,
+    StopResponse,
+    function_tool,
+)
 from livekit.agents.utils.images import encode, EncodeOptions, ResizeOptions
 from livekit.plugins import openai, deepgram, silero, noise_cancellation
 from openai import AsyncOpenAI
