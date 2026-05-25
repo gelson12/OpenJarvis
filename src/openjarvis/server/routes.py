@@ -573,6 +573,62 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 exc_info=True,
             )
 
+    # Round 1.2 (architectural fix) — Parallel orchestrator gate.  Original
+    # gate `if not req.tools` was dead-code because tools are auto-injected
+    # on every request.  Correct gate: route trivial/simple complexity-tier
+    # turns through the orchestrator ensemble (parallel ping all providers,
+    # pick best by mode=fastest|consensus).  These tiers don't need tools
+    # anyway, and Hermes structurally cannot do parallel ensemble.
+    if (
+        not request_body.stream
+        and complexity_info is not None
+        and complexity_info.tier in ("trivial", "simple")
+        and os.getenv("OPENJARVIS_ORCHESTRATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+    ):
+        try:
+            from openjarvis.orchestrator.router import (
+                run_all as _orch_run_all,
+                pick_best as _orch_pick_best,
+            )
+            _orch_msgs = [
+                {"role": m.role.value if hasattr(m.role, "value") else m.role,
+                 "content": m.content or ""}
+                for m in request_body.messages
+            ]
+            responses = await _orch_run_all(_orch_msgs)
+            if responses:
+                best = _orch_pick_best(responses)
+                _text = best.get("text", "")
+                if _text and "Error" not in _text:
+                    logging.getLogger("openjarvis.server").info(
+                        "openjarvis.orchestrator.dispatch winner=%s providers=%d tier=%s",
+                        best.get("model", "?"), len(responses), complexity_info.tier,
+                    )
+                    latest_user_text = ""
+                    for m in reversed(request_body.messages):
+                        if m.role == "user" and m.content:
+                            latest_user_text = m.content
+                            break
+                    _fire_post_turn_hooks_safe(
+                        request=request,
+                        latest_user_text=latest_user_text,
+                        assistant_text=_text,
+                        complexity_info=complexity_info,
+                    )
+                    return ChatCompletionResponse(
+                        model=request_body.model,
+                        choices=[Choice(
+                            message=ChoiceMessage(role="assistant", content=_text),
+                            finish_reason="stop",
+                        )],
+                        usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                        complexity=complexity_info,
+                    )
+        except Exception as _orch_exc:
+            logging.getLogger("openjarvis.server").debug(
+                "orchestrator dispatch-level skipped: %s", _orch_exc,
+            )
+
     if request_body.stream:
         bus = getattr(request.app.state, "bus", None)
         # X-OpenJarvis-Direct: the caller (e.g. the LiveKit voice worker)

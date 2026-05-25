@@ -36,12 +36,19 @@ class GoalTool(BaseTool):
         return ToolSpec(
             name="goal",
             description=(
-                "Manage persistent goals for the user (cross-session). "
-                "Actions: add (record new goal), list (show active or all), "
-                "complete (mark done), archive (pause/abandon), progress "
-                "(append a progress note). Use when the user expresses "
-                "lasting intent like \"my goal is...\" or \"I want to ship...\". "
-                "Don't use for transient single-turn requests."
+                "Manage persistent user goals that survive across sessions. "
+                "INVOKE THIS TOOL (do not write code like goal.list() — call "
+                "the function with action=... arguments). "
+                "Use ACTIONS: 'add' to record a new goal, 'list' to retrieve "
+                "current goals, 'complete' to mark done, 'archive' to pause/"
+                "abandon, 'progress' to append a progress note. "
+                "Use whenever the user expresses lasting intent (\"my goal "
+                "is...\", \"I want to ship...\", \"by Friday I need\") — "
+                "DON'T use for transient single-turn requests. "
+                "Examples of correct invocation: "
+                "call goal with action='add', text='ship the agentic upgrade'; "
+                "call goal with action='list', status='active'; "
+                "call goal with action='complete', id='abc12345'."
             ),
             parameters={
                 "type": "object",

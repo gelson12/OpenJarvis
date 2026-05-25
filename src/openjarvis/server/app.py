@@ -20,6 +20,7 @@ from openjarvis.server.elaboration_routes import router as elaboration_router
 from openjarvis.server.integrations_routes import router as integrations_router
 from openjarvis.server.providers_routes import router as providers_router
 from openjarvis.server.routes import router
+from openjarvis.server.debug_agentic import router as debug_agentic_router
 from openjarvis.server.upload_router import router as upload_router
 
 logger = logging.getLogger(__name__)
@@ -251,6 +252,9 @@ def create_app(
     app.include_router(integrations_router)
     app.include_router(providers_router)
     app.include_router(upload_router)
+    # /v1/_debug/agentic — synchronous probe of every Tier 1+2 agentic layer.
+    # Intentionally low-cost (no heavy LLM calls except orchestrator).
+    app.include_router(debug_agentic_router)
     include_all_routes(app)
 
     # Restore SendBlue channel bindings from database on startup
