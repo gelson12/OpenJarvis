@@ -185,6 +185,7 @@ def _probe_reflector(app_state: Any) -> Dict[str, Any]:
             _probe_msgs = [Message(role=Role.USER, content="Say 'pong' and nothing else.")]
             raw_result = engine.generate(
                 _probe_msgs,
+                model="auto",
                 max_tokens=10,
                 temperature=0,
             ) if engine is not None else None

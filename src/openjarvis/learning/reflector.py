@@ -153,8 +153,12 @@ def _call_engine(system: str, user: str, *, max_tokens: int = 400,
     `engine` overrides the module-level _ENGINE (set by app.py startup).
     The debug endpoint passes request.app.state.engine directly so the
     probe works even if set_engine hasn't fired yet.
+
+    Model resolution: OPENJARVIS_REFLECTOR_MODEL env > "auto" (lets
+    the engine pick).  OpenJarvis's InferenceEngine.generate requires
+    a model= parameter.
     """
-    model_override = os.environ.get("OPENJARVIS_REFLECTOR_MODEL", "").strip() or None
+    model = os.environ.get("OPENJARVIS_REFLECTOR_MODEL", "").strip() or "auto"
     eng = engine if engine is not None else _ENGINE
     if eng is None:
         logger.debug("reflector: no engine available (set_engine not called yet)")
@@ -171,9 +175,11 @@ def _call_engine(system: str, user: str, *, max_tokens: int = 400,
     except Exception as exc:
         logger.debug("reflector: Message import failed: %s", exc)
         return None
-    kwargs: Dict[str, Any] = {"max_tokens": max_tokens, "temperature": temperature}
-    if model_override:
-        kwargs["model"] = model_override
+    kwargs: Dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "model": model,
+    }
 
     try:
         result = eng.generate(messages, **kwargs)

@@ -64,7 +64,7 @@ class SkillMatch:
     manifest: Any  # SkillManifest from openjarvis.skills.parser
 
 
-def find_matching_skill(query: str, *, threshold: float = 0.35) -> Optional[SkillMatch]:
+def find_matching_skill(query: str, *, threshold: float = 0.22) -> Optional[SkillMatch]:
     """Search the loaded TOML skill library for a skill whose name +
     description tokens overlap the query. Returns the best match above
     `threshold`, or None.
