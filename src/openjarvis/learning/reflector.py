@@ -154,11 +154,13 @@ def _call_engine(system: str, user: str, *, max_tokens: int = 400,
     The debug endpoint passes request.app.state.engine directly so the
     probe works even if set_engine hasn't fired yet.
 
-    Model resolution: OPENJARVIS_REFLECTOR_MODEL env > "openrouter/auto"
-    (the OpenJarvis-wide default when clients don't specify).
-    OpenJarvis's InferenceEngine.generate requires a model= parameter.
+    Model resolution: OPENJARVIS_REFLECTOR_MODEL env > a known
+    non-reasoning model.  We avoid `openrouter/auto` because it can pick
+    GPT-5-nano (reasoning model) whose output lands in reasoning_content
+    not content, and OpenJarvis's engine wrapper doesn't unwrap that.
+    Gemini Flash is a stable cheap default that always returns `.content`.
     """
-    model = os.environ.get("OPENJARVIS_REFLECTOR_MODEL", "").strip() or "openrouter/auto"
+    model = os.environ.get("OPENJARVIS_REFLECTOR_MODEL", "").strip() or "openrouter/google/gemini-2.5-flash"
     eng = engine if engine is not None else _ENGINE
     if eng is None:
         logger.debug("reflector: no engine available (set_engine not called yet)")
