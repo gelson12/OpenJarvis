@@ -826,55 +826,18 @@ def _handle_direct(
                      latency_ms=int((_time.time() - _t0) * 1000),
                      role="main_instrumented")
     else:
-        # Round 5 BONUS-A — Speculative parallel race. Fires orchestrator
-        # AND single-engine in parallel; first non-error wins. Only fires
-        # for complexity in the "interesting band" (0.2-0.6) where neither
-        # path is the clear winner. Latency floor that Hermes can't match.
+        # Round 5 BONUS-A — Speculative race REMOVED from _handle_direct.
+        # Original implementation called asyncio.run() / run_until_complete()
+        # from inside this sync function (which FastAPI dispatches via its
+        # threadpool). Each request leaked an event loop + aiohttp session;
+        # a burst of ~20 sequential calls wedged the service.
+        #
+        # The speculative module itself stays in the codebase as a primitive —
+        # to re-enable, wire it from a genuinely async FastAPI handler (not
+        # from _handle_direct's sync threadpool context). The orchestrator
+        # gate at chat_completions() already provides parallel-LLM benefit
+        # via an async path.
         result = None
-        try:
-            from openjarvis.learning import speculative as _spec
-            if _spec._enabled() and not req.tools:
-                import asyncio as _asyncio
-                from openjarvis.orchestrator.router import (
-                    run_all as _spec_run_all, pick_best as _spec_pick_best,
-                )
-                _spec_msgs = [
-                    {"role": m.role.value if hasattr(m.role, "value") else m.role,
-                     "content": m.content or ""}
-                    for m in messages
-                ]
-                _spec_complexity = complexity_info.score if complexity_info else 0.5
-                try:
-                    _loop = _asyncio.get_event_loop()
-                    if _loop.is_running():
-                        raise RuntimeError("nested-loop")
-                    winner = _loop.run_until_complete(_spec.race(
-                        _spec_msgs, engine=engine, run_all=_spec_run_all,
-                        pick_best=_spec_pick_best, model=model,
-                        complexity=_spec_complexity,
-                        temperature=req.temperature or 0.2,
-                        max_tokens=req.max_tokens,
-                    ))
-                except RuntimeError:
-                    winner = _asyncio.run(_spec.race(
-                        _spec_msgs, engine=engine, run_all=_spec_run_all,
-                        pick_best=_spec_pick_best, model=model,
-                        complexity=_spec_complexity,
-                        temperature=req.temperature or 0.2,
-                        max_tokens=req.max_tokens,
-                    ))
-                if winner and winner.get("text"):
-                    result = {"content": winner["text"], "usage": winner.get("usage", {}) or {},
-                              "tool_calls": None, "finish_reason": "stop"}
-                    logging.getLogger("openjarvis.server").info(
-                        "openjarvis.speculative.served winner_path=%s model=%s",
-                        winner.get("winner_path"), winner.get("model"),
-                    )
-        except Exception as _spec_exc:
-            logging.getLogger("openjarvis.server").debug(
-                "speculative race skipped: %s", _spec_exc,
-            )
-            result = None
 
         # Round 1.2 — Parallel orchestrator: when env-enabled, ping all
         # configured LLM providers concurrently and pick the best/consensus
