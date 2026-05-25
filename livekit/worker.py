@@ -84,6 +84,25 @@ import search_tools
 from resource_ledger import ResourceLedger
 from hermes_router import HermesRouter, enabled as _hermes_route_enabled, should_route as _hermes_should_route
 
+# Accommodation booking — lazy import so a missing/broken accommodation
+# module never crashes worker startup. See
+# `brain/Accommodation Booking — Implementation Plan` in the user's vault.
+try:
+    from accommodation import (  # noqa: F401
+        AccommodationService,
+        Property as _AccommodationProperty,
+        SearchQuery as _AccommodationSearchQuery,
+    )
+    _ACCOMMODATION_AVAILABLE = True
+except Exception as _exc:  # noqa: BLE001
+    AccommodationService = None  # type: ignore[assignment]
+    _AccommodationProperty = None  # type: ignore[assignment]
+    _AccommodationSearchQuery = None  # type: ignore[assignment]
+    _ACCOMMODATION_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "accommodation module unavailable (%s) — hotel booking disabled", _exc,
+    )
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -460,6 +479,27 @@ _WEBSEARCH_RE = re.compile(
 _CONTENT_VERB = re.compile(
     r"\b(show|open|bring up|pull up|display|get me|give me|pop up|put up|"
     r"launch|see)\b", re.I
+)
+
+# Accommodation booking intent. Catches "find me a hotel", "book a place",
+# "Airbnb in Lisbon", etc. See `brain/Accommodation Booking — Feasibility &
+# Architecture` in the user's Obsidian vault.
+_ACCOMMODATION_RE = re.compile(
+    r"\b(hotel|airbnb|accommodation|vacation\s+rental|short\s+let|"
+    r"book\s+(?:a\s+|me\s+)?(?:room|place|hotel|stay)|where\s+to\s+stay|"
+    r"find\s+(?:me\s+)?(?:a\s+|an\s+)?(?:hotel|place|stay|room))\b", re.I
+)
+_ACCOMMODATION_BOOK_RE = re.compile(
+    r"\b(?:book|reserve|confirm)\s+(?:the\s+|that\s+|it\b)", re.I
+)
+# Pull a location phrase out of natural speech. Captures words after
+# "in/at/near/around <Place>" until the next preposition or punctuation.
+# Permissive on case (STT lowercases place names sometimes).
+_ACCOMMODATION_LOC_RE = re.compile(
+    r"\b(?:in|at|near|around)\s+"
+    r"([a-z][\w' .-]+?)"
+    r"(?=\s+(?:for|on|next|this|tomorrow|tonight|over|with|from|between)|"
+    r"[.,?!]|$)", re.I
 )
 
 
@@ -2141,6 +2181,14 @@ class Assistant(Agent):
         # Env-gated by OPENJARVIS_HERMES_ROUTE; off by default.
         self._hermes_router: HermesRouter = HermesRouter()
 
+        # Accommodation booking. Lazy-init: build once on first use so a
+        # missing LITEAPI_KEY doesn't crash worker startup. Last-search
+        # results are cached for the "book the X" follow-up turn.
+        self._accommodation = None  # type: ignore[assignment]
+        self._accommodation_init_attempted = False
+        self._accommodation_last_results: list = []
+        self._accommodation_pending_book: dict | None = None
+
     def _has_widget(self, kind: str) -> bool:
         """True when a panel of `kind` is currently visible on the HUD."""
         if not kind:
@@ -3017,6 +3065,256 @@ class Assistant(Agent):
         except Exception:  # noqa: BLE001
             pass
         return True
+
+    # ── Accommodation booking ────────────────────────────────────────
+    def _accommodation_service(self):
+        """Lazy-init the accommodation service. Returns None when LITEAPI_KEY
+        (or any other configured provider env) is missing — callers speak a
+        graceful "not configured" reply."""
+        if self._accommodation is not None:
+            return self._accommodation
+        if self._accommodation_init_attempted or not _ACCOMMODATION_AVAILABLE:
+            return None
+        self._accommodation_init_attempted = True
+        try:
+            self._accommodation = AccommodationService.from_env()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("accommodation init failed: %s", exc)
+            self._accommodation = None
+        return self._accommodation
+
+    def _parse_accommodation_dates(self, text: str) -> tuple:
+        """Phase 1 date NLU is intentionally minimal: default to a 2-night
+        stay starting next Friday when the user says 'weekend', otherwise
+        tomorrow → day-after. Richer parsing (specific dates, ranges) can
+        be added once the search flow proves out."""
+        from datetime import date, timedelta
+        today = date.today()
+        if re.search(r"\bweekend\b", text, re.I):
+            # Next Friday (weekday 4); if today IS Friday, use this Friday.
+            days_to_fri = (4 - today.weekday()) % 7 or 7
+            check_in = today + timedelta(days=days_to_fri)
+            check_out = check_in + timedelta(days=2)
+        elif re.search(r"\btonight\b", text, re.I):
+            check_in = today
+            check_out = today + timedelta(days=1)
+        elif re.search(r"\btomorrow\b", text, re.I):
+            check_in = today + timedelta(days=1)
+            check_out = today + timedelta(days=2)
+        else:
+            check_in = today + timedelta(days=7)
+            check_out = check_in + timedelta(days=2)
+        return check_in, check_out
+
+    def _parse_accommodation_location(self, text: str) -> str:
+        m = _ACCOMMODATION_LOC_RE.search(text)
+        if m:
+            return m.group(1).strip().rstrip(".,?!").title()
+        return ""
+
+    async def _handle_accommodation_search(self, text: str) -> bool:
+        service = self._accommodation_service()
+        if service is None:
+            try:
+                await self.session.say("Accommodation isn't configured, sir.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        location = self._parse_accommodation_location(text)
+        if not location:
+            try:
+                await self.session.say(
+                    "Where would you like to stay, sir? Tell me a city or area."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        check_in, check_out = self._parse_accommodation_dates(text)
+        from accommodation import SearchQuery
+        query = SearchQuery(
+            location=location,
+            check_in=check_in,
+            check_out=check_out,
+            guests=2,
+            currency=os.environ.get("ACCOMMODATION_DEFAULT_CURRENCY", "GBP"),
+        )
+        try:
+            properties = await asyncio.wait_for(service.search(query, limit=12), timeout=20.0)
+        except asyncio.TimeoutError:
+            try:
+                await self.session.say("The search took too long, sir — try again in a moment.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("accommodation search failed: %s", exc)
+            try:
+                await self.session.say("I couldn't reach the booking system just now, sir.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        self._accommodation_last_results = properties
+        # Surface the carousel on the HUD.
+        widget_payload = {
+            "query": location,
+            "check_in": check_in.isoformat(),
+            "check_out": check_out.isoformat(),
+            "properties": [
+                {
+                    "provider_id": p.provider_id,
+                    "external_id": p.external_id,
+                    "name": p.name,
+                    "price_total": p.price_total,
+                    "price_currency": p.price_currency,
+                    "rating": p.rating,
+                    "review_count": p.review_count,
+                    "address": p.address,
+                    "images": p.images[:3],
+                    "lat": p.lat,
+                    "lng": p.lng,
+                }
+                for p in properties
+            ],
+        }
+        await self._publish_ui({
+            "type": "open_widget",
+            "kind": "accommodation",
+            "title": f"Stays in {location}",
+            "payload": widget_payload,
+        })
+        if not properties:
+            try:
+                await self.session.say(
+                    f"I couldn't find any properties in {location} for those dates, sir."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        cheapest = properties[0]
+        nights = (check_out - check_in).days
+        try:
+            await self.session.say(
+                f"Found {len(properties)} properties in {location}, sir. "
+                f"The {cheapest.name} is cheapest at {cheapest.price_total:.0f} "
+                f"{cheapest.price_currency} total for {nights} nights. "
+                f"Say 'book the {cheapest.name.split()[0]}' to reserve."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _handle_accommodation_book(self, text: str) -> bool:
+        """Match a spoken property name against the last search results, lock
+        in a quote, and dispatch the Telegram magic link."""
+        service = self._accommodation_service()
+        if service is None or not self._accommodation_last_results:
+            try:
+                await self.session.say(
+                    "I don't have any properties to book, sir — search for somewhere first."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        # Identify which property the user named. Phase 1: simplest possible
+        # match — substring of any token. "Book the Marriott" → first prop
+        # with "marriott" in its name. "Book it" with no name → cheapest.
+        text_lower = text.lower()
+        target = None
+        for prop in self._accommodation_last_results:
+            tokens = prop.name.lower().split()
+            if any(tok and tok in text_lower for tok in tokens if len(tok) > 3):
+                target = prop
+                break
+        if target is None:
+            target = self._accommodation_last_results[0]
+        # Pull guest details from env — voice-dictating an email is awful UX.
+        first_name = os.environ.get("ACCOMMODATION_GUEST_FIRST_NAME", "").strip()
+        last_name = os.environ.get("ACCOMMODATION_GUEST_LAST_NAME", "").strip()
+        email = os.environ.get("ACCOMMODATION_GUEST_EMAIL", "").strip()
+        if not (first_name and last_name and email):
+            try:
+                await self.session.say(
+                    "Booking isn't fully set up, sir — your guest details are missing. "
+                    "Set the ACCOMMODATION_GUEST_* env vars on the worker."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        try:
+            quote = await asyncio.wait_for(service.quote(target), timeout=15.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("accommodation quote failed: %s", exc)
+            try:
+                await self.session.say("I couldn't lock in the price just now, sir.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        from accommodation import BookingRequest
+        request = BookingRequest(
+            quote_id=quote.quote_id,
+            book_token=quote.book_token,
+            guest_first_name=first_name,
+            guest_last_name=last_name,
+            guest_email=email,
+        )
+        try:
+            result = await asyncio.wait_for(
+                service.book(
+                    request,
+                    property_name=target.name,
+                    provider_id=target.provider_id,
+                ),
+                timeout=25.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("accommodation book failed: %s", exc)
+            try:
+                await self.session.say("The booking failed, sir. Please try again.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        if not result.success or not result.checkout_url:
+            try:
+                await self.session.say(
+                    "The provider didn't return a payment link, sir — booking aborted."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        # Telegram already attempted inside service.book(); if it failed,
+        # publish the checkout URL as a HUD link so the user still has a path.
+        if not service.telegram.configured:
+            await self._publish_ui({
+                "type": "open_widget",
+                "kind": "accommodation",
+                "title": "Complete payment",
+                "payload": {
+                    "query": target.name,
+                    "checkout_url": result.checkout_url,
+                    "price_total": result.price_total,
+                    "price_currency": result.price_currency,
+                },
+            })
+        try:
+            await self.session.say(
+                f"Booking link sent to your phone, sir. "
+                f"Total {result.price_total:.0f} {result.price_currency}. "
+                f"Tap to complete payment securely."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _maybe_handle_accommodation(self, text: str) -> bool:
+        """Top-level dispatch for accommodation intents. Cascade-only — when
+        OPENJARVIS_VOICE_PROVIDER=realtime, regex handlers are skipped, so
+        this never fires (documented gap, Phase 2 will add a post-realtime
+        intent re-classifier)."""
+        if not _ACCOMMODATION_RE.search(text or ""):
+            return False
+        if _ACCOMMODATION_BOOK_RE.search(text) and self._accommodation_last_results:
+            return await self._handle_accommodation_book(text)
+        return await self._handle_accommodation_search(text)
 
     async def _wake_greeting(self) -> str:
         """Greeting spoken when the user wakes Jarvis with no follow-up.
@@ -4356,6 +4654,15 @@ class Assistant(Agent):
         # Handled by regex (worker @function_tools never fire on
         # OpenJarvis); we speak our own confirmation, so stop the turn.
         if await self._maybe_handle_content(text):
+            raise StopResponse()
+
+        # Accommodation booking — search / book hotels via LiteAPI (Phase 1).
+        # Runs AFTER content so generic "search/show" verbs still find the
+        # right widget; BEFORE the LLM fall-through so booking intent never
+        # turns into a chat reply. PCI-safe by design: card data never
+        # enters this process (see brain/Accommodation Booking — PCI &
+        # Payment Handoff in the vault).
+        if await self._maybe_handle_accommodation(text):
             raise StopResponse()
 
         # Intelligence — OpenCTI graph operations. Runs BEFORE desktop so

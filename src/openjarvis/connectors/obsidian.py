@@ -203,6 +203,39 @@ class ObsidianConnector(BaseConnector):
         )
 
     # ------------------------------------------------------------------
+    # Note writer (added for accommodation booking — voice agents need to
+    # save knowledge into the vault, not just read it).
+    # ------------------------------------------------------------------
+
+    def write_note(
+        self,
+        rel_path: str,
+        content: str,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        """Write a markdown note to the vault.
+
+        ``rel_path`` is vault-relative (e.g. ``"brain/My Note.md"``). Parent
+        directories are created. Refuses to clobber an existing file unless
+        ``overwrite=True``. Returns the absolute path actually written.
+
+        Path traversal is rejected — the resolved target must stay inside
+        the vault root.
+        """
+        if not self.is_connected():
+            raise RuntimeError("vault not configured")
+        root = Path(self._vault_path).resolve()
+        target = (root / rel_path).resolve()
+        if not str(target).startswith(str(root)):
+            raise ValueError(f"path traversal blocked: {rel_path}")
+        if target.exists() and not overwrite:
+            raise FileExistsError(str(target))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return target
+
+    # ------------------------------------------------------------------
     # MCP tools
     # ------------------------------------------------------------------
 

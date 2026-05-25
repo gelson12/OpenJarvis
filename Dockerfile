@@ -24,6 +24,10 @@ COPY rust/ rust/
 # LiveKit voice worker is co-located in this image (single-service
 # deployment): its code + deps must be present alongside the API server.
 COPY livekit/ livekit/
+# Accommodation booking module — vendored in-repo (see brain/Accommodation
+# Booking — Implementation Plan in the vault). Lazy-imported by the worker,
+# so a missing folder degrades gracefully to "Accommodation isn't configured".
+COPY accommodation/ accommodation/
 
 # Copy built frontend into the server static directory
 COPY --from=frontend /app/src/openjarvis/server/static src/openjarvis/server/static/
