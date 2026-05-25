@@ -2591,10 +2591,27 @@ class Assistant(Agent):
         """Volume command with HUD/desktop disambiguation."""
         if not text or not _VOLUME_INTENT_RE.search(text):
             return False
-        if _DESKTOP_MACHINE_RE.search(text):
-            return False
 
         low = text.lower()
+
+        # Refusal of the desktop-machine bail when the user clearly named
+        # a HUD audio widget. Without this, "unmute the news from the
+        # YouTube window" got mis-routed to the desktop handler ("from"
+        # used to be a hard exit), which then said "I can't reach the
+        # laptop" because no machine was online — the worst kind of
+        # wrong answer (volume IS handled, just on the HUD side).
+        hud_widget_kw = bool(re.search(
+            r"\b("
+            r"youtube|the\s+video|video\s+(?:panel|widget|window)|"
+            r"music\s+(?:panel|widget|window)|"
+            r"browser\s+(?:panel|widget|window)|"
+            r"news\s+(?:panel|widget|window)|"
+            r"(?:the\s+)?(?:panel|widget|window)"
+            r")\b",
+            low,
+        ))
+        if _DESKTOP_MACHINE_RE.search(text) and not hud_widget_kw:
+            return False
         if re.search(r"\bunmute\b", low):
             action_args: dict = {"action": "unmute"}
         elif re.search(r"\bmute\b", low):
@@ -3460,18 +3477,32 @@ class Assistant(Agent):
             return "I couldn't reach the news feed just now, sir."
 
         # Derive a SAFE YouTube query from the top headline. Strip
-        # source suffix (" - Reuters"), and any garbage. If the derived
-        # query is too short to be useful, skip the video panel.
+        # source suffix (" - Reuters"), pipe-separated subtitle, and
+        # truncate to the first 8 meaningful words — real headlines
+        # routinely run 80-130 chars, which is far too specific for
+        # YouTube (returns 0 results) AND used to trip our noise
+        # heuristic (intended for spoken topics, not headline strings)
+        # so we fell off the companion-video path entirely.
         top = articles[0] if articles else {}
         top_title = (top.get("title") or "").strip()
         top_source = (top.get("source") or "").strip()
         video_query = re.sub(r"\s+-\s+[A-Z][A-Za-z0-9 .&'-]+$", "", top_title)
         video_query = re.sub(r"\s+\|.*$", "", video_query).strip()
+        # Drop punctuation that YouTube treats as nothing useful.
+        video_query_clean = re.sub(r"[\"'`]", "", video_query)
+        # First N words is the right granularity for YouTube — the
+        # core noun phrase is almost always within the first 6-8 words,
+        # and over-specifying just kills recall.
+        video_query_short = " ".join(video_query_clean.split()[:8])
 
-        if len(video_query) >= 12 and not _topic_looks_noisy(video_query):
+        # We deliberately DO NOT apply `_topic_looks_noisy` here —
+        # headlines are inherently long and that heuristic would
+        # reject every legitimate one. Just gate on having SOMETHING
+        # substantive to search (>= 12 chars).
+        if len(video_query_short) >= 12:
             try:
                 videos = await asyncio.wait_for(
-                    search_tools.youtube_search(video_query, limit=6),
+                    search_tools.youtube_search(video_query_short, limit=6),
                     timeout=6.0,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -3485,9 +3516,10 @@ class Assistant(Agent):
                             {
                                 "type": "open_widget",
                                 "kind": "youtube",
-                                "title": f"News Video — {video_query[:50]}",
+                                "title": f"News Video — {video_query_short[:50]}",
                                 "payload": {
-                                    "query": video_query, "videos": videos,
+                                    "query": video_query_short,
+                                    "videos": videos,
                                 },
                             }
                         )
