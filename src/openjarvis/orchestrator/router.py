@@ -505,21 +505,69 @@ async def call_openjarvis_default(
 # ---------------------------------------------------------------------------
 
 
-def pick_best(responses: list[dict[str, Any]]) -> dict[str, Any]:
+def pick_best(responses: list[dict[str, Any]],
+              *, mode: str = "") -> dict[str, Any]:
     """Pick the best response from the list.
 
-    Prioritizes:
-    1. Responses without errors
-    2. Longest responses (more complete)
-    3. First successful response
+    Two selection modes (Round 3.1 extension):
+
+      "fastest" / "" (default) — legacy behavior. Filter errors, return
+        the longest response (proxy for most-complete).
+
+      "consensus" — when ≥3 clean responses, score each by mean Jaccard
+        token overlap with every other response and pick the one with the
+        highest mean.  Equivalent to picking the answer that best
+        represents the agreement across providers.  Falls back to the
+        "fastest" rule if fewer than 3 clean responses are available.
+
+    `mode` defaults to the value of OPENJARVIS_ORCHESTRATOR_MODE env var
+    when not explicitly passed (so callers in routes.py don't need to
+    thread it through every call site).
     """
+    import os as _os
+    import re as _re
+
+    if not mode:
+        mode = _os.environ.get("OPENJARVIS_ORCHESTRATOR_MODE", "fastest").strip().lower()
+
     # Filter out error responses
     clean = [r for r in responses if r and "Error" not in r.get("text", "")]
     if not clean:
-        # If all failed, return the first one with less error overhead
         return responses[0] if responses else {"model": "unknown", "text": "Error: All models failed"}
 
-    # Return the longest response (most complete)
+    if mode == "consensus" and len(clean) >= 3:
+        # Jaccard-overlap consensus — picks the response most aligned with
+        # the population.  Token-based; cheap; doesn't need embeddings.
+        _TOK = _re.compile(r"[a-z0-9][a-z0-9_-]{1,}")
+
+        def _toks(r: dict) -> set:
+            return set(_TOK.findall((r.get("text") or "").lower()))
+
+        token_sets = [_toks(r) for r in clean]
+        scores: list[float] = []
+        for i, ti in enumerate(token_sets):
+            if not ti:
+                scores.append(0.0)
+                continue
+            overlaps = []
+            for j, tj in enumerate(token_sets):
+                if i == j or not tj:
+                    continue
+                union = ti | tj
+                if not union:
+                    continue
+                overlaps.append(len(ti & tj) / len(union))
+            scores.append(sum(overlaps) / len(overlaps) if overlaps else 0.0)
+        # Index of max-consensus response; ties broken by longer text.
+        best_idx = max(
+            range(len(clean)),
+            key=lambda i: (scores[i], len(clean[i].get("text", ""))),
+        )
+        chosen = dict(clean[best_idx])
+        chosen.setdefault("consensus_score", round(scores[best_idx], 3))
+        return chosen
+
+    # "fastest" (legacy): longest non-error response
     return max(clean, key=lambda r: len(r.get("text", "")))
 
 

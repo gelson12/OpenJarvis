@@ -81,6 +81,12 @@ try:
     import openjarvis.tools.memory_manage  # noqa: F401
 except ImportError:
     pass
+
+try:
+    # Round 2.2: persistent goal tracker (env-gated by OPENJARVIS_GOALS_ENABLED).
+    import openjarvis.tools.goal  # noqa: F401
+except ImportError:
+    pass
 try:
     import openjarvis.tools.user_profile_manage  # noqa: F401
 except ImportError:

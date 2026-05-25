@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from typing import Any
 
@@ -467,6 +468,41 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 exc_info=True,
             )
 
+    # Round 3.3 — Skill-aware planner short-circuit.  Before any LLM call,
+    # check if a registered TOML skill matches the user's latest message
+    # with high confidence.  If so, execute the skill chain directly and
+    # return the result as a normal chat completion.  Hermes structurally
+    # can't do this — its planner always invokes the LLM.
+    if os.getenv("OPENJARVIS_SKILL_PLANNER_ENABLED", "false").lower() in ("1", "true", "yes", "on"):
+        try:
+            from openjarvis.agents.skill_planner import maybe_handle as _skill_maybe_handle
+            latest_user = ""
+            for m in reversed(request_body.messages):
+                if m.role == "user" and m.content:
+                    latest_user = m.content
+                    break
+            skill_answer = _skill_maybe_handle(latest_user) if latest_user else None
+            if skill_answer:
+                _fire_post_turn_hooks_safe(
+                    request=request,
+                    latest_user_text=latest_user,
+                    assistant_text=skill_answer,
+                    complexity_info=None,
+                )
+                return ChatCompletionResponse(
+                    model=request_body.model,
+                    choices=[Choice(
+                        message=ChoiceMessage(role="assistant", content=skill_answer),
+                        finish_reason="stop",
+                    )],
+                    usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                    complexity=None,
+                )
+        except Exception as _sp_exc:
+            logging.getLogger("openjarvis.server").debug(
+                "skill_planner short-circuit skipped: %s", _sp_exc,
+            )
+
     # Auto-inject integration tools when the frontend didn't send any,
     # filtered by relevance to the user's latest message.
     #
@@ -615,13 +651,68 @@ def _handle_direct(
             **kwargs,
         )
     else:
-        result = engine.generate(
-            messages,
-            model=model,
-            temperature=req.temperature,
-            max_tokens=req.max_tokens,
-            **kwargs,
-        )
+        # Round 1.2 — Parallel orchestrator: when env-enabled, ping all
+        # configured LLM providers concurrently and pick the best/consensus
+        # response via orchestrator.pick_best.  Falls back to engine.generate
+        # if orchestrator fails or returns nothing usable.
+        if (
+            os.getenv("OPENJARVIS_ORCHESTRATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+            and not req.tools  # skip orchestrator when caller passes tools (orchestrator doesn't proxy tool calls)
+        ):
+            try:
+                import asyncio as _asyncio
+                from openjarvis.orchestrator.router import run_all as _orch_run_all
+                from openjarvis.orchestrator.router import pick_best as _orch_pick_best
+
+                _msgs_for_orch = [
+                    {"role": m.role.value if hasattr(m.role, "value") else m.role,
+                     "content": m.content or ""}
+                    for m in messages
+                ]
+                try:
+                    _loop = _asyncio.get_event_loop()
+                    if _loop.is_running():
+                        # Already inside an async context (FastAPI handler dispatched
+                        # this sync function via a threadpool).  Use a new loop.
+                        raise RuntimeError("nested-loop")
+                    responses = _loop.run_until_complete(_orch_run_all(_msgs_for_orch))
+                except RuntimeError:
+                    responses = _asyncio.run(_orch_run_all(_msgs_for_orch))
+
+                if responses:
+                    best = _orch_pick_best(responses)  # honors OPENJARVIS_ORCHESTRATOR_MODE
+                    _text = best.get("text", "")
+                    if _text and "Error" not in _text:
+                        result = {"content": _text, "usage": {}, "tool_calls": None,
+                                  "finish_reason": "stop"}
+                        logging.getLogger("openjarvis.server").info(
+                            "openjarvis.orchestrator.dispatch winner=%s providers=%d",
+                            best.get("model", "?"), len(responses),
+                        )
+                    else:
+                        result = None
+                else:
+                    result = None
+            except Exception as _orch_exc:
+                logging.getLogger("openjarvis.server").debug(
+                    "orchestrator path skipped: %s", _orch_exc,
+                )
+                result = None
+
+            if result is None:
+                result = engine.generate(
+                    messages, model=model,
+                    temperature=req.temperature, max_tokens=req.max_tokens,
+                    **kwargs,
+                )
+        else:
+            result = engine.generate(
+                messages,
+                model=model,
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
+                **kwargs,
+            )
     content = result.get("content", "")
     usage = result.get("usage", {})
 
@@ -640,6 +731,15 @@ def _handle_direct(
             }
             for tc in tool_calls
         ]
+
+    # Rounds 2.1 + 3.5 — fire reflector + distillation feedback callbacks.
+    # Off-path (background); never blocks the user response.
+    _fire_post_turn_hooks_safe(
+        request=None,
+        latest_user_text=_extract_latest_user_text_from_messages(messages),
+        assistant_text=content,
+        complexity_info=complexity_info,
+    )
 
     return ChatCompletionResponse(
         model=model,
@@ -702,6 +802,14 @@ def _handle_agent(
 
         if Path(audio_path).exists():
             audio_meta = AudioMeta(url="/api/digest/audio")
+
+    # Rounds 2.1 + 3.5 — fire reflector + distillation feedback callbacks.
+    _fire_post_turn_hooks_safe(
+        request=None,
+        latest_user_text=input_text,
+        assistant_text=result.content,
+        complexity_info=complexity_info,
+    )
 
     return ChatCompletionResponse(
         model=model,
@@ -1375,3 +1483,113 @@ async def security_scan():
 
 
 __all__ = ["router"]
+
+
+# ---------------------------------------------------------------------------
+# Post-turn hook fan-out (Rounds 2.1 + 3.5)
+# ---------------------------------------------------------------------------
+
+def _extract_latest_user_text_from_messages(messages) -> str:
+    """Pull the last user message text from a Message list. Best-effort."""
+    for m in reversed(messages or []):
+        try:
+            role = m.role.value if hasattr(m.role, "value") else m.role
+        except Exception:
+            role = ""
+        if role == "user":
+            return getattr(m, "content", "") or ""
+    return ""
+
+
+def _fire_post_turn_hooks_safe(*, request, latest_user_text: str,
+                                assistant_text: str, complexity_info=None) -> None:
+    """Fire reflector + distillation feedback callbacks off-path.
+
+    Both hooks run in background threads inside their own implementations;
+    this function just calls them and swallows any exception so the live
+    chat response is never affected.
+
+    Round 2.1 — reflector posts a structured critique of (user, assistant)
+    to ~/.openjarvis/reflections/<session>.jsonl.
+    Round 3.5 — distillation queues turns with low-confidence reflection
+    OR explicit failure markers to the OnDemandTrigger pipeline so
+    OpenJarvis learns from mistakes in near-real-time.
+    """
+    if not latest_user_text or not assistant_text:
+        return
+
+    # Derive session id from request headers when available; fallback to a
+    # stable hash so per-session reflection history aggregates correctly
+    # even for stateless clients.
+    session_id = ""
+    try:
+        if request is not None:
+            session_id = (
+                request.headers.get("X-OpenJarvis-Session-Id")
+                or request.headers.get("X-Hermes-Session-Id")
+                or ""
+            ).strip()
+    except Exception:
+        session_id = ""
+    if not session_id:
+        import hashlib as _h
+        session_id = _h.sha1((latest_user_text[:80] or "anon").encode("utf-8", errors="replace")).hexdigest()[:12]
+
+    # Complexity score for reflector context.
+    complexity_score = None
+    try:
+        if complexity_info is not None:
+            complexity_score = float(getattr(complexity_info, "score", None) or
+                                       (complexity_info.get("score") if isinstance(complexity_info, dict) else 0.0))
+    except Exception:
+        complexity_score = None
+
+    # Round 2.1 — Reflector
+    try:
+        from openjarvis.learning.reflector import reflect_async as _reflect_async
+        _reflect_async(
+            session_id=session_id,
+            user_text=latest_user_text,
+            assistant_text=assistant_text,
+            domain="general",
+            complexity=complexity_score,
+        )
+    except Exception:
+        pass
+
+    # Round 3.5 — Online distillation trigger.  Currently fires only for
+    # explicit failure markers in the response text; once Round 2.1's
+    # reflector confidence is flowing, this gate broadens to include
+    # low-confidence reflections (read via reflector.last_reflection).
+    try:
+        if os.getenv("OPENJARVIS_DISTILLER_ONLINE_ENABLED", "false").lower() in ("1", "true", "yes", "on"):
+            looks_failed = any(
+                marker in assistant_text.lower() for marker in (
+                    "i'm sorry", "i cannot", "i can't", "i don't know",
+                    "unable to", "i'm not able", "error:", "[no result]",
+                )
+            )
+            if looks_failed:
+                import threading as _threading
+                def _queue_distillation():
+                    try:
+                        from openjarvis.learning.distillation.orchestrator import DistillationOrchestrator
+                        from openjarvis.learning.distillation.triggers import OnDemandTrigger
+                        trigger = OnDemandTrigger(
+                            turn={"user": latest_user_text[:1200],
+                                  "assistant": assistant_text[:2400],
+                                  "session_id": session_id},
+                        )
+                        DistillationOrchestrator().run(trigger)
+                        logging.getLogger("openjarvis.server").info(
+                            "openjarvis.distiller.queued session=%s", session_id,
+                        )
+                    except Exception as _dexc:
+                        logging.getLogger("openjarvis.server").debug(
+                            "distiller queue failed: %s", _dexc,
+                        )
+                _threading.Thread(target=_queue_distillation,
+                                  name="openjarvis-distiller-queue",
+                                  daemon=True).start()
+    except Exception:
+        pass

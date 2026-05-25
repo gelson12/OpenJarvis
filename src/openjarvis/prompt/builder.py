@@ -39,6 +39,28 @@ class SystemPromptBuilder:
         if self._frozen_prefix is None:
             self._frozen_prefix = self._build_frozen_prefix()
         parts = [self._frozen_prefix]
+
+        # Round 2.3 — Prompt evolver: when enabled, an active variant for
+        # the current domain may exist; treat it as an override block that
+        # the model should weight more heavily than the frozen prefix.
+        try:
+            from openjarvis.prompt.evolver import current_prompt as _evolver_current
+            variant = _evolver_current("general")  # TODO: thread real domain via builder ctor
+            if variant:
+                parts.append(f"\n\n## Active Refinement (Evolver)\n\n{variant}")
+        except Exception:
+            pass
+
+        # Round 2.2 — Goal tracker: inject active goals so the agent stays
+        # aligned across sessions.  Cached internally for 60s; cheap on the hot path.
+        try:
+            from openjarvis.tools.goal_tracker import active_goals_block as _goals_block
+            gb = _goals_block(max_goals=5)
+            if gb:
+                parts.append(f"\n\n{gb}")
+        except Exception:
+            pass
+
         if self._session_context:
             parts.append(f"\n\n## Session Context\n\n{self._session_context}")
         if self._previous_state:

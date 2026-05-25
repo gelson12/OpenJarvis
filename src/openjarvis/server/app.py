@@ -265,6 +265,37 @@ def create_app(
         except Exception as exc:
             logger.warning("Elaboration hydration skipped: %s", exc)
 
+    # Round 1.1 — Skills auto-load.  When OPENJARVIS_SKILLS_AUTOLOAD_ENABLED=true,
+    # discover all TOML/MD skills at startup so the skill_planner short-circuit
+    # (Round 3.3) and the agent's tool-list both see them.  Best-effort; never
+    # blocks startup.
+    @app.on_event("startup")
+    async def _autoload_skills() -> None:
+        if os.getenv("OPENJARVIS_SKILLS_AUTOLOAD_ENABLED", "false").lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return
+        try:
+            from openjarvis.skills.manager import SkillManager
+            mgr = SkillManager()
+            mgr.discover()
+            # Count skills if the manager exposes a way to introspect.
+            count = 0
+            for attr in ("get_all", "list_skills", "all_skills", "skills"):
+                obj = getattr(mgr, attr, None)
+                if callable(obj):
+                    try:
+                        count = len(list(obj()) or [])
+                        break
+                    except Exception:
+                        continue
+                elif isinstance(obj, (list, dict)) and obj:
+                    count = len(obj)
+                    break
+            logger.info("openjarvis.skills_autoload count=%d", count)
+        except Exception as exc:
+            logger.warning("Skills auto-load skipped: %s", exc)
+
     # Add security headers middleware
     try:
         from openjarvis.server.middleware import create_security_middleware
