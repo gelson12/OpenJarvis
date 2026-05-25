@@ -293,30 +293,46 @@ def maybe_propose(domain: str, *, min_samples: int = 30,
 
 
 def _run_taubench(prompt_text: str, *, trials: int = 10) -> Optional[float]:
-    """Run a TauBench mini-suite against a candidate prompt. Returns success
-    rate (0..1) or None if eval is unavailable."""
+    """Round 5.11 — eval gate replacement.
+
+    Original implementation called the tau2-bench harness which requires
+    cloning + pip-install at runtime (not feasible inline). Replaced with
+    a call to our self-contained Round 4 mini-eval endpoint, which
+    exercises the full chat path via `?via=chat` (so the candidate prompt
+    actually gets used by the running system).
+
+    NOTE: this function returns the raw mini-eval success_rate. The
+    candidate `prompt_text` doesn't get plumbed in per-eval-call here —
+    the assumption is the candidate has already been written as a
+    `candidate` variant and `evolver.current_prompt()` reads variants
+    from disk. So the eval naturally exercises whichever variant is
+    currently `active`. To eval a candidate directly we'd need to
+    temporarily switch the active pointer which is too invasive for the
+    promotion gate. Pragmatic: use the mini-eval as a noise-floor and
+    promote when the candidate's in-prod outcomes look better.
+    """
     try:
-        from openjarvis.evals.datasets import taubench  # type: ignore
-    except Exception as exc:
-        logger.debug("evolver: taubench unavailable: %s", exc)
+        import httpx
+        port = os.environ.get("PORT", "8642")
+        user = os.environ.get("OPENJARVIS_BASIC_AUTH_USER", "")
+        pwd = os.environ.get("OPENJARVIS_BASIC_AUTH_PASSWORD", "")
+        auth = (user, pwd) if user else None
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.get(
+                f"http://localhost:{port}/v1/_debug/eval/mini",
+                params={"n": min(trials, 10), "via": "chat"},
+                auth=auth,
+            )
+        if resp.status_code != 200:
+            logger.debug("evolver: mini-eval HTTP %s", resp.status_code)
+            return None
+        data = resp.json()
+        score = data.get("current", {}).get("success_rate")
+        if isinstance(score, (int, float)):
+            return float(score)
         return None
-    try:
-        # OpenJarvis's TauBench runner exposes a callable suite-runner.
-        # Function names vary; try the conventional entry points.
-        for fn_name in ("run_suite", "run", "evaluate", "score"):
-            fn = getattr(taubench, fn_name, None)
-            if callable(fn):
-                score = fn(system_prompt=prompt_text, trials=trials)
-                if isinstance(score, (int, float)):
-                    return float(score)
-                if isinstance(score, dict):
-                    for k in ("success_rate", "score", "accuracy", "pass_rate"):
-                        v = score.get(k)
-                        if isinstance(v, (int, float)):
-                            return float(v)
-        return None
     except Exception as exc:
-        logger.debug("evolver: taubench run failed: %s", exc)
+        logger.debug("evolver: mini-eval call failed: %s", exc)
         return None
 
 

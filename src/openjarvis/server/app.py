@@ -314,6 +314,45 @@ def create_app(
         except Exception as exc:
             logger.warning("openjarvis.skills_autoload_FAILED: %s", exc, exc_info=True)
 
+    # Round 5.11 — Prompt-evolver + skill-proposer background scheduler.
+    # Single daemon thread; sleeps 30 min between sweeps. No external dep.
+    # Each sub-task is env-gated and wrapped in try/except.
+    try:
+        import threading as _threading
+        import time as _time
+        def _round5_scheduler():
+            while True:
+                try:
+                    _time.sleep(int(os.getenv("OPENJARVIS_ROUND5_SCHEDULER_INTERVAL_SEC", "1800")))
+                except Exception:
+                    _time.sleep(1800)
+                # Prompt evolver — propose + promote per domain with sufficient samples
+                try:
+                    from openjarvis.prompt import evolver as _ev
+                    from openjarvis.learning.domain_classifier import all_known_domains
+                    if _ev._enabled():
+                        for d in all_known_domains():
+                            try:
+                                _ev.maybe_propose(d)
+                                _ev.maybe_promote(d)
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                # Skill proposer — scan corpus for failure clusters
+                try:
+                    from openjarvis.learning import skill_proposer as _sp
+                    if _sp._enabled():
+                        _sp.propose_for_all_domains()
+                except Exception:
+                    pass
+        _threading.Thread(target=_round5_scheduler,
+                          name="openjarvis-round5-scheduler",
+                          daemon=True).start()
+        logger.warning("openjarvis.round5.scheduler started")
+    except Exception as exc:
+        logger.warning("openjarvis.round5.scheduler failed to start: %s", exc)
+
     # Restore SendBlue channel bindings from database on startup
     _restore_sendblue_bindings(app)
 

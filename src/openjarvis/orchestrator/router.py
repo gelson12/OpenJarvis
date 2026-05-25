@@ -506,7 +506,7 @@ async def call_openjarvis_default(
 
 
 def pick_best(responses: list[dict[str, Any]],
-              *, mode: str = "") -> dict[str, Any]:
+              *, mode: str = "", domain: str = "") -> dict[str, Any]:
     """Pick the best response from the list.
 
     Two selection modes (Round 3.1 extension):
@@ -566,6 +566,28 @@ def pick_best(responses: list[dict[str, Any]],
         chosen = dict(clean[best_idx])
         chosen.setdefault("consensus_score", round(scores[best_idx], 3))
         return chosen
+
+    # Round 5.2 — model-preference tiebreak in "fastest" mode.
+    # If we have a domain hint AND the preference learner has rankings,
+    # pick the highest-ranked model among the longest 3 responses (keeps
+    # "longest=most-complete" intuition but breaks ties by learned success).
+    if (domain
+        and _os.environ.get("OPENJARVIS_MODEL_PREFERENCE_TIEBREAK_ENABLED", "false").lower()
+            in ("1", "true", "yes", "on")):
+        try:
+            from openjarvis.learning import model_preference as _mp
+            ranked = dict(_mp.rank_models(domain))  # model -> score
+            if ranked:
+                top3 = sorted(clean, key=lambda r: len(r.get("text", "")), reverse=True)[:3]
+                chosen = max(top3, key=lambda r: (
+                    ranked.get(r.get("model", ""), 0.0),
+                    len(r.get("text", "")),
+                ))
+                chosen = dict(chosen)
+                chosen.setdefault("pick_reason", "tiebreak:model_preference")
+                return chosen
+        except Exception:
+            pass
 
     # "fastest" (legacy): longest non-error response
     return max(clean, key=lambda r: len(r.get("text", "")))
@@ -647,7 +669,20 @@ async def run_all(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Python 3.11+ requires Tasks (not bare coroutines) for asyncio.wait.
         # Wrap each coroutine explicitly — fixes
         # "TypeError: Passing coroutines is forbidden, use tasks explicitly."
-        tasks = [asyncio.create_task(t) if asyncio.iscoroutine(t) else t for t in tasks]
+        # Round 5.4: also wrap with a per-task latency stamp so we can record
+        # real provider latency (was hardcoded to 0).
+        import time as _time
+        async def _stamp(coro):
+            _t0 = _time.time()
+            try:
+                _r = await coro
+                if isinstance(_r, dict):
+                    _r["_latency_ms"] = int((_time.time() - _t0) * 1000)
+                return _r
+            except Exception as _exc:
+                return {"model": "unknown", "text": f"Error: {_exc}",
+                        "_latency_ms": int((_time.time() - _t0) * 1000)}
+        tasks = [asyncio.create_task(_stamp(t)) if asyncio.iscoroutine(t) else t for t in tasks]
 
         # OPTION C HYBRID: Wait 4s to gather ALL responses (not just the first)
         done, pending = await asyncio.wait(
@@ -691,7 +726,7 @@ async def run_all(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     model=model,
                     tokens_in=est_in,
                     tokens_out=est_out,
-                    latency_ms=0,
+                    latency_ms=int(r.get("_latency_ms", 0) or 0),
                     success=True,
                     role="orchestrator",
                 )

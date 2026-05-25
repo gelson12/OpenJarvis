@@ -503,6 +503,41 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 "skill_planner short-circuit skipped: %s", _sp_exc,
             )
 
+    # Round 5.1 — Predictive answer cache lookup.  After skill_planner has
+    # had its first shot (skills execute fresh logic), check the cache.
+    # The cache only stores reflections w/ conf>=0.85 && success=True, so a
+    # hit is a previously-validated answer to a near-identical query.
+    if os.getenv("OPENJARVIS_ANSWER_CACHE_LOOKUP_ENABLED", "false").lower() in ("1", "true", "yes", "on"):
+        try:
+            from openjarvis.learning import answer_cache as _ac
+            from openjarvis.learning.domain_classifier import infer_domain as _infer_domain
+            latest_user_cache = ""
+            for m in reversed(request_body.messages):
+                if m.role == "user" and m.content:
+                    latest_user_cache = m.content
+                    break
+            if latest_user_cache:
+                cache_domain = _infer_domain(latest_user_cache)
+                hit = _ac.lookup(latest_user_cache, cache_domain)
+                if hit and hit.get("answer"):
+                    logging.getLogger("openjarvis.server").info(
+                        "openjarvis.answer_cache.hit_serve domain=%s hits=%d conf=%.2f",
+                        cache_domain, hit.get("hits", 0), hit.get("confidence", 0.0),
+                    )
+                    return ChatCompletionResponse(
+                        model=request_body.model,
+                        choices=[Choice(
+                            message=ChoiceMessage(role="assistant", content=hit["answer"]),
+                            finish_reason="stop",
+                        )],
+                        usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                        complexity=None,
+                    )
+        except Exception as _ac_exc:
+            logging.getLogger("openjarvis.server").debug(
+                "answer_cache lookup skipped: %s", _ac_exc,
+            )
+
     # Auto-inject integration tools when the frontend didn't send any,
     # filtered by relevance to the user's latest message.
     #
@@ -573,18 +608,38 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 exc_info=True,
             )
 
+    # Round 5.7 — Hybrid 4-tier router. When enabled, computes a tier from
+    # complexity x vault-confidence and may force orchestrator-consensus
+    # mode for this request (via thread-local env override). Decision is
+    # non-binding: Tier 2/3 still flow through the orchestrator gate below;
+    # Tier 0/1 fall through to single-engine path.
+    _hybrid_tier = None
+    try:
+        from openjarvis.learning.routing import hybrid as _hybrid
+        if complexity_info is not None:
+            _hybrid_tier = _hybrid.decide(query_text_for_complexity, complexity_info.score)
+    except Exception:
+        _hybrid_tier = None
+
     # Round 1.2 (architectural fix) — Parallel orchestrator gate.  Original
     # gate `if not req.tools` was dead-code because tools are auto-injected
     # on every request.  Correct gate: route trivial/simple complexity-tier
     # turns through the orchestrator ensemble (parallel ping all providers,
     # pick best by mode=fastest|consensus).  These tiers don't need tools
     # anyway, and Hermes structurally cannot do parallel ensemble.
-    if (
+    # Round 5.7: also activate for hybrid tiers 2 + 3 (medium/high complexity)
+    _orch_gate_open = (
         not request_body.stream
         and complexity_info is not None
-        and complexity_info.tier in ("trivial", "simple")
         and os.getenv("OPENJARVIS_ORCHESTRATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
-    ):
+        and (
+            complexity_info.tier in ("trivial", "simple")
+            or (_hybrid_tier is not None and _hybrid_tier.tier in (
+                _hybrid.TIER_ORCH_FASTEST, _hybrid.TIER_ORCH_CONSENSUS
+            ))
+        )
+    )
+    if _orch_gate_open:
         try:
             from openjarvis.orchestrator.router import (
                 run_all as _orch_run_all,
@@ -597,7 +652,22 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             ]
             responses = await _orch_run_all(_orch_msgs)
             if responses:
-                best = _orch_pick_best(responses)
+                # Round 5.2 — pass inferred domain so pick_best can use
+                # model_preference as a tiebreak in fastest mode.
+                try:
+                    from openjarvis.learning.domain_classifier import infer_domain as _id
+                    _orch_domain = _id(query_text_for_complexity,
+                                       getattr(complexity_info, "signals", None) if complexity_info else None)
+                except Exception:
+                    _orch_domain = "general"
+                # Hybrid tier picks consensus mode explicitly (no env mutation)
+                _orch_mode = ""
+                try:
+                    if _hybrid_tier and _hybrid_tier.tier == _hybrid.TIER_ORCH_CONSENSUS:
+                        _orch_mode = "consensus"
+                except Exception:
+                    pass
+                best = _orch_pick_best(responses, mode=_orch_mode, domain=_orch_domain)
                 _text = best.get("text", "")
                 if _text and "Error" not in _text:
                     logging.getLogger("openjarvis.server").info(
@@ -682,6 +752,30 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     )
 
 
+def _record_cost(result: Any, *, model: str, latency_ms: int, role: str = "main") -> None:
+    """Round 5.4 — record main-path engine call into cost_telemetry."""
+    try:
+        from openjarvis.learning import cost_telemetry as _ct
+        usage = (result or {}).get("usage") if isinstance(result, dict) else {}
+        if not isinstance(usage, dict):
+            usage = {}
+        tokens_in = int(usage.get("prompt_tokens", 0) or 0)
+        tokens_out = int(usage.get("completion_tokens", 0) or 0)
+        # Char-estimate fallback when provider doesn't return usage
+        if tokens_in == 0 and isinstance(result, dict):
+            content = result.get("content") or ""
+            tokens_out = tokens_out or max(1, len(content) // 4)
+        provider = model.split("/")[0] if "/" in model else (model or "unknown")
+        success = bool((result or {}).get("content") if isinstance(result, dict) else False)
+        _ct.record(
+            provider=provider, model=model,
+            tokens_in=tokens_in, tokens_out=tokens_out,
+            latency_ms=int(latency_ms), success=success, role=role,
+        )
+    except Exception:
+        pass
+
+
 def _handle_direct(
     engine,
     model: str,
@@ -690,13 +784,35 @@ def _handle_direct(
     complexity_info=None,
 ) -> ChatCompletionResponse:
     """Direct engine call without agent."""
+    import time as _time
     messages = _to_messages(req.messages)
     kwargs: dict[str, Any] = {}
     if req.tools:
         kwargs["tools"] = req.tools
+
+    # Round 5 BONUS-B — temperature auto-tune. Only override when the
+    # caller's temperature looks like a default (not explicitly tuned per-call)
+    # and the tuner has been recording. Hermes can't do this — it has one
+    # global temperature.
+    try:
+        from openjarvis.learning import temperature_tuner as _tt
+        from openjarvis.learning.domain_classifier import infer_domain as _id_dom
+        if _tt._enabled() and (req.temperature is None or abs((req.temperature or 0.0) - 0.7) < 0.01):
+            _latest_user = ""
+            for _m in reversed(req.messages):
+                if _m.role == "user" and _m.content:
+                    _latest_user = _m.content
+                    break
+            _dom = _id_dom(_latest_user)
+            _rec_temp = _tt.recommended(_dom)
+            if _rec_temp is not None:
+                req.temperature = _rec_temp
+    except Exception:
+        pass
     if bus:
         from openjarvis.telemetry.wrapper import instrumented_generate
 
+        _t0 = _time.time()
         result = instrumented_generate(
             engine,
             messages,
@@ -706,12 +822,65 @@ def _handle_direct(
             max_tokens=req.max_tokens,
             **kwargs,
         )
+        _record_cost(result, model=model,
+                     latency_ms=int((_time.time() - _t0) * 1000),
+                     role="main_instrumented")
     else:
+        # Round 5 BONUS-A — Speculative parallel race. Fires orchestrator
+        # AND single-engine in parallel; first non-error wins. Only fires
+        # for complexity in the "interesting band" (0.2-0.6) where neither
+        # path is the clear winner. Latency floor that Hermes can't match.
+        result = None
+        try:
+            from openjarvis.learning import speculative as _spec
+            if _spec._enabled() and not req.tools:
+                import asyncio as _asyncio
+                from openjarvis.orchestrator.router import (
+                    run_all as _spec_run_all, pick_best as _spec_pick_best,
+                )
+                _spec_msgs = [
+                    {"role": m.role.value if hasattr(m.role, "value") else m.role,
+                     "content": m.content or ""}
+                    for m in messages
+                ]
+                _spec_complexity = complexity_info.score if complexity_info else 0.5
+                try:
+                    _loop = _asyncio.get_event_loop()
+                    if _loop.is_running():
+                        raise RuntimeError("nested-loop")
+                    winner = _loop.run_until_complete(_spec.race(
+                        _spec_msgs, engine=engine, run_all=_spec_run_all,
+                        pick_best=_spec_pick_best, model=model,
+                        complexity=_spec_complexity,
+                        temperature=req.temperature or 0.2,
+                        max_tokens=req.max_tokens,
+                    ))
+                except RuntimeError:
+                    winner = _asyncio.run(_spec.race(
+                        _spec_msgs, engine=engine, run_all=_spec_run_all,
+                        pick_best=_spec_pick_best, model=model,
+                        complexity=_spec_complexity,
+                        temperature=req.temperature or 0.2,
+                        max_tokens=req.max_tokens,
+                    ))
+                if winner and winner.get("text"):
+                    result = {"content": winner["text"], "usage": winner.get("usage", {}) or {},
+                              "tool_calls": None, "finish_reason": "stop"}
+                    logging.getLogger("openjarvis.server").info(
+                        "openjarvis.speculative.served winner_path=%s model=%s",
+                        winner.get("winner_path"), winner.get("model"),
+                    )
+        except Exception as _spec_exc:
+            logging.getLogger("openjarvis.server").debug(
+                "speculative race skipped: %s", _spec_exc,
+            )
+            result = None
+
         # Round 1.2 — Parallel orchestrator: when env-enabled, ping all
         # configured LLM providers concurrently and pick the best/consensus
         # response via orchestrator.pick_best.  Falls back to engine.generate
         # if orchestrator fails or returns nothing usable.
-        if (
+        if result is None and (
             os.getenv("OPENJARVIS_ORCHESTRATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
             and not req.tools  # skip orchestrator when caller passes tools (orchestrator doesn't proxy tool calls)
         ):
@@ -756,12 +925,18 @@ def _handle_direct(
                 result = None
 
             if result is None:
+                _t0 = _time.time()
                 result = engine.generate(
                     messages, model=model,
                     temperature=req.temperature, max_tokens=req.max_tokens,
                     **kwargs,
                 )
-        else:
+                _record_cost(result, model=model,
+                             latency_ms=int((_time.time() - _t0) * 1000),
+                             role="main_fallback")
+        elif result is None:
+            # Neither speculative nor orchestrator filled result — raw single-engine path
+            _t0 = _time.time()
             result = engine.generate(
                 messages,
                 model=model,
@@ -769,6 +944,9 @@ def _handle_direct(
                 max_tokens=req.max_tokens,
                 **kwargs,
             )
+            _record_cost(result, model=model,
+                         latency_ms=int((_time.time() - _t0) * 1000),
+                         role="main_raw")
     content = result.get("content", "")
     usage = result.get("usage", {})
 
@@ -1600,6 +1778,19 @@ def _fire_post_turn_hooks_safe(*, request, latest_user_text: str,
     except Exception:
         complexity_score = None
 
+    # Round 5.6 — infer per-request domain instead of hardcoding "general"
+    inferred_domain = "general"
+    try:
+        from openjarvis.learning.domain_classifier import infer_domain as _id
+        _signals = None
+        if complexity_info is not None:
+            _signals = getattr(complexity_info, "signals", None)
+            if _signals is None and isinstance(complexity_info, dict):
+                _signals = complexity_info.get("signals")
+        inferred_domain = _id(latest_user_text, _signals)
+    except Exception:
+        pass
+
     # Round 2.1 — Reflector
     try:
         from openjarvis.learning.reflector import reflect_async as _reflect_async
@@ -1607,7 +1798,7 @@ def _fire_post_turn_hooks_safe(*, request, latest_user_text: str,
             session_id=session_id,
             user_text=latest_user_text,
             assistant_text=assistant_text,
-            domain="general",
+            domain=inferred_domain,
             complexity=complexity_score,
         )
     except Exception:
@@ -1626,26 +1817,27 @@ def _fire_post_turn_hooks_safe(*, request, latest_user_text: str,
                 )
             )
             if looks_failed:
-                import threading as _threading
-                def _queue_distillation():
-                    try:
-                        from openjarvis.learning.distillation.orchestrator import DistillationOrchestrator
-                        from openjarvis.learning.distillation.triggers import OnDemandTrigger
-                        trigger = OnDemandTrigger(
-                            turn={"user": latest_user_text[:1200],
-                                  "assistant": assistant_text[:2400],
-                                  "session_id": session_id},
-                        )
-                        DistillationOrchestrator().run(trigger)
-                        logging.getLogger("openjarvis.server").info(
-                            "openjarvis.distiller.queued session=%s", session_id,
-                        )
-                    except Exception as _dexc:
-                        logging.getLogger("openjarvis.server").debug(
-                            "distiller queue failed: %s", _dexc,
-                        )
-                _threading.Thread(target=_queue_distillation,
-                                  name="openjarvis-distiller-queue",
-                                  daemon=True).start()
+                # Round 5.9 — corpus-shim distiller. Replaces the previous
+                # DistillationOrchestrator() call which crashed at construction
+                # (it requires 9 dependency singletons not built today). The
+                # shim writes a structured JSONL record per failed turn,
+                # producing real, verifiable training data.
+                try:
+                    from openjarvis.learning import online_distiller as _od
+                    # We don't have a full reflection here (this fires before
+                    # reflector finishes its async critique), so synthesise
+                    # one with the explicit_failed flag set.
+                    _od.queue(
+                        {"confidence": 0.0, "success": False, "refusal_risk": True,
+                         "tags": ["explicit-failure-marker"], "domain": inferred_domain},
+                        user_text=latest_user_text,
+                        assistant_text=assistant_text,
+                        session_id=session_id,
+                        explicit_failed=True,
+                    )
+                except Exception as _dexc:
+                    logging.getLogger("openjarvis.server").debug(
+                        "online_distiller queue failed: %s", _dexc,
+                    )
     except Exception:
         pass

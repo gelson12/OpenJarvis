@@ -56,12 +56,22 @@ _AGENTIC_FLAGS = (
     "OPENJARVIS_GOALS_ENABLED",
     "OPENJARVIS_PROMPT_EVOLVER_ENABLED",
     "OPENJARVIS_SKILL_PLANNER_ENABLED",
+    "OPENJARVIS_HERMES_ROUTE",
     # Round 4 layers
     "OPENJARVIS_ANSWER_CACHE_ENABLED",
     "OPENJARVIS_WATCHDOG_ENABLED",
     "OPENJARVIS_WATCHDOG_AUTOROLLBACK",
     "OPENJARVIS_MODEL_PREFERENCE_ENABLED",
     "OPENJARVIS_COST_TELEMETRY_ENABLED",
+    # Round 5 closed-loop + bonus layers
+    "OPENJARVIS_ANSWER_CACHE_LOOKUP_ENABLED",
+    "OPENJARVIS_MODEL_PREFERENCE_TIEBREAK_ENABLED",
+    "OPENJARVIS_HYBRID_ROUTING_ENABLED",
+    "OPENJARVIS_HYBRID_COMPLEXITY_CONSENSUS",
+    "OPENJARVIS_ONLINE_DISTILLER_ENABLED",
+    "OPENJARVIS_SPECULATIVE_RACE_ENABLED",
+    "OPENJARVIS_TEMP_TUNER_ENABLED",
+    "OPENJARVIS_SKILL_PROPOSER_ENABLED",
     "OPENJARVIS_HOME",
 )
 
@@ -369,6 +379,59 @@ def _probe_cost_telemetry() -> Dict[str, Any]:
     return out
 
 
+def _probe_online_distiller() -> Dict[str, Any]:
+    try:
+        from openjarvis.learning import online_distiller as _od
+        return _od.stats()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _probe_hybrid_router() -> Dict[str, Any]:
+    try:
+        from openjarvis.learning.routing import hybrid as _h
+        return _h.snapshot()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _probe_speculative() -> Dict[str, Any]:
+    try:
+        from openjarvis.learning import speculative as _s
+        return _s.snapshot()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _probe_temp_tuner() -> Dict[str, Any]:
+    try:
+        from openjarvis.learning import temperature_tuner as _t
+        return _t.snapshot()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _probe_skill_proposer() -> Dict[str, Any]:
+    try:
+        from openjarvis.learning import skill_proposer as _sp
+        return _sp.snapshot()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _probe_domain_classifier() -> Dict[str, Any]:
+    try:
+        from openjarvis.learning.domain_classifier import infer_domain, all_known_domains
+        samples = {
+            "What is 2+2?": infer_domain("What is 2+2?"),
+            "How do I reverse a string in Python?": infer_domain("How do I reverse a string in Python?"),
+            "Translate hello to Spanish": infer_domain("Translate hello to Spanish"),
+        }
+        return {"enabled": True, "domains": all_known_domains(), "samples": samples}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def _probe_eval() -> Dict[str, Any]:
     """Quick TauBench mini-run — 3 trials max to keep latency reasonable."""
     out: Dict[str, Any] = {"available": False}
@@ -411,6 +474,12 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
     watchdog_block = _probe_watchdog()
     model_pref_block = _probe_model_preference()
     cost_block = _probe_cost_telemetry()
+    online_distiller_block = _probe_online_distiller()
+    hybrid_block = _probe_hybrid_router()
+    speculative_block = _probe_speculative()
+    temp_tuner_block = _probe_temp_tuner()
+    skill_proposer_block = _probe_skill_proposer()
+    domain_classifier_block = _probe_domain_classifier()
     eval_block = _probe_eval()
 
     return {
@@ -428,5 +497,110 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
         "watchdog": watchdog_block,
         "model_preference": model_pref_block,
         "cost_telemetry": cost_block,
+        # Round 5 closed-loop + bonus layers
+        "online_distiller": online_distiller_block,
+        "hybrid_router": hybrid_block,
+        "speculative": speculative_block,
+        "temperature_tuner": temp_tuner_block,
+        "skill_proposer": skill_proposer_block,
+        "domain_classifier": domain_classifier_block,
         "eval": eval_block,
     }
+
+
+# ---------------------------------------------------------------------------
+# Round 5.10 — manual safe-restore for watchdog autorollback
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/_debug/watchdog/restore")
+async def watchdog_restore() -> Dict[str, Any]:
+    """Re-enable the most recently autorolled-back flag. Manual rescue when
+    autorollback misfires under transient bad data."""
+    try:
+        from openjarvis.learning import watchdog as _wd
+        rollbacks = list(_wd._ROLLBACKS)
+        if not rollbacks:
+            return {"restored": False, "reason": "no rollback history"}
+        last = rollbacks[-1]
+        flag = last.get("flag")
+        prev_value = last.get("from")
+        if not flag or prev_value is None:
+            return {"restored": False, "reason": "rollback record missing flag/from"}
+        os.environ[flag] = prev_value
+        return {"restored": True, "flag": flag, "value": prev_value, "from_rollback": last}
+    except Exception as e:
+        return {"restored": False, "error": f"{type(e).__name__}: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# Round 5.12 — real-traffic verification probe
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/_debug/agentic/real_traffic")
+async def real_traffic(request: Request) -> Dict[str, Any]:
+    """Self-test: POST a canned query through /v1/chat/completions and check
+    that reflector + cost_telemetry actually fired. Proves HERMES_ROUTE=off
+    doesn't silently break the agentic fan-out."""
+    import asyncio as _asyncio
+    out: Dict[str, Any] = {"chat_ok": False, "reflector_fired": False,
+                           "cost_recorded": False, "latency_ms": 0,
+                           "all_green": False}
+    started = time.time()
+    session_id = f"real-traffic-{int(started)}"
+    canned_query = "What is the capital of France?"
+    try:
+        import httpx
+        port = os.environ.get("PORT", "8642")
+        user = os.environ.get("OPENJARVIS_BASIC_AUTH_USER", "")
+        pwd = os.environ.get("OPENJARVIS_BASIC_AUTH_PASSWORD", "")
+        auth = (user, pwd) if user else None
+        # Baseline cost call count before request
+        try:
+            from openjarvis.learning import cost_telemetry as _ct
+            cost_before = (_ct.snapshot() or {}).get("total_calls", 0)
+        except Exception:
+            cost_before = -1
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"http://localhost:{port}/v1/chat/completions",
+                json={"model": os.environ.get("OPENJARVIS_EVAL_MODEL", "openrouter/google/gemini-2.5-flash"),
+                      "messages": [{"role": "user", "content": canned_query}],
+                      "max_tokens": 80, "temperature": 0.0, "stream": False},
+                auth=auth,
+                headers={"X-OpenJarvis-Session-Id": session_id},
+            )
+        out["chat_status"] = resp.status_code
+        out["chat_ok"] = (resp.status_code == 200)
+        if out["chat_ok"]:
+            try:
+                out["chat_answer_preview"] = (resp.json()["choices"][0]["message"]["content"] or "")[:120]
+            except Exception:
+                out["chat_answer_preview"] = "<parse-failed>"
+        # Reflector fires in a background thread; wait a bit
+        await _asyncio.sleep(5.0)
+        try:
+            from openjarvis.learning import reflector as _ref
+            ref = _ref.last_reflection(session_id)
+            if ref:
+                out["reflector_fired"] = True
+                out["reflection"] = {
+                    "confidence": ref.get("confidence"),
+                    "success": ref.get("success"),
+                    "domain": ref.get("domain"),
+                    "tags": ref.get("tags"),
+                }
+        except Exception as e:
+            out["reflector_error"] = f"{type(e).__name__}: {e}"
+        try:
+            from openjarvis.learning import cost_telemetry as _ct2
+            cost_after = (_ct2.snapshot() or {}).get("total_calls", 0)
+            out["cost_recorded"] = cost_before >= 0 and cost_after > cost_before
+            out["cost_delta"] = cost_after - cost_before if cost_before >= 0 else None
+        except Exception:
+            pass
+        out["all_green"] = bool(out["chat_ok"] and out["reflector_fired"] and out["cost_recorded"])
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    out["latency_ms"] = int((time.time() - started) * 1000)
+    out["session_id"] = session_id
+    return out

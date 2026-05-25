@@ -347,6 +347,21 @@ def _do_reflect(session_id: str, user_text: str, assistant_text: str,
     except Exception as exc:
         logger.debug("reflector: answer_cache dispatch failed: %s", exc)
 
+    # Round 5.9 — Online distiller corpus shim
+    try:
+        from openjarvis.learning import online_distiller as _od
+        _od.queue(norm, user_text=user_text, assistant_text=assistant_text,
+                  session_id=session_id)
+    except Exception as exc:
+        logger.debug("reflector: online_distiller dispatch failed: %s", exc)
+
+    # Round 5 BONUS-B — reflection-driven temperature tuner
+    try:
+        from openjarvis.learning import temperature_tuner as _tt
+        _tt.record(norm["domain"], norm["confidence"], norm["success"])
+    except Exception as exc:
+        logger.debug("reflector: temperature_tuner dispatch failed: %s", exc)
+
 
 def reflect_async(*, session_id: str, user_text: str, assistant_text: str,
                   domain: str = "general", complexity: Optional[float] = None) -> None:

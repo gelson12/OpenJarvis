@@ -83,16 +83,13 @@ def _heuristic_score(answer: str, expected: List[str]) -> bool:
     return any(k.lower() in a for k in expected)
 
 
-async def _run_one(engine: Any, item: Dict[str, Any]) -> Dict[str, Any]:
+async def _run_one_engine(engine: Any, item: Dict[str, Any]) -> Dict[str, Any]:
+    """Direct engine.generate path — fast, bypasses the agentic stack."""
     started = time.time()
     out: Dict[str, Any] = {
-        "id": item["id"],
-        "domain": item["domain"],
-        "q": item["q"],
-        "ok": False,
-        "answer_len": 0,
-        "latency_ms": 0,
-        "error": None,
+        "id": item["id"], "domain": item["domain"], "q": item["q"],
+        "ok": False, "answer_len": 0, "latency_ms": 0, "error": None,
+        "via": "engine",
     }
     if engine is None:
         out["error"] = "no engine"
@@ -100,11 +97,8 @@ async def _run_one(engine: Any, item: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from openjarvis.core.types import Message, Role
         msgs = [Message(role=Role.USER, content=item["q"] or "(empty)")]
-        # Use a stable cheap model — the goal is consistency, not picking
-        # the perfect model per query.
         model = os.environ.get("OPENJARVIS_EVAL_MODEL", "openrouter/google/gemini-2.5-flash")
         result = engine.generate(msgs, model=model, max_tokens=200, temperature=0.0)
-        # Extract text
         text = ""
         if isinstance(result, dict):
             for k in ("content", "text", "output", "response", "answer"):
@@ -124,14 +118,70 @@ async def _run_one(engine: Any, item: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-async def _run_suite(engine: Any, *, n: int) -> Dict[str, Any]:
+async def _run_one_chat(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Full-stack path — POSTs to /v1/chat/completions on this same instance.
+    Exercises every Round 4+5 layer (cache, skill_planner, hybrid router,
+    orchestrator, reflector fan-out). Round 5.5."""
+    started = time.time()
+    out: Dict[str, Any] = {
+        "id": item["id"], "domain": item["domain"], "q": item["q"],
+        "ok": False, "answer_len": 0, "latency_ms": 0, "error": None,
+        "via": "chat",
+    }
+    try:
+        import httpx
+        port = os.environ.get("PORT", "8642")
+        user = os.environ.get("OPENJARVIS_BASIC_AUTH_USER", "")
+        pwd = os.environ.get("OPENJARVIS_BASIC_AUTH_PASSWORD", "")
+        auth = (user, pwd) if user else None
+        model = os.environ.get("OPENJARVIS_EVAL_MODEL", "openrouter/google/gemini-2.5-flash")
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": item["q"] or "(empty)"}],
+            "max_tokens": 200,
+            "temperature": 0.0,
+            "stream": False,
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"http://localhost:{port}/v1/chat/completions",
+                json=payload, auth=auth,
+                headers={"X-OpenJarvis-Session-Id": f"eval-{item['id']}"},
+            )
+        if resp.status_code != 200:
+            out["error"] = f"http {resp.status_code}: {resp.text[:120]}"
+        else:
+            data = resp.json()
+            text = ""
+            try:
+                text = data["choices"][0]["message"]["content"] or ""
+            except Exception:
+                text = ""
+            out["answer_len"] = len(text)
+            out["answer_preview"] = text[:160]
+            out["ok"] = _heuristic_score(text, item.get("expected", []))
+            out["cache_hit"] = resp.headers.get("X-OpenJarvis-Cache") == "hit"
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        out["latency_ms"] = int((time.time() - started) * 1000)
+    return out
+
+
+async def _run_one(engine: Any, item: Dict[str, Any], *, via: str = "engine") -> Dict[str, Any]:
+    if via == "chat":
+        return await _run_one_chat(item)
+    return await _run_one_engine(engine, item)
+
+
+async def _run_suite(engine: Any, *, n: int, via: str = "engine") -> Dict[str, Any]:
     started = time.time()
     items = _MINI_SUITE[:max(1, min(n, len(_MINI_SUITE)))]
     # Run sequentially — parallel would skew latency measurements + risk
     # rate-limits on free providers.
     results: List[Dict[str, Any]] = []
     for item in items:
-        results.append(await _run_one(engine, item))
+        results.append(await _run_one(engine, item, via=via))
     n_total = len(results)
     n_ok = sum(1 for r in results if r["ok"])
     n_err = sum(1 for r in results if r.get("error"))
@@ -193,9 +243,10 @@ def _compute_delta(current: Dict[str, Any], baseline: Dict[str, Any]) -> Dict[st
 
 @router.get("/v1/_debug/eval/mini")
 async def eval_mini(request: Request, n: int = Query(20, ge=1, le=20),
-                    baseline_label: str = Query("", max_length=48)) -> Dict[str, Any]:
+                    baseline_label: str = Query("", max_length=48),
+                    via: str = Query("engine", regex="^(engine|chat)$")) -> Dict[str, Any]:
     engine = getattr(request.app.state, "engine", None)
-    current = await _run_suite(engine, n=n)
+    current = await _run_suite(engine, n=n, via=via)
     response: Dict[str, Any] = {"current": current}
     if baseline_label:
         path = _baseline_path(baseline_label)
@@ -214,9 +265,10 @@ async def eval_mini(request: Request, n: int = Query(20, ge=1, le=20),
 @router.post("/v1/_debug/eval/mini/baseline")
 async def save_baseline(request: Request,
                         label: str = Query("default", max_length=48),
-                        n: int = Query(20, ge=1, le=20)) -> Dict[str, Any]:
+                        n: int = Query(20, ge=1, le=20),
+                        via: str = Query("engine", regex="^(engine|chat)$")) -> Dict[str, Any]:
     engine = getattr(request.app.state, "engine", None)
-    current = await _run_suite(engine, n=n)
+    current = await _run_suite(engine, n=n, via=via)
     path = _baseline_path(label)
     try:
         path.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
