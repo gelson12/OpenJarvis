@@ -257,70 +257,41 @@ def create_app(
     app.include_router(debug_agentic_router)
     include_all_routes(app)
 
-    # Restore SendBlue channel bindings from database on startup
-    _restore_sendblue_bindings(app)
+    # ──────────────────────────────────────────────────────────────────────
+    # Round 1 — AGENTIC ACTIVATION (synchronous, logs visible at startup).
+    # Previous attempt put these in `@app.on_event("startup")` hooks but
+    # the hooks didn't produce visible logs in production (likely Starlette
+    # deprecation or output ordering issue).  Running them inline here so
+    # failures are immediately visible in container logs.
+    # ──────────────────────────────────────────────────────────────────────
 
-    # Hydrate the elaboration store from Postgres if persistence is configured
-    @app.on_event("startup")
-    async def _hydrate_elaborations() -> None:
-        try:
-            from openjarvis.server.elaboration_store import get_store
-            await get_store().hydrate_from_postgres()
-        except Exception as exc:
-            logger.warning("Elaboration hydration skipped: %s", exc)
+    # 1a — Reflector engine reference
+    try:
+        from openjarvis.learning import reflector as _ref_module
+        _ref_module.set_engine(engine)
+        logger.warning("openjarvis.reflector.engine_wired engine=%s", type(engine).__name__)
+    except Exception as exc:
+        logger.warning("openjarvis.reflector.engine_wired_FAILED: %s", exc)
 
-    # Round 2.1 — wire the engine reference into the reflector module so it
-    # can call the real InferenceEngine for post-turn critiques without
-    # needing the per-request app context.  Fires once at startup; the
-    # reflector then re-uses the same engine instance for the lifetime of
-    # the process.
-    @app.on_event("startup")
-    async def _wire_reflector_engine() -> None:
-        try:
-            from openjarvis.learning import reflector as _ref
-            _ref.set_engine(getattr(app.state, "engine", None))
-            logger.info("openjarvis.reflector.engine_wired ok")
-        except Exception as exc:
-            logger.warning("Reflector engine wiring skipped: %s", exc)
-
-    # Round 1.1 — Skills auto-load.  When OPENJARVIS_SKILLS_AUTOLOAD_ENABLED=true,
-    # discover all TOML/MD skills at startup so the skill_planner short-circuit
-    # (Round 3.3) and the agent's tool-list both see them.  Best-effort; never
-    # blocks startup.
-    @app.on_event("startup")
-    async def _autoload_skills() -> None:
-        if os.getenv("OPENJARVIS_SKILLS_AUTOLOAD_ENABLED", "false").lower() not in (
-            "1", "true", "yes", "on",
-        ):
-            return
+    # 1b — Skills auto-load
+    if os.getenv("OPENJARVIS_SKILLS_AUTOLOAD_ENABLED", "false").lower() in (
+        "1", "true", "yes", "on",
+    ):
         try:
             from openjarvis.skills.manager import SkillManager
-            # SkillManager requires an EventBus.  Reuse the app's bus when
-            # available; otherwise instantiate a throwaway local bus so
-            # discovery still completes.
-            bus = getattr(app.state, "bus", None)
-            if bus is None:
-                try:
-                    from openjarvis.core.bus import EventBus
-                    bus = EventBus()
-                except Exception:
-                    bus = None
-            mgr = SkillManager(bus) if bus is not None else None
-            if mgr is None:
-                logger.warning("Skills auto-load skipped: no EventBus available")
-                return
-            # SkillManager.discover() loads zero skills when paths=None.
-            # Resolve the bundled `src/openjarvis/skills/data/` dir which
-            # ships 17 TOML skill recipes (backup-files, calendar-prep,
-            # code-lint, daily-digest, email-draft, etc.).
+            from openjarvis.core.bus import EventBus
+            bus = getattr(app.state, "bus", None) or EventBus()
+            mgr = SkillManager(bus)
             from pathlib import Path as _Path
             import openjarvis.skills as _skills_pkg
             bundled_dir = _Path(_skills_pkg.__file__).parent / "data"
+            toml_count = len(list(bundled_dir.glob("*.toml"))) if bundled_dir.exists() else -1
+            logger.warning(
+                "openjarvis.skills_autoload bundled_dir=%s exists=%s toml_files=%d",
+                bundled_dir, bundled_dir.exists(), toml_count,
+            )
             mgr.discover(paths=[bundled_dir])
-            # Cache the manager on app.state so the request-time tool
-            # registry + skill_planner can reuse it without re-discovering.
             app.state.skill_manager = mgr
-            # Count skills if the manager exposes a way to introspect.
             count = 0
             for attr in ("get_all", "list_skills", "all_skills", "skills"):
                 obj = getattr(mgr, attr, None)
@@ -333,9 +304,21 @@ def create_app(
                 elif isinstance(obj, (list, dict)) and obj:
                     count = len(obj)
                     break
-            logger.info("openjarvis.skills_autoload count=%d", count)
+            logger.warning("openjarvis.skills_autoload loaded_count=%d", count)
         except Exception as exc:
-            logger.warning("Skills auto-load skipped: %s", exc)
+            logger.warning("openjarvis.skills_autoload_FAILED: %s", exc, exc_info=True)
+
+    # Restore SendBlue channel bindings from database on startup
+    _restore_sendblue_bindings(app)
+
+    # Hydrate the elaboration store from Postgres if persistence is configured
+    @app.on_event("startup")
+    async def _hydrate_elaborations() -> None:
+        try:
+            from openjarvis.server.elaboration_store import get_store
+            await get_store().hydrate_from_postgres()
+        except Exception as exc:
+            logger.warning("Elaboration hydration skipped: %s", exc)
 
     # Add security headers middleware
     try:
