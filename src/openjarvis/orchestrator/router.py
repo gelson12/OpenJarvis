@@ -677,6 +677,27 @@ async def run_all(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             except Exception as e:
                 logger.debug(f"Task failed: {e}")
 
+        # Best-effort cost telemetry — token counts are estimated from chars
+        # (rough ~4 chars/token) since most providers here don't return usage.
+        try:
+            from openjarvis.learning import cost_telemetry as _ct
+            for r in clean:
+                model = r.get("model") or "unknown"
+                text = r.get("text") or ""
+                est_out = max(1, len(text) // 4)
+                est_in = max(1, sum(len(m.get("content", "")) for m in messages) // 4)
+                _ct.record(
+                    provider=model.split("/")[0] if "/" in model else model,
+                    model=model,
+                    tokens_in=est_in,
+                    tokens_out=est_out,
+                    latency_ms=0,
+                    success=True,
+                    role="orchestrator",
+                )
+        except Exception:
+            pass
+
         return clean if clean else [{"model": "unknown", "text": "All models failed or timed out"}]
 
 

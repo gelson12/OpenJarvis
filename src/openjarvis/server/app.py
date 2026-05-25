@@ -21,6 +21,8 @@ from openjarvis.server.integrations_routes import router as integrations_router
 from openjarvis.server.providers_routes import router as providers_router
 from openjarvis.server.routes import router
 from openjarvis.server.debug_agentic import router as debug_agentic_router
+from openjarvis.server.debug_dashboard import router as debug_dashboard_router
+from openjarvis.server.eval_endpoint import router as eval_endpoint_router
 from openjarvis.server.upload_router import router as upload_router
 
 logger = logging.getLogger(__name__)
@@ -255,6 +257,10 @@ def create_app(
     # /v1/_debug/agentic — synchronous probe of every Tier 1+2 agentic layer.
     # Intentionally low-cost (no heavy LLM calls except orchestrator).
     app.include_router(debug_agentic_router)
+    # /v1/_debug/dashboard — live HTML status view (auto-refresh every 15s)
+    app.include_router(debug_dashboard_router)
+    # /v1/_debug/eval/mini — self-contained mini-benchmark for outclass delta
+    app.include_router(eval_endpoint_router)
     include_all_routes(app)
 
     # ──────────────────────────────────────────────────────────────────────

@@ -56,6 +56,12 @@ _AGENTIC_FLAGS = (
     "OPENJARVIS_GOALS_ENABLED",
     "OPENJARVIS_PROMPT_EVOLVER_ENABLED",
     "OPENJARVIS_SKILL_PLANNER_ENABLED",
+    # Round 4 layers
+    "OPENJARVIS_ANSWER_CACHE_ENABLED",
+    "OPENJARVIS_WATCHDOG_ENABLED",
+    "OPENJARVIS_WATCHDOG_AUTOROLLBACK",
+    "OPENJARVIS_MODEL_PREFERENCE_ENABLED",
+    "OPENJARVIS_COST_TELEMETRY_ENABLED",
     "OPENJARVIS_HOME",
 )
 
@@ -323,6 +329,46 @@ def _probe_prompt_evolver() -> Dict[str, Any]:
     return out
 
 
+def _probe_answer_cache() -> Dict[str, Any]:
+    out: Dict[str, Any] = {"enabled": False}
+    try:
+        from openjarvis.learning import answer_cache as _ac
+        return _ac.stats()
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _probe_watchdog() -> Dict[str, Any]:
+    out: Dict[str, Any] = {"enabled": False}
+    try:
+        from openjarvis.learning import watchdog as _wd
+        return _wd.health_snapshot()
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _probe_model_preference() -> Dict[str, Any]:
+    out: Dict[str, Any] = {"enabled": False}
+    try:
+        from openjarvis.learning import model_preference as _mp
+        return _mp.snapshot()
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _probe_cost_telemetry() -> Dict[str, Any]:
+    out: Dict[str, Any] = {"enabled": False}
+    try:
+        from openjarvis.learning import cost_telemetry as _ct
+        return _ct.snapshot()
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def _probe_eval() -> Dict[str, Any]:
     """Quick TauBench mini-run — 3 trials max to keep latency reasonable."""
     out: Dict[str, Any] = {"available": False}
@@ -361,6 +407,10 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
     orchestrator_block = await _probe_orchestrator()
     distiller_block = _probe_distiller()
     evolver_block = _probe_prompt_evolver()
+    answer_cache_block = _probe_answer_cache()
+    watchdog_block = _probe_watchdog()
+    model_pref_block = _probe_model_preference()
+    cost_block = _probe_cost_telemetry()
     eval_block = _probe_eval()
 
     return {
@@ -374,5 +424,9 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
         "orchestrator": orchestrator_block,
         "distiller": distiller_block,
         "prompt_evolver": evolver_block,
+        "answer_cache": answer_cache_block,
+        "watchdog": watchdog_block,
+        "model_preference": model_pref_block,
+        "cost_telemetry": cost_block,
         "eval": eval_block,
     }

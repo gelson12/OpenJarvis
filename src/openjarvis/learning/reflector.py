@@ -303,6 +303,50 @@ def _do_reflect(session_id: str, user_text: str, assistant_text: str,
         norm["follow_up_needed"], norm["tags"],
     )
 
+    # ──────────────────────────────────────────────────────────────────
+    # Round 4 fan-out: feed the new agentic layers from the reflection.
+    # Each call is wrapped — a failure in one downstream consumer must not
+    # cause the others to skip. All are best-effort and gated by their
+    # own env flags inside the callee.
+    # ──────────────────────────────────────────────────────────────────
+    try:
+        from openjarvis.learning import watchdog as _watchdog
+        _watchdog.record(
+            confidence=norm["confidence"],
+            success=norm["success"],
+            domain=norm["domain"],
+            session_id=session_id,
+        )
+    except Exception as exc:
+        logger.debug("reflector: watchdog dispatch failed: %s", exc)
+
+    try:
+        from openjarvis.learning import model_preference as _modelpref
+        # Best-effort model attribution — we don't have the live model name
+        # in this scope, but the orchestrator/main path records its own.
+        # Here we just bump the (domain, "reflection-source") counter so the
+        # learner has at least domain-level signal for ranking.
+        _modelpref.record(
+            domain=norm["domain"],
+            model=os.environ.get("OPENJARVIS_REFLECTOR_MODEL", "openrouter/google/gemini-2.5-flash"),
+            success=norm["success"],
+            confidence=norm["confidence"],
+        )
+    except Exception as exc:
+        logger.debug("reflector: model_preference dispatch failed: %s", exc)
+
+    try:
+        from openjarvis.learning import answer_cache as _cache
+        _cache.maybe_store(
+            query=user_text,
+            answer=assistant_text,
+            domain=norm["domain"],
+            confidence=norm["confidence"],
+            success=norm["success"],
+        )
+    except Exception as exc:
+        logger.debug("reflector: answer_cache dispatch failed: %s", exc)
+
 
 def reflect_async(*, session_id: str, user_text: str, assistant_text: str,
                   domain: str = "general", complexity: Optional[float] = None) -> None:
