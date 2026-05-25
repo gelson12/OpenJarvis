@@ -75,6 +75,7 @@ except Exception as _exc:  # noqa: BLE001
     )
 
 import search_tools
+from resource_ledger import ResourceLedger
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -182,25 +183,30 @@ def _camera_intent(text: str):
     return None
 
 
-# Matches the noun-phrase only. Conservative — requires the exact two-word
-# phrase so a stray "gesture" in conversation doesn't toggle the mode.
-_GESTURE_MODE_RE = re.compile(
-    r"\b(gesture\s+mode|hand\s+tracking|gesture\s+control)\b", re.I
+# ── Gesture mode ─────────────────────────────────────────────────────
+# Full-screen camera overlay blended into the HUD; hand gestures drive
+# the widgets. Toggled by voice ("turn on/off gesture mode"); when
+# turning on we force the camera publication on too so MediaPipe has
+# frames.
+_GESTURE_MODE_WORD = re.compile(r"\bgesture(?:\s+mode|\s+control)?\b", re.I)
+_GESTURE_MODE_OFF = re.compile(
+    r"\b(off|disable|stop|exit|leave|cancel|hide|turn it off)\b", re.I
+)
+_GESTURE_MODE_ON = re.compile(
+    r"\b(on|enable|start|activate|enter|begin|turn it on)\b", re.I
 )
 
 
 def _gesture_mode_intent(text: str):
-    """Return True (turn on), False (turn off), or None (not a gesture-mode cmd).
+    """Return True (turn on), False (turn off), or None.
 
-    Reuses _CAM_ON / _CAM_OFF as the polarity vocabulary so the toggle
-    phrasing stays uniform across modes ("turn on", "enable", "start"
-    etc.). 'off' wins if both polarities appear.
+    "off" wins on conflict — "turn off gesture mode" is unambiguous.
     """
-    if not text or not _GESTURE_MODE_RE.search(text):
+    if not text or not _GESTURE_MODE_WORD.search(text):
         return None
-    if _CAM_OFF.search(text):
+    if _GESTURE_MODE_OFF.search(text):
         return False
-    if _CAM_ON.search(text):
+    if _GESTURE_MODE_ON.search(text):
         return True
     return None
 
@@ -441,26 +447,6 @@ _WEBSEARCH_RE = re.compile(
     r"\b(?:search\s+(?:the\s+)?(?:web|internet|google)|google|look\s+up|"
     r"web\s+search|search\s+for)\b", re.I
 )
-# v0.dev website generation. Conservative — must have a build-verb AND
-# a site-noun in the same utterance so "search for site builders" or
-# "build me a sandwich" don't trigger.
-_SITE_BUILD_RE = re.compile(
-    r"\b(?:build|design|create|make|generate|spin\s+up|set\s+up|whip\s+up)\b"
-    r"[^.]*?"
-    r"\b(?:website|web\s*site|site|landing\s+page|webpage|web\s*page|app)\b",
-    re.I,
-)
-# Pulls preview URL out of the v0 assistant message. Mirrors the regex
-# already in src/openjarvis/tools/v0_tools.py:28 — kept inline so the
-# worker doesn't need to import server-side modules.
-_V0_PREVIEW_URL_RE = re.compile(
-    r"https?://(?:v0\.dev/chat/|[a-z0-9-]+\.vusercontent\.net/?|"
-    r"[a-z0-9-]+\.vercel\.app/?)\S*",
-    re.IGNORECASE,
-)
-V0_API_BASE = os.environ.get("V0_API_BASE", "https://api.v0.dev/v1")
-V0_MODEL = os.environ.get("V0_MODEL", "v0-1.5-md")
-
 # An explicit "put it on screen" verb. The bare nouns `news`/`maps` match
 # far too eagerly ("any news on my project" should be answered, not turned
 # into a news panel), so those two intents additionally require this verb.
@@ -509,6 +495,41 @@ def _clean_query(text: str) -> str:
     return q
 
 
+# ── Noisy-transcript detection ──────────────────────────────────────
+# A content-intent topic ("news on X") that contains imperative fragments
+# ("fix that", "also, the…") or stacked commas is almost certainly a
+# garbled STT result, not what the user actually meant. We refuse to
+# dispatch on it and ask a clarifying question instead.
+_NOISY_TOPIC_RE = re.compile(
+    r"\b(?:fix\s+(?:that|this|it)|do\s+that|also[,]?|by\s+the\s+way|"
+    r"never\s*mind|nevermind|stop|wait|hold\s+on|cancel|forget\s+it|"
+    r"hmm+|uh+|um+|like\s+i\s+said)\b",
+    re.I,
+)
+
+
+def _topic_looks_noisy(arg: str) -> bool:
+    """Heuristic: does this cleaned topic look like STT noise, not a query?
+
+    Triggers when the topic:
+      - is suspiciously long (> 8 words / > 60 chars after cleaning)
+      - contains an imperative fragment (`fix that` / `also,` / filler)
+      - has 2+ commas (multi-clause sentence stitched into the topic)
+    """
+    a = (arg or "").strip()
+    if not a:
+        return False  # empty is fine — handled as "top of category"
+    if len(a) > 60:
+        return True
+    if len(a.split()) > 8:
+        return True
+    if a.count(",") >= 2:
+        return True
+    if _NOISY_TOPIC_RE.search(a):
+        return True
+    return False
+
+
 def _content_intent(text: str):
     """Detect a HUD content intent. Returns ``(kind, arg)`` or ``None``.
 
@@ -548,29 +569,9 @@ def _content_intent(text: str):
         q = re.sub(r"\b(?:videos?|clips?|footage)\b", " ", q, flags=re.I)
         return ("youtube", _clean_query(q))
 
-    if _NEWS_RE.search(low) and (
-        _CONTENT_VERB.search(low)
-        or "headlines" in low
-        # Bare-noun triggers so "what's the news", "any news",
-        # "tell me the news", "catch me up", "latest news" all
-        # fire the handler. The bare-noun protection (don't react
-        # to "any news on my project") is preserved by the explicit
-        # phrase set below — we only fire on these specific stems.
-        or re.search(
-            r"\b(?:what(?:'?s)?|what\s+is|any|tell\s+me|"
-            r"catch\s+me\s+up|update\s+me|latest|breaking)\b",
-            low,
-        )
-    ):
+    if _NEWS_RE.search(low) and (_CONTENT_VERB.search(low) or "headlines" in low):
         q = re.sub(r"\b(?:news|headlines)\b|\b(?:about|on|regarding)\b",
                    " ", t, flags=re.I)
-        # Strip the new trigger stems too, so "what's the news" → ""
-        # (no topic = top headlines), "any news on Ukraine" → "Ukraine".
-        q = re.sub(
-            r"\b(?:what(?:'?s)?|what\s+is|any|tell\s+me|"
-            r"catch\s+me\s+up|update\s+me|latest|breaking)\b",
-            " ", q, flags=re.I,
-        )
         return ("news", _clean_query(q))
 
     if _MAP_RE.search(low) and (
@@ -582,21 +583,6 @@ def _content_intent(text: str):
         q = _clean_query(q)
         q = re.sub(r"^(?:of|to|for|the)\s+", "", q, flags=re.I).strip()
         return ("maps", q)
-
-    # v0.dev website generation — BEFORE websearch so "create a site
-    # for cats" doesn't get caught as a web search.
-    if _SITE_BUILD_RE.search(low):
-        q = re.sub(
-            r"\b(?:build|design|create|make|generate|spin\s+up|set\s+up|whip\s+up)\b",
-            " ", t, flags=re.I,
-        )
-        q = re.sub(
-            r"\b(?:website|web\s*site|site|landing\s+page|webpage|web\s*page|app)\b",
-            " ", q, flags=re.I,
-        )
-        q = re.sub(r"\b(?:me|a|an|the|that|which|for|about)\b", " ",
-                   q, flags=re.I)
-        return ("v0", _clean_query(q))
 
     if _WEBSEARCH_RE.search(low):
         return ("web", _clean_query(t))
@@ -1168,6 +1154,16 @@ Available OpenCTI commands (use `command` and `args`):
 
   cti_summary       {"hours": 24}     # rollup of new objects in window
   cti_list_indicators {"limit": 10}
+  cti_enrich        {"value": "<observable value>",
+                     "observable_type": "domain"|"ip"|"ipv6"|"url"
+                                       |"email"|"md5"|"sha1"|"sha256"
+                                       |"hash"|"file"|"user-agent"
+                                       |"mutex"|"registry-key"}
+                    Add the observable AND wait ~30s for enrichment
+                    connectors (VirusTotal, AbuseIPDB, Shodan, etc.)
+                    to fire, then report the findings. Use for:
+                    "enrich X", "look up X", "scan X", "check X
+                    against threat intel", "is X malicious".
   cti_open_panel    {"dashboard": "<slug>", "path": "<optional URL path>"}
                     Mount the on-screen Intelligence panel; optional
                     deep-link path like "/dashboard/threats".
@@ -1535,6 +1531,95 @@ class OpenCTIClient:
             ],
         }
 
+    async def get_observable(self, obs_id: str) -> dict:
+        """Fetch the live state of one observable — its score, the
+        external references that enrichment connectors have attached,
+        and any labels (verdicts) they wrote back."""
+        gql = """
+        query GetObs($id: String!) {
+          stixCyberObservable(id: $id) {
+            id
+            observable_value
+            entity_type
+            x_opencti_score
+            externalReferences {
+              edges {
+                node {
+                  source_name
+                  url
+                  description
+                }
+              }
+            }
+            objectLabel {
+              value
+              color
+            }
+          }
+        }
+        """
+        data = await self._gql(gql, {"id": obs_id})
+        obs = data.get("stixCyberObservable") or {}
+        refs = (obs.get("externalReferences") or {}).get("edges") or []
+        labels = obs.get("objectLabel") or []
+        return {
+            "id": obs.get("id"),
+            "value": obs.get("observable_value"),
+            "type": obs.get("entity_type"),
+            "score": obs.get("x_opencti_score"),
+            "refs": [
+                {
+                    "source": (e.get("node") or {}).get("source_name"),
+                    "url": (e.get("node") or {}).get("url"),
+                    "description": (
+                        (e.get("node") or {}).get("description") or ""
+                    )[:200],
+                }
+                for e in refs
+            ],
+            "labels": [
+                {"value": lab.get("value"), "color": lab.get("color")}
+                for lab in labels
+            ],
+        }
+
+    async def enrich(
+        self, value: str, obs_type: str, deadline_s: float = 30.0
+    ) -> dict:
+        """Add the observable, then poll for enrichment connector output.
+
+        Enrichment connectors (VirusTotal, AbuseIPDB, Shodan
+        InternetDB) fire automatically when an observable is added.
+        They write findings back as external references, labels, and
+        an aggregate x_opencti_score. We poll get_observable every 5s
+        up to ``deadline_s`` and return the first state that has ANY
+        enrichment signal (refs OR labels OR a non-null score) — or
+        the bare observable if nothing fired in time.
+        """
+        added = await self.add_observable(value, obs_type)
+        obs_id = added.get("id")
+        if not obs_id:
+            return {"error": "could not create observable", **added}
+        end = time.time() + deadline_s
+        attempts = 0
+        last: dict = {}
+        while time.time() < end:
+            attempts += 1
+            try:
+                last = await self.get_observable(obs_id)
+            except Exception:  # noqa: BLE001
+                pass
+            if last.get("refs") or last.get("labels") or last.get("score"):
+                last["enrichment_attempts"] = attempts
+                return last
+            await asyncio.sleep(5.0)
+        # No enrichment signal in the window — still return what we have.
+        if not last:
+            last = added
+        last["enrichment_attempts"] = attempts
+        last["timed_out"] = True
+        return last
+
 
 def _cti_reply(cmd: str, args: dict, res: dict) -> str:
     """Format an OpenCTI result into a single butler sentence."""
@@ -1586,6 +1671,38 @@ def _cti_reply(cmd: str, args: dict, res: dict) -> str:
             + ", ".join(i.get("name", "?") for i in items[:4])
             + "."
         )
+    if cmd == "cti_enrich":
+        value = args.get("value") or res.get("value") or "that"
+        refs = res.get("refs") or []
+        labels = res.get("labels") or []
+        score = res.get("score")
+        if not refs and not labels and score is None:
+            if res.get("timed_out"):
+                return (
+                    f"Logged {value}, sir, but no enrichment came back "
+                    "in the window — the connectors may be cold."
+                )
+            return f"Logged {value}, sir. No findings yet."
+        bits: list[str] = []
+        if score is not None:
+            bits.append(f"score {score}")
+        # Surface up to 2 distinct sources in the spoken reply.
+        sources = []
+        for r in refs:
+            s = r.get("source") or ""
+            if s and s not in sources:
+                sources.append(s)
+            if len(sources) >= 3:
+                break
+        if sources:
+            bits.append("flagged by " + ", ".join(sources))
+        if labels:
+            label_words = [lab.get("value", "") for lab in labels[:3]]
+            label_words = [w for w in label_words if w]
+            if label_words:
+                bits.append("labels " + " / ".join(label_words))
+        summary = "; ".join(bits) if bits else "no clear verdict"
+        return f"{value} — {summary}, sir."
     if cmd == "cti_open_panel":
         return "Intelligence panel is up, sir."
     if cmd == "cti_spinup":
@@ -1823,347 +1940,12 @@ class DesktopBridge:
             self._pending.pop(cmd_id, None)
 
 
-# ── Mobile bridge (Android phone via mobile-bridge APK) ──────────────
-_MOBILE_TOPIC_CMD = "mobile-cmd"
-_MOBILE_TOPIC_RESULT = "mobile-result"
-_MOBILE_IDENTITY_PREFIX = "mobile-bridge-"
-
-
-class MobileBridge:
-    """Lazy LiveKit connection to the mobile-bridge control room.
-
-    Mirrors DesktopBridge but for the phone APK. Same control room,
-    different topics + identity prefix so the wire contract is cleanly
-    versioned away from the desktop-bridge.
-    """
-
-    def __init__(self) -> None:
-        self._room: rtc.Room | None = None
-        self._pending: dict[str, asyncio.Future] = {}
-        self._lock = asyncio.Lock()
-
-    @staticmethod
-    def _phone_from_identity(identity: str) -> str | None:
-        if not identity or not identity.startswith(_MOBILE_IDENTITY_PREFIX):
-            return None
-        return identity[len(_MOBILE_IDENTITY_PREFIX):].strip().lower() or None
-
-    def online_phones(self) -> list[str]:
-        if self._room is None:
-            return []
-        phones: set[str] = set()
-        for p in self._room.remote_participants.values():
-            name = self._phone_from_identity(getattr(p, "identity", "") or "")
-            if name:
-                phones.add(name)
-        return sorted(phones)
-
-    def is_online(self, phone: str) -> bool:
-        p = (phone or "").strip().lower()
-        if p in ("", "any", "all", "phone", "mobile"):
-            return bool(self.online_phones())
-        return p in set(self.online_phones())
-
-    async def _ensure(self) -> rtc.Room | None:
-        async with self._lock:
-            if self._room is not None:
-                return self._room
-            url = os.environ.get("LIVEKIT_URL", "")
-            key = os.environ.get("LIVEKIT_API_KEY", "")
-            secret = os.environ.get("LIVEKIT_API_SECRET", "")
-            if not (url and key and secret):
-                logger.warning("mobile bridge: LIVEKIT_* env not set")
-                return None
-            token = (
-                api.AccessToken(key, secret)
-                .with_identity(f"jarvis-worker-mob-{uuid.uuid4().hex[:8]}")
-                .with_grants(
-                    api.VideoGrants(
-                        room_join=True,
-                        room=_CONTROL_ROOM,
-                        can_publish=True,
-                        can_subscribe=True,
-                        can_publish_data=True,
-                    )
-                )
-                .to_jwt()
-            )
-            room = rtc.Room()
-
-            @room.on("data_received")
-            def _on_data(packet: rtc.DataPacket) -> None:  # noqa: ANN001
-                if packet.topic != _MOBILE_TOPIC_RESULT:
-                    return
-                try:
-                    msg = json.loads(bytes(packet.data).decode("utf-8"))
-                except Exception:  # noqa: BLE001
-                    return
-                fut = self._pending.pop(msg.get("id", ""), None)
-                if fut and not fut.done():
-                    fut.set_result(msg)
-
-            await room.connect(url, token)
-            self._room = room
-            logger.info("mobile bridge: connected to '%s'", _CONTROL_ROOM)
-            return room
-
-    async def send(
-        self, target: str, cmd: str, args: dict, timeout: float = 30.0
-    ) -> dict:
-        room = await self._ensure()
-        if room is None:
-            return {"error": "mobile bridge unavailable (LIVEKIT_* unset)"}
-        cmd_id = uuid.uuid4().hex
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending[cmd_id] = fut
-        payload = json.dumps(
-            {"id": cmd_id, "target": target, "cmd": cmd, "args": args}
-        ).encode("utf-8")
-        try:
-            await room.local_participant.publish_data(
-                payload, reliable=True, topic=_MOBILE_TOPIC_CMD
-            )
-            msg = await asyncio.wait_for(fut, timeout)
-            return msg.get("result", {})
-        except asyncio.TimeoutError:
-            self._pending.pop(cmd_id, None)
-            return {
-                "error": f"no response from the '{target}' phone — is the "
-                f"Jarvis Mobile Bridge app open and connected?"
-            }
-        except Exception as exc:  # noqa: BLE001
-            self._pending.pop(cmd_id, None)
-            return {"error": str(exc)}
-
-
-# ── Mobile intent routing ────────────────────────────────────────────
-_MOBILE_HINT_RE = re.compile(
-    r"\b("
-    r"phone|mobile|cell|cellphone|smartphone|android|pixel|oneplus|samsung|"
-    r"text|texts|sms|"
-    r"call|dial|ring|"
-    r"contact|contacts|phonebook|phone\s+book|"
-    r"whatsapp|wapp|whats\s+app|"
-    r"battery|charge|charging|signal|reception|"
-    r"instagram|insta|tiktok|tik\s+tok|facebook|messenger|youtube|"
-    r"install|uninstall|"
-    r"app|apps"
-    r")\b",
-    re.I,
-)
-
-_MOBILE_MACHINE_RE = re.compile(
-    r"\b(?:on|via|through|using|in|to|from)\s+"
-    r"(?:my\s+|the\s+|this\s+)?"
-    r"(phone|mobile|cell|cellphone|smartphone|android|pixel|oneplus|samsung)\b"
-    r"|\bmy\s+(phone|mobile|cell|pixel|oneplus|samsung)\b",
-    re.I,
-)
-
-_BRIDGE_MOBILE_COMMANDS_GUIDE = """\
-Available mobile-bridge commands (the user's Android phone):
-
-  sms_list         {"limit": 10, "number_filter": "<optional>"}
-  sms_send         {"number": "<phone>", "message": "<text>"}
-  contacts_search  {"query": "<name>", "limit": 10}
-  dial             {"number": "<phone>"}                       # opens dialer
-  open_app         {"name": "<app name>" or "package": "<bundle id>"}
-  list_apps        {}                                          # for fuzzy resolution
-  install_app      {"package": "<bundle id>"}                  # opens Play Store
-  uninstall_app    {"package": "<bundle id>"}                  # opens uninstall dialog
-  open_url         {"url": "<full URL>"}                       # opens browser
-  whatsapp_send    {"number": "<phone>", "message": "<text>"}  # opens WhatsApp pre-filled
-  device_status    {}                                          # battery / model / signal
-  host_info        {}
-
-NOT supported (no public personal-account API exists): sending DMs on
-Instagram, Facebook Messenger, or TikTok; posting to those platforms.
-For those intents pick `open_app` with the app name OR `open_url` with
-a deep-link such as instagram.com/<user>, m.me/<user>, ig.me/<user>."""
-
-
-async def _route_mobile(text: str, phones_online: list[str]) -> dict | None:
-    """Turn a free-form spoken request into a structured mobile-bridge command."""
-    client = _get_router_client()
-    if client is None or not text:
-        return None
-    online = ", ".join(phones_online) if phones_online else "none right now"
-    system = (
-        "You translate ONE spoken request into ONE command for the user's "
-        "Android phone. Output strict JSON only — no prose, no code fences.\n\n"
-        "Schema. Either:\n"
-        '  {"mobile": false}   — when the request is NOT about operating '
-        "their phone.\n"
-        "Or:\n"
-        '  {"mobile": true, "phone": "<phone_name>"|"any", '
-        '"command": "<name>", "args": {...}, '
-        '"contact_query": "<name>"?, '
-        '"say": "<one short butler-voice sentence>"}\n\n'
-        f"{_BRIDGE_MOBILE_COMMANDS_GUIDE}\n\n"
-        "Rules:\n"
-        "- Default phone: 'any'. Phones online right now: " + online + ".\n"
-        "- If the user names a CONTACT instead of a phone number for sms_send"
-        " / dial / whatsapp_send, set `contact_query` to the name and leave "
-        '`args.number` empty — the worker will resolve it via contacts_search.\n'
-        "- For 'open <social app>' use open_app with the app name.\n"
-        "- For 'send Instagram DM / FB message / TikTok message': output\n"
-        '  {"mobile": true, "phone": "any", "command": "open_app", '
-        '"args": {"name": "<instagram|messenger|tiktok>"}, '
-        '"say": "I can\'t message <Platform> directly from here, sir — '
-        'opening the app for you."}\n'
-        "- `dial` opens the dialer (no auto-call); `whatsapp_send` opens "
-        "WhatsApp pre-filled (user taps send).\n"
-        "- `say` is one short butler sentence ('Texting Mum, sir.', "
-        "'On it, sir.').\n"
-        "- If conversation / question / unclear, output {\"mobile\": false}."
-    )
-    try:
-        resp = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=_ROUTER_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.0,
-                max_tokens=400,
-                response_format={"type": "json_object"},
-            ),
-            timeout=6.0,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("mobile router LLM failed: %s", exc)
-        return None
-    raw = (resp.choices[0].message.content or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
-    try:
-        data = json.loads(raw)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("mobile router non-JSON: %s — %r", exc, raw[:200])
-        return None
-    if not isinstance(data, dict) or not data.get("mobile"):
-        return None
-    cmd = (data.get("command") or "").strip()
-    if not cmd:
-        return None
-    return {
-        "phone": str(data.get("phone") or "any").strip().lower(),
-        "cmd": cmd,
-        "args": data.get("args") or {},
-        "contact_query": (data.get("contact_query") or "").strip(),
-        "say": (data.get("say") or "").strip(),
-    }
-
-
-def _mobile_reply(phone: str, cmd: str, args: dict, res: dict) -> str:
-    """Turn a mobile-bridge result dict into a butler-tone confirmation."""
-    if res.get("error"):
-        return f"That didn't work, sir — {res['error']}"
-    if cmd == "sms_send":
-        return "Texted them, sir."
-    if cmd == "sms_list":
-        messages = res.get("messages") or []
-        if not messages:
-            return "No recent messages, sir."
-        lines = []
-        for m in messages[:3]:
-            sender = m.get("from", "Unknown")
-            body = (m.get("body", "") or "").strip().replace("\n", " ")
-            if len(body) > 120:
-                body = body[:120] + "…"
-            lines.append(f"{sender}: {body}")
-        more = "" if len(messages) <= 3 else f" Plus {len(messages) - 3} more."
-        return "Your latest texts, sir. " + " ... ".join(lines) + more
-    if cmd == "contacts_search":
-        contacts = res.get("contacts") or []
-        if not contacts:
-            return "No contacts matched, sir."
-        if len(contacts) == 1:
-            c = contacts[0]
-            return f"That's {c.get('name', 'them')} at {c.get('number', '')}, sir."
-        names = ", ".join(c.get("name", "?") for c in contacts[:3])
-        return f"Found {len(contacts)} contacts, sir: {names}."
-    if cmd == "dial":
-        return "Dialler's up, sir — tap to call."
-    if cmd == "whatsapp_send":
-        return "WhatsApp's open and ready, sir — tap send."
-    if cmd == "open_app":
-        opened = res.get("opened") or args.get("name") or args.get("package")
-        return f"Opening {opened}, sir."
-    if cmd == "open_url":
-        return "On screen, sir."
-    if cmd == "list_apps":
-        apps = res.get("apps") or []
-        return f"You have {len(apps)} apps installed, sir."
-    if cmd == "install_app":
-        return "Play Store's up, sir — tap install."
-    if cmd == "uninstall_app":
-        return "Uninstall prompt's up, sir."
-    if cmd == "device_status":
-        bat = res.get("battery_percent")
-        charging = res.get("charging")
-        if bat is not None:
-            tail = " and charging" if charging else " and not charging"
-            return f"Battery is at {bat}%{tail}, sir."
-        return "Phone reports back, sir."
-    if cmd == "host_info":
-        model = res.get("model", "")
-        return f"That's your {model or phone}, sir." if model else f"Phone {phone} online, sir."
-    return f"Done on your {phone}, sir."
-
-
-# ── Telegram (worker-side via Bot API; no phone required) ────────────
-_TELEGRAM_RE = re.compile(
-    r"\b(?:telegram|tg)\b.*?\b(?:to|send|message|tell|ping)\b"
-    r"|\b(?:send|tell|message|ping)\b.*?\b(?:telegram|tg)\b",
-    re.I,
-)
-
-
-async def _extract_telegram_payload(text: str) -> dict | None:
-    """LLM-extract {contact, message} from a Telegram-send utterance."""
-    client = _get_router_client()
-    if client is None or not text:
-        return None
-    system = (
-        "Extract the recipient name and the message body from the user's "
-        "request to send a Telegram message. Output strict JSON only:\n"
-        '  {"contact": "<name>", "message": "<body>"}\n'
-        "Lowercase the contact name. Strip the verbs ('send', 'tell',\n"
-        "'telegram', 'message', etc.) from the message body."
-    )
-    try:
-        resp = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=_ROUTER_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.0,
-                max_tokens=200,
-                response_format={"type": "json_object"},
-            ),
-            timeout=6.0,
-        )
-        data = json.loads((resp.choices[0].message.content or "").strip())
-        if not data.get("contact") or not data.get("message"):
-            return None
-        return data
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("telegram extractor failed: %s", exc)
-        return None
-
-
 class Assistant(Agent):
     def __init__(self, room: rtc.Room):
         super().__init__(instructions=AGENT_INSTRUCTION)
         self._room = room
         # Desktop control — lazy 2nd LiveKit connection to the PCs' bridge.
         self._desktop = DesktopBridge()
-        # Mobile control — Android phone via mobile-bridge APK (same room).
-        self._mobile = MobileBridge()
         # OpenCTI — Railway-hosted, reached via direct httpx (Path Y).
         # Lifecycle (spinup/spindown) goes through GitHub Actions
         # workflow_dispatch on the opencti-lifecycle workflow.
@@ -2202,10 +1984,30 @@ class Assistant(Agent):
         # to permissive mode in that gap.
         self._open_widgets: list[dict] = []
         self._open_widgets_at: float = 0.0
+        # Playback state per widget id, reported from the frontend on
+        # `widget_playback`. Absent means unknown (treated as
+        # possibly-playing). Explicit 'paused'/'stopped'/'ended' wins.
+        self._widget_playback_states: dict[str, str] = {}
+        # Widget kinds we auto-muted at the top of the current user turn
+        # so we can auto-unmute on the next one.
+        self._auto_muted_kinds: set[str] = set()
+        self._auto_mute_warning_spoken: bool = False
+        self._auto_mute_safety_task: asyncio.Task | None = None
+        # Unified inventory of open resources (widgets, browser, etc.)
+        # with idle-detection + spoken warning before auto-close.
+        self._ledger = ResourceLedger()
         # Generic clarification slot for ambiguous intents.
         self._pending_clarification: PendingClarification | None = None
         self._clarification_resumers: dict[str, callable] = {}
         self._clarification_resumers["volume"] = self._resume_volume
+        self._clarification_resumers["content"] = self._resume_content
+        # Desktop master volumes we auto-muted at the start of this turn.
+        # Mirrors `_auto_muted_kinds` but for OS-level mute on each PC, so
+        # we can unmute exactly what we muted at end-of-turn.
+        self._auto_muted_machines: set[str] = set()
+        # Cache of "is any audio session active on this machine?" so we
+        # don't re-enumerate on every turn. (mono time, busy-set).
+        self._desktop_audio_busy_cache: tuple[float, set[str]] | None = None
 
     def _has_widget(self, kind: str) -> bool:
         """True when a panel of `kind` is currently visible on the HUD."""
@@ -2396,7 +2198,19 @@ class Assistant(Agent):
 
     # ── Screen widget tools (floating HUD panels) ───────────────────
     async def _publish_ui(self, msg: dict) -> None:
-        """Send a UI command to the browser on the `jarvis-ui` topic."""
+        """Send a UI command to the browser on the `jarvis-ui` topic.
+
+        Also maintains an OPTIMISTIC mirror of `_open_widgets` for every
+        `open_widget` / `close_widget` / `close_all` we publish — so the
+        worker never has to wait for the frontend's `widget_state` echo
+        to know what it just opened. The frontend echo, when it arrives,
+        replaces this mirror with the authoritative state.
+
+        Why this is here: the user reported asking to mute a clearly-
+        visible YouTube widget and getting "nothing is currently playing"
+        because the inventory hadn't synced yet. Optimistic tracking
+        closes that race entirely.
+        """
         try:
             await self._room.local_participant.publish_data(
                 json.dumps(msg).encode("utf-8"),
@@ -2405,6 +2219,41 @@ class Assistant(Agent):
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("jarvis-ui publish failed: %s", exc)
+
+        # Local optimistic mirror.
+        try:
+            mtype = msg.get("type")
+            if mtype == "open_widget":
+                kind = (msg.get("kind") or "").strip()
+                if kind:
+                    # Singleton per kind on the frontend side — replace
+                    # any prior entry of the same kind.
+                    self._open_widgets = [
+                        w for w in self._open_widgets
+                        if (w.get("kind") or "").lower() != kind.lower()
+                    ]
+                    self._open_widgets.append({
+                        "kind": kind,
+                        "id": f"local-{kind}-{uuid.uuid4().hex[:8]}",
+                        "title": msg.get("title") or kind,
+                        "optimistic": True,
+                    })
+                    # Don't claim a fresh widget_state sync (that's the
+                    # frontend's job) — but stamp non-zero so close-widget
+                    # priority knows we have at least optimistic visibility.
+                    if self._open_widgets_at == 0.0:
+                        self._open_widgets_at = time.monotonic()
+            elif mtype == "close_widget":
+                kind = (msg.get("kind") or "").strip().lower()
+                if kind:
+                    self._open_widgets = [
+                        w for w in self._open_widgets
+                        if (w.get("kind") or "").lower() != kind
+                    ]
+            elif mtype == "close_all":
+                self._open_widgets = []
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("optimistic widget mirror update failed: %s", exc)
 
     async def _maybe_handle_widget(self, text: str) -> None:
         """Open/close screen widgets when the user asks.
@@ -2465,7 +2314,21 @@ class Assistant(Agent):
             return False
         known_state = self._open_widgets_at > 0.0
         if known_state and not self._has_widget(kind):
-            return False
+            # We KNOW (from a real widget_state sync) that this panel
+            # isn't on screen. Tell the user honestly instead of leaving
+            # it to the LLM to fabricate "I don't have access" — that
+            # was the exact failure mode in the user-reported regression
+            # ("close the news window" → "I don't have access").
+            try:
+                await self.session.say(
+                    f"The {kind} panel doesn't seem to be open, sir."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        # State unknown OR widget is open — fire the close. close_widget
+        # is idempotent on the frontend, so an unknown-state close is a
+        # safe no-op when nothing's actually there.
         await self._publish_ui({"type": "close_widget", "kind": kind})
         try:
             await self.session.say(f"Closing the {kind} panel, sir.")
@@ -2492,6 +2355,20 @@ class Assistant(Agent):
                 await self.session.say("As you wish, sir.")
             except Exception:  # noqa: BLE001
                 pass
+            return True
+        # Free-text clarifications (no option matching). Used by the
+        # content router when it gates a noisy topic — the next turn IS
+        # the answer, in full sentence form. We pass `text` straight to
+        # the resumer, which re-extracts the topic.
+        if pc.intent_kind == "content":
+            captured = pc
+            self._pending_clarification = None
+            resumer = self._clarification_resumers.get("content")
+            if resumer is not None:
+                try:
+                    await resumer(text, captured, None)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("content resumer failed: %s", exc)
             return True
         low = text.lower()
         chosen: list[dict] = []
@@ -2567,9 +2444,19 @@ class Assistant(Agent):
 
         # HUD audio widgets (visible panels that can produce sound).
         audio_widget_kinds = {"youtube", "music", "browser"}
+        # `mute` is a PREVENTIVE action — apply it to anything that
+        # could produce sound, even if paused right now. Volume up/down/
+        # set still respect playback state (no point boosting silence).
+        is_mute_action = action_args.get("action") in ("mute", "unmute")
         for w in self._open_widgets:
             wkind = (w.get("kind") or "").lower()
             if wkind not in audio_widget_kinds:
+                continue
+            # Respect explicit playback state from the widget. Absent =
+            # unknown = treated as possibly-playing (the prior default).
+            wid = w.get("id") or ""
+            pstate = self._widget_playback_states.get(wid)
+            if not is_mute_action and pstate in ("paused", "stopped", "ended"):
                 continue
             title = (w.get("title") or wkind).strip() or wkind
             match_words = {wkind, title.lower()}
@@ -2722,6 +2609,100 @@ class Assistant(Agent):
         """Finish a deferred volume action once an option is chosen."""
         await self._dispatch_volume(option, pc.original_args)
 
+    # ── Content-intent clarification (free-text resumer) ──────────────
+    async def _ask_content_clarification(
+        self, kind: str, arg: str, original_text: str
+    ) -> bool:
+        """Park a noisy content intent and ask the user to rephrase.
+
+        Returns True so the caller stops the turn; the next user utterance
+        is resolved by `_resume_content` and re-dispatched cleanly.
+        """
+        category = {
+            "news": "the news", "youtube": "a video",
+            "web": "the web", "maps": "the map", "browser": "the browser",
+        }.get(kind, "that")
+        if arg.strip():
+            prompt = (
+                f"I didn't quite catch that, sir. What would you like "
+                f"on {category}?"
+            )
+        else:
+            prompt = f"What would you like on {category}, sir?"
+        self._pending_clarification = PendingClarification(
+            intent_kind="content",
+            options=[],
+            original_args={
+                "kind": kind, "original_arg": arg, "raw": original_text,
+            },
+            prompt=prompt,
+            created_at=time.monotonic(),
+            expires_at=time.monotonic() + 30.0,
+        )
+        try:
+            await self.session.say(prompt)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _resume_content(
+        self, text: str, pc: PendingClarification, option: dict | None
+    ) -> None:
+        """Re-dispatch a deferred content intent with the user's clarified topic.
+
+        `text` is the user's free-form reply (a topic phrase). We strip
+        filler and feed it back into the original kind's flow. If the
+        clarified topic STILL looks noisy, we give up rather than loop —
+        the user can always re-ask.
+        """
+        kind = pc.original_args.get("kind") or ""
+        new_topic = _clean_query(text or "")
+        # Drop a leading "it's", "the news on", "about" — common in replies.
+        new_topic = re.sub(
+            r"^(?:it'?s\s+|the\s+|on\s+|about\s+|regarding\s+|news\s+on\s+|"
+            r"video\s+(?:of|about|on)\s+)+",
+            "", new_topic, flags=re.I,
+        ).strip(" ,.?!-\"'")
+        if not new_topic and kind not in ("news", "browser"):
+            try:
+                await self.session.say(
+                    "Still didn't catch a topic, sir — try again when you're ready."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if _topic_looks_noisy(new_topic):
+            try:
+                await self.session.say(
+                    "I'm still not sure I follow, sir. Let's pick this up again."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        dispatch = {
+            "web": lambda: self.web_search(new_topic),
+            "youtube": lambda: self.search_youtube(new_topic),
+            "news": lambda: self.show_news(new_topic),
+            "maps": lambda: self.show_map(new_topic),
+            "browser": lambda: self.open_browser(
+                new_topic or "https://www.google.com"
+            ),
+        }
+        fn = dispatch.get(kind)
+        if fn is None:
+            return
+        try:
+            reply = await asyncio.wait_for(fn(), timeout=20.0)
+        except asyncio.TimeoutError:
+            reply = "That's taking too long, sir — try again in a moment."
+        except Exception as exc:  # noqa: BLE001
+            logger.error("content resume '%s' failed: %s", kind, exc)
+            reply = "I couldn't complete that just now, sir."
+        try:
+            await self.session.say(reply)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _maybe_handle_content(self, text: str) -> bool:
         """Handle search / video / news / maps / browser intents by regex.
 
@@ -2734,6 +2715,17 @@ class Assistant(Agent):
         if intent is None:
             return False
         kind, arg = intent
+
+        # Coherence gate — refuse to dispatch on a garbled topic. The
+        # user just saw their news search return Elton John because the
+        # transcript was junk ("a little bit of delay, fix that, also,
+        # , the"); a conscious AGI asks instead of guessing.
+        # Empty arg is allowed for news/browser (= top of category).
+        needs_topic = kind in ("youtube", "web", "maps")
+        topic_required_but_missing = needs_topic and not arg.strip()
+        if topic_required_but_missing or _topic_looks_noisy(arg):
+            return await self._ask_content_clarification(kind, arg, text)
+
         dispatch = {
             "web": lambda: self.web_search(arg),
             "youtube": lambda: self.search_youtube(arg),
@@ -2742,18 +2734,13 @@ class Assistant(Agent):
             "browser": lambda: self.open_browser(
                 arg or "https://www.google.com"
             ),
-            "v0": lambda: self.build_website(arg),
         }
         if kind not in dispatch:
             return False
         try:
-            # Bound the call so a hung provider can never freeze the
-            # voice turn. v0.dev generations can run 30-60s; everything
-            # else should be much faster.
-            handler_timeout = 120.0 if kind == "v0" else 20.0
-            reply = await asyncio.wait_for(
-                dispatch[kind](), timeout=handler_timeout
-            )
+            # Bound the search/browser call so a hung provider can never
+            # freeze the whole voice turn.
+            reply = await asyncio.wait_for(dispatch[kind](), timeout=20.0)
         except asyncio.TimeoutError:
             logger.error("content intent '%s' timed out", kind)
             reply = "That's taking too long, sir — try again in a moment."
@@ -2828,7 +2815,9 @@ class Assistant(Agent):
         say_hint = routed.get("say", "")
 
         # Quick acknowledgement for ops that might take a moment.
-        info_cmds = {"cti_search", "cti_summary", "cti_list_indicators"}
+        info_cmds = {
+            "cti_search", "cti_summary", "cti_list_indicators", "cti_enrich"
+        }
         if say_hint and cmd not in info_cmds:
             try:
                 await self.session.say(say_hint)
@@ -2875,6 +2864,11 @@ class Assistant(Agent):
             if cmd == "cti_list_indicators":
                 return await self._cti.list_indicators(
                     int(args.get("limit") or 10)
+                )
+            if cmd == "cti_enrich":
+                return await self._cti.enrich(
+                    str(args.get("value", "")),
+                    str(args.get("observable_type", "")),
                 )
             if cmd == "cti_open_panel":
                 await self._open_cti_panel(
@@ -3169,141 +3163,6 @@ class Assistant(Agent):
             pass
         return True
 
-    async def _maybe_handle_mobile(self, text: str) -> bool:
-        """Operate the user's Android phone via the mobile-bridge APK.
-
-        Pipeline: broad hint gate → LLM router (free-form → structured
-        command) → optional contacts_search resolve → bridge.send →
-        speak butler-tone reply.
-        """
-        if not text or not _MOBILE_HINT_RE.search(text):
-            return False
-
-        try:
-            await self._mobile._ensure()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("mobile control-room connect failed: %s", exc)
-        online = self._mobile.online_phones()
-        routed = await _route_mobile(text, online)
-        if routed is None:
-            return False
-
-        if not online:
-            try:
-                await self.session.say(
-                    "Your phone bridge isn't connected, sir — open Jarvis "
-                    "Mobile Bridge and connect."
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-
-        phone = routed["phone"] if routed.get("phone") != "any" else online[0]
-        cmd = routed["cmd"]
-        args = dict(routed.get("args") or {})
-
-        contact_query = routed.get("contact_query", "")
-        if (
-            cmd in ("sms_send", "dial", "whatsapp_send")
-            and not args.get("number")
-            and contact_query
-        ):
-            search = await self._mobile.send(
-                phone, "contacts_search",
-                {"query": contact_query, "limit": 3},
-                timeout=10.0,
-            )
-            contacts = search.get("contacts") or []
-            if not contacts:
-                try:
-                    await self.session.say(
-                        f"I couldn't find a contact for '{contact_query}', sir."
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-                return True
-            args["number"] = contacts[0]["number"]
-
-        say_hint = routed.get("say", "")
-        if say_hint:
-            try:
-                await self.session.say(say_hint)
-            except Exception:  # noqa: BLE001
-                pass
-
-        try:
-            res = await self._mobile.send(phone, cmd, args, timeout=30.0)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("mobile send failed: %s", exc)
-            res = {"error": str(exc)}
-        try:
-            await self.session.say(_mobile_reply(phone, cmd, args, res))
-        except Exception:  # noqa: BLE001
-            pass
-        return True
-
-    async def _maybe_handle_telegram(self, text: str) -> bool:
-        """Send a Telegram message via the official Bot API.
-
-        Worker-side only — does NOT need the phone bridge online.
-        Requires TELEGRAM_BOT_TOKEN env + TELEGRAM_CONTACTS_JSON env
-        mapping `{"<name lowercased>": <chat_id>, ...}`.
-        """
-        if not text or not _TELEGRAM_RE.search(text):
-            return False
-        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        if not token:
-            try:
-                await self.session.say(
-                    "Telegram isn't configured, sir — the bot token is unset."
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-
-        extracted = await _extract_telegram_payload(text)
-        if not extracted:
-            return False
-        contact_name = extracted["contact"].lower().strip()
-        message = extracted["message"].strip()
-
-        try:
-            contacts = json.loads(
-                os.environ.get("TELEGRAM_CONTACTS_JSON", "{}") or "{}"
-            )
-        except Exception:  # noqa: BLE001
-            contacts = {}
-        chat_id = contacts.get(contact_name)
-        if not chat_id:
-            try:
-                await self.session.say(
-                    f"I don't have a Telegram chat id for '{contact_name}', sir."
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": chat_id, "text": message},
-                )
-                r.raise_for_status()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("telegram send failed: %s", exc)
-            try:
-                await self.session.say("Telegram didn't accept that, sir.")
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-
-        try:
-            await self.session.say(f"Telegrammed {contact_name}, sir.")
-        except Exception:  # noqa: BLE001
-            pass
-        return True
-
     async def show_widget(self, widget: str, title: str = "") -> str:
         """Display a floating widget panel on the user's JARVIS screen.
 
@@ -3389,118 +3248,30 @@ class Assistant(Agent):
             "the first is ready to play."
         )
 
-    async def build_website(self, prompt: str) -> str:
-        """Generate a website via v0.dev and open it in a `site` widget.
-
-        Two-utterance UX: speak an immediate acknowledgement so the user
-        knows the command landed (v0 generation can take 30-60 s), then
-        return the completion sentence which the caller TTSes.
-        """
-        prompt = (prompt or "").strip() or "a simple landing page"
-        api_key = os.environ.get("V0_API_KEY", "").strip()
-        if not api_key:
-            return "I can't reach v0 — the V0_API_KEY isn't set, sir."
-
-        # Immediate ack so the user knows we heard them. Fire-and-forget;
-        # the spoken return from this method comes ~30-60 s later.
-        try:
-            await self.session.say(
-                "Building your site, sir — one moment."
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-        payload = {
-            "model": V0_MODEL,
-            "messages": [
-                {"role": "user", "content": f"Build a website: {prompt}"}
-            ],
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=110.0) as client:
-                resp = await client.post(
-                    f"{V0_API_BASE}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("v0 generation failed: %s", exc)
-            return (
-                "v0 didn't respond just now, sir — try again in a moment."
-            )
-
-        content = ""
-        try:
-            content = (
-                (data.get("choices") or [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                or ""
-            )
-        except Exception:  # noqa: BLE001
-            content = ""
-
-        urls = _V0_PREVIEW_URL_RE.findall(content)
-        # Prefer vusercontent.net (clean preview) over v0.dev/chat (editor).
-        preview_url = next(
-            (u for u in urls if "vusercontent.net" in u),
-            urls[0] if urls else "",
-        )
-        if not preview_url:
-            logger.warning(
-                "v0 returned no preview URL; raw: %r", content[:300]
-            )
-            return (
-                "I built something but couldn't find a preview link, sir."
-            )
-
-        await self._publish_ui(
-            {
-                "type": "open_widget",
-                "kind": "site",
-                "title": f"Site — {prompt[:40]}" if prompt else "Generated Site",
-                "payload": {"url": preview_url, "prompt": prompt},
-            }
-        )
-        return "Your site's on the panel, sir."
-
     async def show_news(self, topic: str = "") -> str:
-        """Show current news headlines + a related news video, and speak
-        a top-headline summary.
+        """Show current news headlines on the JARVIS screen, and (when a
+        related video can be derived from the actual headlines) open a
+        news-themed YouTube panel alongside.
 
         Args:
-            topic: Optional subject (e.g. "technology"). Empty = top
-                headlines + a generic "breaking news today" video.
+            topic: Optional subject to focus the news on (e.g.
+                "technology"). Leave empty for the top headlines.
 
-        Behaviour:
-          1. Parallel-fetch news articles AND a YouTube news video.
-          2. Open the news widget immediately so the user has something
-             to read while the summary is spoken.
-          3. Return the spoken summary (caller TTS's it).
-          4. Open the YouTube widget on a ~4 s delay so its auto-play
-             audio doesn't drown the spoken summary.
+        Why this is shaped the way it is:
+          Previously this fetched YouTube with the raw user `topic` (or
+          "breaking news today" on empty), which routinely returned
+          unrelated content — a noisy STT turn would search YouTube for
+          "delay, fix that" and Elton John's catalogue would appear next
+          to the news panel. We now (a) skip YouTube entirely if there
+          are no real headlines, and (b) derive the YouTube query from
+          the top headline's TITLE, so the companion video is actually
+          on-topic.
         """
         topic = (topic or "").strip()
-        video_query = topic or "breaking news today"
+        articles = await search_tools.news_search(topic, limit=8)
 
-        # Parallel-fetch — one slow provider doesn't double the latency.
-        try:
-            articles, videos = await asyncio.gather(
-                search_tools.news_search(topic, limit=8),
-                search_tools.youtube_search(video_query, limit=8),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("news+video parallel fetch failed: %s", exc)
-            articles, videos = [], []
-
-        # News widget up front.
+        # News widget up front so the user has something to read while
+        # we (maybe) fetch a related video.
         await self._publish_ui(
             {
                 "type": "open_widget",
@@ -3510,49 +3281,54 @@ class Assistant(Agent):
             }
         )
 
-        # YouTube widget on a delay so its autoplay doesn't fight TTS.
-        if videos:
-            async def _open_video_after_summary() -> None:
-                try:
-                    await asyncio.sleep(4.0)
-                    await self._publish_ui(
-                        {
-                            "type": "open_widget",
-                            "kind": "youtube",
-                            "title": f"News Video — {video_query}",
-                            "payload": {
-                                "query": video_query,
-                                "videos": videos,
-                            },
-                        }
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("delayed news-video open failed: %s", exc)
-            asyncio.create_task(_open_video_after_summary())
-
         if not articles:
             return "I couldn't reach the news feed just now, sir."
 
+        # Derive a SAFE YouTube query from the top headline. Strip
+        # source suffix (" - Reuters"), and any garbage. If the derived
+        # query is too short to be useful, skip the video panel.
         top = articles[0] if articles else {}
         top_title = (top.get("title") or "").strip()
         top_source = (top.get("source") or "").strip()
-        where = f" on {topic}" if topic else ""
+        video_query = re.sub(r"\s+-\s+[A-Z][A-Za-z0-9 .&'-]+$", "", top_title)
+        video_query = re.sub(r"\s+\|.*$", "", video_query).strip()
 
+        if len(video_query) >= 12 and not _topic_looks_noisy(video_query):
+            try:
+                videos = await asyncio.wait_for(
+                    search_tools.youtube_search(video_query, limit=6),
+                    timeout=6.0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("news-companion youtube fetch failed: %s", exc)
+                videos = []
+            if videos:
+                async def _open_video_after_summary() -> None:
+                    try:
+                        await asyncio.sleep(4.0)
+                        await self._publish_ui(
+                            {
+                                "type": "open_widget",
+                                "kind": "youtube",
+                                "title": f"News Video — {video_query[:50]}",
+                                "payload": {
+                                    "query": video_query, "videos": videos,
+                                },
+                            }
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "delayed news-video open failed: %s", exc
+                        )
+                asyncio.create_task(_open_video_after_summary())
+
+        where = f" on {topic}" if topic else ""
         if top_title:
             lead = f"Top headline{where}: {top_title}"
-            if top_source:
-                lead += f", from {top_source}."
-            else:
-                lead += "."
+            lead += f", from {top_source}." if top_source else "."
         else:
-            lead = f"Latest headlines{where} on screen, sir."
-
-        tail = (
-            "Video coming up in a moment, sir."
-            if videos
-            else f"That's {len(articles)} headlines on screen."
-        )
-        return f"{lead} {tail}"
+            lead = f"Here are the latest headlines{where}, sir."
+        return lead
 
     async def show_map(self, place: str) -> str:
         """Show a place, address, or directions on a map on the JARVIS
@@ -3627,11 +3403,19 @@ class Assistant(Agent):
         browser, self._browser = self._browser, None
         if browser is not None:
             await browser.close()
+        # Remove from the ledger (idempotent if a ledger close already
+        # triggered us — re-entry into close() finds nothing and exits).
+        try:
+            await self._ledger.close("browser", "main")
+        except Exception:  # noqa: BLE001
+            pass
 
     async def handle_browser_event(self, msg: dict) -> None:
         """Apply a relayed interaction from the browser widget."""
         if self._browser is None:
             return
+        # Any interaction counts as activity for the idle watcher.
+        await self._ledger.touch("browser", "main")
         action = msg.get("action")
         if action == "click":
             await self._browser.click(
@@ -3672,6 +3456,15 @@ class Assistant(Agent):
         except Exception as exc:  # noqa: BLE001
             return f"I couldn't open the browser, sir: {exc}"
         self._browser = browser
+        # Register with the ledger so "what's open?" lists it and the
+        # idle watcher will close it after 10 minutes of no interaction.
+        await self._ledger.open(
+            "browser",
+            "main",
+            f"the browser ({url})",
+            idle_threshold_s=600.0,
+            on_close=self._stop_browser,
+        )
         await self._publish_ui(
             {
                 "type": "open_widget",
@@ -3682,6 +3475,224 @@ class Assistant(Agent):
         )
         self._browser_task = asyncio.create_task(self._browser_stream_loop())
         return f"The browser is open, sir — loading {url}."
+
+    # ── Cross-talk auto-mute ─────────────────────────────────────────
+    async def _check_desktop_audio_busy(self) -> set[str]:
+        """Which online desktop machines have any active audio session?
+
+        Bounded enumeration (1.5 s per machine, in parallel), cached for
+        20 s so we don't pay this on every turn. Returns the SET of
+        machine names that are currently producing sound — these are the
+        ones we'll mute pre-emptively when the user speaks.
+        """
+        cache = self._desktop_audio_busy_cache
+        now = time.monotonic()
+        if cache is not None and now - cache[0] < 20.0:
+            return set(cache[1])
+        try:
+            await self._desktop._ensure()
+        except Exception:  # noqa: BLE001
+            return set()
+        machines = self._desktop.online_machines()
+        if not machines:
+            self._desktop_audio_busy_cache = (now, set())
+            return set()
+
+        async def _busy(m: str) -> str | None:
+            try:
+                res = await self._desktop.send(
+                    m, "audio_sessions", {}, timeout=1.5
+                )
+            except Exception:  # noqa: BLE001
+                return None
+            for s in (res.get("sessions") or []):
+                if s.get("is_active"):
+                    return m
+            return None
+
+        try:
+            results = await asyncio.gather(
+                *(_busy(m) for m in machines), return_exceptions=False
+            )
+        except Exception:  # noqa: BLE001
+            results = []
+        busy = {m for m in results if m}
+        self._desktop_audio_busy_cache = (now, busy)
+        return busy
+
+    async def _maybe_auto_unmute(self) -> None:
+        """Un-mute anything we auto-muted at the start of the previous turn."""
+        if not self._auto_muted_kinds and not self._auto_muted_machines:
+            return
+        kinds = sorted(self._auto_muted_kinds)
+        machines = sorted(self._auto_muted_machines)
+        self._auto_muted_kinds.clear()
+        self._auto_muted_machines.clear()
+        task = self._auto_mute_safety_task
+        if task is not None:
+            self._auto_mute_safety_task = None
+            task.cancel()
+        for kind in kinds:
+            try:
+                await self._room.local_participant.publish_data(
+                    json.dumps({
+                        "type": "widget_volume",
+                        "kind": kind,
+                        "action": "unmute",
+                    }).encode(),
+                    reliable=True,
+                    topic="jarvis-ui",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("auto-unmute widget publish failed: %s", exc)
+        # Unmute the desktop masters we muted on this turn.
+        for m in machines:
+            try:
+                await self._desktop.send(
+                    m, "volume", {"action": "unmute"}, timeout=3.0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("auto-unmute desktop send failed: %s", exc)
+
+    async def _maybe_auto_mute(self) -> None:
+        """Mute any actively-playing source so the user can be heard.
+
+        Covers two distinct audio surfaces:
+          1. HUD widgets currently playing (YouTube panel, music panel,
+             browser widget) — muted via the `widget_volume` data topic.
+          2. Per-machine OS master volume on each online desktop bridge
+             that has at least one active audio session (Spotify, Chrome
+             tab outside our HUD, anything making sound).
+
+        Spoken warning fires once per session — silent on subsequent
+        turns. Both surfaces are restored by `_maybe_auto_unmute` on the
+        next user turn, or by the 60 s safety task if the user falls
+        silent.
+        """
+        if self._auto_muted_kinds or self._auto_muted_machines:
+            return  # already muted this turn cycle
+
+        # ── Surface 1: HUD widgets ──────────────────────────────────
+        playing_ids = {
+            wid for wid, st in self._widget_playback_states.items()
+            if st == "playing"
+        }
+        kinds: set[str] = set()
+        for w in self._open_widgets:
+            if (w.get("id") or "") in playing_ids:
+                k = (w.get("kind") or "").lower()
+                if k:
+                    kinds.add(k)
+
+        # ── Surface 2: external (PC master) ─────────────────────────
+        busy_machines = await self._check_desktop_audio_busy()
+
+        if not kinds and not busy_machines:
+            return
+
+        # Mute HUD widgets.
+        for kind in sorted(kinds):
+            try:
+                await self._room.local_participant.publish_data(
+                    json.dumps({
+                        "type": "widget_volume",
+                        "kind": kind,
+                        "action": "mute",
+                        "reason": "user_speaking",
+                    }).encode(),
+                    reliable=True,
+                    topic="jarvis-ui",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("auto-mute widget publish failed: %s", exc)
+
+        # Mute desktop masters in parallel.
+        async def _mute_machine(m: str) -> None:
+            try:
+                await self._desktop.send(
+                    m, "volume", {"action": "mute"}, timeout=3.0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("auto-mute desktop send failed: %s", exc)
+
+        if busy_machines:
+            await asyncio.gather(
+                *(_mute_machine(m) for m in sorted(busy_machines)),
+                return_exceptions=False,
+            )
+
+        self._auto_muted_kinds = kinds
+        self._auto_muted_machines = busy_machines
+
+        # 60 s safety unmute: if the user falls silent and never starts
+        # another turn, don't strand audio muted forever.
+        if self._auto_mute_safety_task is None:
+            async def _safety() -> None:
+                try:
+                    await asyncio.sleep(60.0)
+                except asyncio.CancelledError:
+                    return
+                await self._maybe_auto_unmute()
+            self._auto_mute_safety_task = asyncio.create_task(_safety())
+
+        if not self._auto_mute_warning_spoken:
+            self._auto_mute_warning_spoken = True
+            try:
+                await self.session.say(
+                    "I'll mute that while you speak, sir."
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("auto-mute warning failed: %s", exc)
+
+    # ── Resource-ledger voice tools ──────────────────────────────────
+    @function_tool
+    async def list_open(self) -> str:
+        """List everything currently open — widgets, the live browser,
+        any tracked resource — along with how long each has been idle.
+
+        Use when the user asks 'what's open?' / 'what do I have open' /
+        'list everything open'.
+        """
+        items = await self._ledger.list_open()
+        if not items:
+            return "Nothing is open, sir."
+        now = time.monotonic()
+        parts: list[str] = []
+        for r in sorted(items, key=lambda x: x.opened_at):
+            idle = now - r.last_activity_at
+            mins = int(idle // 60)
+            if mins < 1:
+                idle_str = "just now"
+            elif mins == 1:
+                idle_str = "1 minute idle"
+            else:
+                idle_str = f"{mins} minutes idle"
+            parts.append(f"{r.label} ({idle_str})")
+        if len(parts) == 1:
+            return f"You have {parts[0]} open, sir."
+        return f"Open: {', '.join(parts[:-1])}, and {parts[-1]}, sir."
+
+    @function_tool
+    async def close_idle(self) -> str:
+        """Close every tracked resource that is currently past its idle
+        threshold — no warning, no grace. The background watcher
+        otherwise warns and waits 10 seconds before closing on its own.
+        """
+        items = await self._ledger.list_open()
+        now = time.monotonic()
+        closed: list[str] = []
+        for r in items:
+            if r.idle_threshold_s is None:
+                continue
+            if (now - r.last_activity_at) < r.idle_threshold_s:
+                continue
+            if await self._ledger.close(r.kind, r.id):
+                closed.append(r.label)
+        if not closed:
+            return "Nothing is idle, sir."
+        if len(closed) == 1:
+            return f"Closed {closed[0]}, sir."
+        return f"Closed {', '.join(closed[:-1])}, and {closed[-1]}, sir."
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         """Intercept commands before the LLM — and never die silently.
@@ -3794,15 +3805,6 @@ class Assistant(Agent):
         if await self._maybe_handle_desktop(text):
             raise StopResponse()
 
-        # Mobile control — operate the user's Android phone via the
-        # mobile-bridge APK.
-        if await self._maybe_handle_mobile(text):
-            raise StopResponse()
-
-        # Telegram (worker-side Bot API; no phone bridge required).
-        if await self._maybe_handle_telegram(text):
-            raise StopResponse()
-
         # Screen widgets — open/close panels on request (non-blocking).
         await self._maybe_handle_widget(text)
 
@@ -3830,33 +3832,12 @@ class Assistant(Agent):
                 self._pending_elab_id = None
                 asyncio.create_task(self._elab_dismiss(elab_id))
 
-        # 0) Gesture mode — must run BEFORE the bare camera intent so
-        #    phrasings like "turn on the camera gesture mode" claim as
-        #    gesture-mode (which enables the camera as a side effect)
-        #    instead of just toggling the camera.
-        gesture_want = _gesture_mode_intent(text)
-        if gesture_want is not None:
-            try:
-                # Camera state piggybacks gesture mode. Send camera FIRST
-                # so the recognizer's track-availability gate flips before
-                # the frontend tries to render the fullscreen preview.
-                await self._room.local_participant.publish_data(
-                    json.dumps({"type": "camera", "enabled": gesture_want}).encode(),
-                    reliable=True,
-                    topic=UI_COMMAND_TOPIC,
-                )
-                await self._room.local_participant.publish_data(
-                    json.dumps({"type": "gesture_mode", "enabled": gesture_want}).encode(),
-                    reliable=True,
-                    topic=UI_COMMAND_TOPIC,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("gesture_mode publish failed: %s", exc)
-                return
-            await self.session.say(
-                "Gesture mode on, sir." if gesture_want else "Gesture mode off, sir."
-            )
-            raise StopResponse()
+        # ── Cross-talk auto-mute ─────────────────────────────────────
+        # Top of every real turn: release any prior auto-mute, then mute
+        # what's currently playing so Jarvis can be heard. Cheap no-op
+        # when nothing is playing or already-muted state is current.
+        await self._maybe_auto_unmute()
+        await self._maybe_auto_mute()
 
         # 1) Camera on/off — structured command, short-circuit the turn.
         want = _camera_intent(text)
@@ -3872,6 +3853,30 @@ class Assistant(Agent):
                 return
             await self.session.say(
                 "Camera on, sir." if want else "Camera off, sir."
+            )
+            raise StopResponse()
+
+        # 1.5) Gesture mode — fullscreen blended camera overlay. Force
+        #      the camera on when entering so MediaPipe has frames.
+        gm = _gesture_mode_intent(text)
+        if gm is not None:
+            try:
+                if gm:
+                    await self._room.local_participant.publish_data(
+                        json.dumps({"type": "camera", "enabled": True}).encode(),
+                        reliable=True,
+                        topic=UI_COMMAND_TOPIC,
+                    )
+                await self._room.local_participant.publish_data(
+                    json.dumps({"type": "gesture_mode", "enabled": gm}).encode(),
+                    reliable=True,
+                    topic=UI_COMMAND_TOPIC,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("gesture-mode command publish failed: %s", exc)
+                return
+            await self.session.say(
+                "Gesture mode on, sir." if gm else "Gesture mode off, sir."
             )
             raise StopResponse()
 
@@ -4047,17 +4052,38 @@ def _attach_wake_listener(session: AgentSession, assistant: "Assistant") -> None
     transcriber emits "Jarvis" in ANY transcript (interim OR final), not
     only on a fully-endpointed turn. Works identically on the cascade
     (Deepgram) and the realtime (Gemini Live) paths — both emit
-    `user_input_transcribed` with `.transcript` + `.is_final`."""
+    `user_input_transcribed` with `.transcript` + `.is_final`.
+
+    Doubles as the pre-emptive auto-mute trigger: any interim transcript
+    while the agent is awake fires `_maybe_auto_mute` immediately, so
+    background audio (HUD widgets, PC music) is silenced WITHIN ~200 ms
+    of the user opening their mouth — well before the turn endpoints.
+    """
 
     @session.on("user_input_transcribed")
     def _on_user_transcript(ev) -> None:  # noqa: ANN001
-        if assistant._awake:
-            return
         text = getattr(ev, "transcript", "") or ""
-        if text and _WAKE_RE.search(text):
-            assistant._awake = True
-            assistant._just_woke = True
-            logger.info("wake: matched on transcript %r", text[:60])
+        if not assistant._awake:
+            if text and _WAKE_RE.search(text):
+                assistant._awake = True
+                assistant._just_woke = True
+                logger.info("wake: matched on transcript %r", text[:60])
+                # Wake-on-music: kick off the mute task right away so the
+                # background audio is down by the time TTS replies.
+                try:
+                    asyncio.create_task(assistant._maybe_auto_mute())
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        # Already awake — any speech is a candidate user turn. Fire the
+        # mute task PRE-EMPTIVELY on the first interim transcript so we
+        # don't wait for the endpoint to mute background audio. Cheap
+        # no-op when nothing is playing (cached).
+        if text:
+            try:
+                asyncio.create_task(assistant._maybe_auto_mute())
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def entrypoint(ctx: agents.JobContext):
@@ -4162,10 +4188,50 @@ async def entrypoint(ctx: agents.JobContext):
             msg = json.loads(bytes(packet.data).decode("utf-8"))
         except Exception:  # noqa: BLE001
             return
-        if msg.get("type") == "widget_state":
-            open_list = msg.get("open") or []
-            assistant._open_widgets = open_list if isinstance(open_list, list) else []
+        mtype = msg.get("type")
+        if mtype == "widget_state":
+            raw_open = msg.get("open")
+            open_list: list = raw_open if isinstance(raw_open, list) else []
+            prior_ids: set[str] = {
+                w.get("id") for w in assistant._open_widgets
+                if isinstance(w, dict) and isinstance(w.get("id"), str)
+            }
+            new_ids: set[str] = {
+                w.get("id") for w in open_list
+                if isinstance(w, dict) and isinstance(w.get("id"), str)
+            }
+            assistant._open_widgets = open_list
             assistant._open_widgets_at = time.monotonic()
+            # Diff into the resource ledger so "what's open?" is accurate.
+            for w in open_list:
+                if not isinstance(w, dict):
+                    continue
+                wid = w.get("id")
+                if not isinstance(wid, str) or wid in prior_ids:
+                    continue
+                label = w.get("title") or w.get("kind") or "widget"
+                asyncio.create_task(
+                    assistant._ledger.open("widget", wid, str(label))
+                )
+            for wid in prior_ids - new_ids:
+                asyncio.create_task(
+                    assistant._ledger.close("widget", wid)
+                )
+        elif mtype == "widget_playback":
+            wid = msg.get("id")
+            state = msg.get("state")
+            if isinstance(wid, str) and state in (
+                "playing", "paused", "stopped", "ended"
+            ):
+                if state == "playing":
+                    assistant._widget_playback_states[wid] = "playing"
+                else:
+                    assistant._widget_playback_states.pop(wid, None)
+    # Start the unified resource-ledger idle watcher (browser auto-closes
+    # after 10 min of no interaction; widgets carry no threshold; CTI
+    # keeps its own watchdog for the moment).
+    await assistant._ledger.start_idle_watcher(session)
+
     # Proactive elaboration is OFF by default. The OpenJarvis dual-track
     # elaboration fires on every turn (not the "3+ coherent topics" the
     # user expects) and its Claude-CLI backend currently leaks raw status

@@ -2,8 +2,10 @@ livekit-agents
 livekit-api
 livekit-plugins-openai
 livekit-plugins-deepgram
+livekit-plugins-google
 livekit-plugins-silero
 livekit-plugins-noise-cancellation
+google-genai>=1.0
 requests
 python-dotenv
 httpx
