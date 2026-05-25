@@ -196,6 +196,30 @@ def _probe_reflector(app_state: Any) -> Dict[str, Any]:
             }
         except Exception as exc:
             out["direct_engine_test"] = {"error": f"{type(exc).__name__}: {exc}"}
+        # ALSO call engine.generate directly with the reflector's exact
+        # prompt + model, so we can see the raw response separately from
+        # the reflector's JSON-parsing logic.
+        try:
+            from openjarvis.core.types import Message, Role
+            _refl_msgs = [
+                Message(role=Role.SYSTEM, content=_ref._REFLECT_SYSTEM),
+                Message(role=Role.USER, content=_ref._build_user_prompt(
+                    "What is 2+2?", "2+2 equals 4.", domain="debug-probe",
+                )),
+            ]
+            _refl_result = engine.generate(
+                _refl_msgs, model="openrouter/auto",
+                max_tokens=400, temperature=0.2,
+            ) if engine is not None else None
+            if isinstance(_refl_result, dict):
+                out["reflector_raw_engine"] = {
+                    "content_preview": str(_refl_result.get("content"))[:240],
+                    "model": _refl_result.get("model"),
+                    "usage": _refl_result.get("usage"),
+                }
+        except Exception as exc:
+            out["reflector_raw_engine"] = {"error": f"{type(exc).__name__}: {exc}"}
+
         raw = _ref._call_engine(
             _ref._REFLECT_SYSTEM,
             _ref._build_user_prompt(
