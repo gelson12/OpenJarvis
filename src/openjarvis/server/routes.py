@@ -890,25 +890,25 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
 
 def _payment_fallback_chain(messages: Any) -> dict | None:
     """When the primary engine returns 402 Payment Required (OpenRouter
-    credits exhausted), try free-tier providers in order of speed +
-    reliability. Returns a result dict on first success, or None if every
-    fallback failed.
+    credits exhausted), RACE every configured free/cheap provider in
+    parallel via the orchestrator's existing `run_all` + `pick_best`.
 
-    Providers are called via the orchestrator's existing async wrappers
-    (sync-wrapped here). Tools are NOT passed through — these wrappers
-    use plain chat APIs. That's fine for fallback: when credits run out,
-    a no-tool conversational reply beats a 500 / silence.
+    Returns a result dict on first usable winner, or None if every
+    provider returned an error within the timeout. Worst-case wall
+    time ≈ 4 s (orchestrator's first-batch wait), not 32 s.
 
-    Order:
-        1. Gemini direct (free up to 15 RPM, fast)
-        2. Groq (free + fastest open-weight inference)
-        3. DeepSeek (cheap + good function-following)
-        4. Cerebras (free + very fast)
+    Providers raced (whichever are env-configured):
+        Gemini direct · Groq · DeepSeek · Cerebras · SambaNova · Kimi ·
+        GitHub Models · GLM · OpenRouter (other model) · Ollama · Anthropic
+
+    Tools are NOT passed through — orchestrator's parallel wrappers use
+    plain chat APIs. That's acceptable for fallback: the SERVER
+    CAPABILITIES system block + AGENT_INSTRUCTION already give the LLM
+    enough ground truth to answer factually even without tools in scope.
     """
     import asyncio as _asyncio
-    import aiohttp as _aiohttp_lib
 
-    # Convert openjarvis Message objects → plain dict format for orchestrator
+    # Convert openjarvis Message objects → plain dict for orchestrator
     _msgs_plain: list[dict] = []
     for m in messages:
         role = getattr(m, "role", None)
@@ -919,44 +919,51 @@ def _payment_fallback_chain(messages: Any) -> dict | None:
         content = getattr(m, "content", "") or ""
         _msgs_plain.append({"role": role, "content": content})
 
-    async def _try_chain() -> dict | None:
-        async with _aiohttp_lib.ClientSession() as session:
-            from openjarvis.orchestrator.router import (
-                call_gemini_api, call_groq, call_deepseek, call_cerebras,
+    async def _race() -> dict | None:
+        from openjarvis.orchestrator.router import (
+            run_all as _run_all, pick_best as _pick_best,
+        )
+        try:
+            responses = await _asyncio.wait_for(
+                _run_all(_msgs_plain), timeout=10.0,
             )
-            for label, coro in (
-                ("gemini", call_gemini_api(session, _msgs_plain)),
-                ("groq",   call_groq(session, _msgs_plain)),
-                ("deepseek", call_deepseek(session, _msgs_plain)),
-                ("cerebras", call_cerebras(session, _msgs_plain)),
-            ):
-                try:
-                    r = await _asyncio.wait_for(coro, timeout=8.0)
-                except Exception as exc:
-                    logging.getLogger("openjarvis.server").warning(
-                        "openjarvis.fallback.%s_failed: %s", label, exc,
-                    )
-                    continue
-                text = (r or {}).get("text") or ""
-                if text and "Error" not in text:
-                    logging.getLogger("openjarvis.server").warning(
-                        "openjarvis.fallback.%s_served len=%d", label, len(text),
-                    )
-                    return {
-                        "content": text, "usage": {}, "tool_calls": None,
-                        "finish_reason": "stop", "_fallback_via": label,
-                    }
-        return None
+        except _asyncio.TimeoutError:
+            return None
+        if not responses:
+            return None
+        # Filter out the OpenRouter responses since that's what just failed —
+        # avoids picking the same broken pipe twice on the same turn.
+        cleaned = [
+            r for r in responses
+            if r and "Error" not in (r.get("text") or "")
+            and "openrouter" not in (r.get("model") or "").lower()
+        ]
+        if not cleaned:
+            # If only OpenRouter responded (and primary failed), nothing useful.
+            return None
+        winner = _pick_best(cleaned)
+        text = winner.get("text") or ""
+        if not text:
+            return None
+        logging.getLogger("openjarvis.server").warning(
+            "openjarvis.fallback.served_via=%s providers_clean=%d/%d",
+            winner.get("model", "?"), len(cleaned), len(responses),
+        )
+        return {
+            "content": text, "usage": {}, "tool_calls": None,
+            "finish_reason": "stop",
+            "_fallback_via": winner.get("model", "?"),
+        }
 
     try:
         loop = _asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(_try_chain())
+            return loop.run_until_complete(_race())
         finally:
             loop.close()
     except Exception as exc:
         logging.getLogger("openjarvis.server").warning(
-            "openjarvis.fallback.chain_failed: %s", exc,
+            "openjarvis.fallback.race_failed: %s", exc,
         )
         return None
 
