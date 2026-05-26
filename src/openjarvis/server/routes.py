@@ -1253,7 +1253,44 @@ def _handle_agent(
     if model:
         agent._model = model
     try:
-        result = agent.run(input_text, context=ctx)
+        try:
+            result = agent.run(input_text, context=ctx)
+        except Exception as _agent_exc:
+            # Round 6 — catch OpenRouter 402 here too. The agent path
+            # bypasses _handle_direct's 402 catcher, so without this every
+            # tool-bearing turn turns into a 500 → 15s of LiveKit retries
+            # → hallucinated "I don't have access" fallback. Route through
+            # the same parallel-race fallback we use elsewhere.
+            _emsg = str(_agent_exc)
+            if "402" in _emsg or "Payment Required" in _emsg or "more credits" in _emsg:
+                logging.getLogger("openjarvis.server").warning(
+                    "openjarvis.agent.payment_required model=%s — racing fallback providers",
+                    model,
+                )
+                _msgs_objs = _to_messages(req.messages)
+                _fallback = _payment_fallback_chain(_msgs_objs)
+                if _fallback and _fallback.get("content"):
+                    # Synthesise a minimal RunResult-shaped object so the
+                    # rest of this function can keep its existing flow.
+                    class _RR:
+                        def __init__(self, content):
+                            self.content = content
+                            self.metadata = {}
+                    result = _RR(_fallback["content"])
+                else:
+                    class _RR:
+                        def __init__(self, content):
+                            self.content = content
+                            self.metadata = {}
+                    result = _RR(
+                        "Apologies, sir — OpenRouter is out of credits and my "
+                        "free-tier fallback providers (Gemini, Groq, DeepSeek, "
+                        "Cerebras, Kimi, GLM, SambaNova) all failed to respond. "
+                        "Top up at openrouter.ai/settings/credits or check the "
+                        "fallback API keys."
+                    )
+            else:
+                raise
     finally:
         agent._model = original_model
 
