@@ -91,14 +91,18 @@ from hermes_router import HermesRouter, enabled as _hermes_route_enabled, should
 try:
     from accommodation import (  # noqa: F401
         AccommodationService,
+        BookingRequest as _AccommodationBookingRequest,
         Property as _AccommodationProperty,
         SearchQuery as _AccommodationSearchQuery,
     )
+    from accommodation import nlu as _accommodation_nlu
     _ACCOMMODATION_AVAILABLE = True
 except Exception as _exc:  # noqa: BLE001
     AccommodationService = None  # type: ignore[assignment]
+    _AccommodationBookingRequest = None  # type: ignore[assignment]
     _AccommodationProperty = None  # type: ignore[assignment]
     _AccommodationSearchQuery = None  # type: ignore[assignment]
+    _accommodation_nlu = None  # type: ignore[assignment]
     _ACCOMMODATION_AVAILABLE = False
     logging.getLogger(__name__).warning(
         "accommodation module unavailable (%s) — hotel booking disabled", _exc,
