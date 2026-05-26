@@ -72,6 +72,17 @@ ENV OPENJARVIS_BUILD_TIME=${BUILD_TIME}
 RUN python -c "from livekit.plugins import silero; silero.VAD.load()" 2>/dev/null || \
     echo "Silero VAD prefetch skipped; worker will download it on first job"
 
+# Belt-and-suspenders CRLF defence. Even with .gitattributes enforcing LF
+# on every commit, a Windows-side checkout / a `railway up` upload from a
+# misconfigured working tree CAN slip CRLF into the container. Bash on
+# Python 3.12 slim refuses CRLF and crashes the launcher with
+# "$'\r': command not found / set: pipefail: invalid option / exit 127".
+# This strip runs once at image-build time so no script needs to know
+# about it; it's idempotent on already-LF files.
+RUN find /app -maxdepth 4 \( -name '*.sh' -o -name 'entrypoint*' -o -name 'start*' \) \
+    -type f -print0 | xargs -0 -r sed -i 's/\r$//' \
+    && chmod +x /app/livekit/start.sh /app/entrypoint.sh 2>/dev/null || true
+
 EXPOSE 8080
 
 # Single container runs BOTH the OpenJarvis API server and the LiveKit

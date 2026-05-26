@@ -1,0 +1,27 @@
+# Force LF line endings for all shell scripts and Dockerfile-related
+# files. Without this, Windows developers (the user) commit CRLF which
+# bash on the Python 3.12 slim Docker base now refuses to interpret,
+# producing the
+#   /app/livekit/start.sh: line N: $'\r': command not found
+#   set: pipefail: invalid option name
+#   [start] a process exited (code 127); shutting down the container
+# crash-loop that wedged production on 2026-05-26.
+*.sh           text eol=lf
+*.bash         text eol=lf
+Dockerfile     text eol=lf
+*.dockerfile   text eol=lf
+.dockerignore  text eol=lf
+entrypoint*    text eol=lf
+start*         text eol=lf
+supervisord*   text eol=lf
+nginx*         text eol=lf
+
+# Python source — LF everywhere keeps cross-OS diffs clean
+*.py           text eol=lf
+
+# Keep binary files untouched
+*.png          binary
+*.jpg          binary
+*.ico          binary
+*.pdf          binary
+*.woff*        binary
