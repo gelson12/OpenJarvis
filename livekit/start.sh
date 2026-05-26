@@ -9,6 +9,12 @@ set -uo pipefail
 # round-trip, no second service. An explicit OPENJARVIS_URL still wins.
 export OPENJARVIS_URL="${OPENJARVIS_URL:-http://127.0.0.1:${PORT:-8080}}"
 
+# `python /app/livekit/worker.py` sets sys.path[0] to /app/livekit/, which
+# means top-level repo modules at /app/<name>/ (e.g. /app/accommodation/)
+# can't be imported by the worker. Adding /app to PYTHONPATH makes both
+# /app/ AND /app/livekit/ importable so top-level packages work.
+export PYTHONPATH="/app:${PYTHONPATH:-}"
+
 echo "[start] launching LiveKit voice worker (agent: openjarvis-agent)"
 python /app/livekit/worker.py start &
 WORKER_PID=$!
