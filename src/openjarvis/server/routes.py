@@ -538,6 +538,15 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 "answer_cache lookup skipped: %s", _ac_exc,
             )
 
+    # Track which non-always-on groups got enabled by auto-inject. The
+    # orchestrator gate below MUST refuse to take over the request when
+    # any domain-specific group fired (gmail/outlook/calendar/github/...),
+    # because the orchestrator's parallel-provider path STRIPS TOOLS
+    # entirely. Without this gate, "do you have access to my gmail?" gets
+    # routed through the orchestrator → tools dropped → model hallucinates
+    # "I have no email access" even though gmail_* tools were injected.
+    _auto_inject_domain_groups: list[str] = []
+
     # Auto-inject integration tools when the frontend didn't send any,
     # filtered by relevance to the user's latest message.
     #
@@ -564,6 +573,13 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             )
             if relevant_tools:
                 request_body.tools = relevant_tools
+                # Strip "always_on" / "always_on_only" labels — those don't
+                # imply a domain intent that requires preserved tool routing.
+                _auto_inject_domain_groups = [
+                    g.split("(", 1)[0]  # drop the "(partial)" suffix
+                    for g in (enabled_groups or [])
+                    if g not in ("always_on", "always_on_only")
+                ]
                 # WARNING level so prod logs surface this — openjarvis logger
                 # defaults to WARNING+. Critical for diagnosing tool routing.
                 logging.getLogger("openjarvis.server").warning(
@@ -636,9 +652,16 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     # pick best by mode=fastest|consensus).  These tiers don't need tools
     # anyway, and Hermes structurally cannot do parallel ensemble.
     # Round 5.7: also activate for hybrid tiers 2 + 3 (medium/high complexity)
+    # Round 6 FIX (2026-05-26): refuse the orchestrator path when the auto-
+    # inject filter enabled a DOMAIN-SPECIFIC tool group (gmail/outlook/
+    # calendar/github/n8n/...). The orchestrator's parallel-provider path
+    # strips tools entirely; routing tool-bearing requests through it
+    # caused "do you have gmail access?" → "no access" hallucinations
+    # despite the gmail_* tools being correctly injected.
     _orch_gate_open = (
         not request_body.stream
         and complexity_info is not None
+        and not _auto_inject_domain_groups
         and os.getenv("OPENJARVIS_ORCHESTRATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
         and (
             complexity_info.tier in ("trivial", "simple")
