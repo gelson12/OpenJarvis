@@ -888,6 +888,79 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     )
 
 
+def _payment_fallback_chain(messages: Any) -> dict | None:
+    """When the primary engine returns 402 Payment Required (OpenRouter
+    credits exhausted), try free-tier providers in order of speed +
+    reliability. Returns a result dict on first success, or None if every
+    fallback failed.
+
+    Providers are called via the orchestrator's existing async wrappers
+    (sync-wrapped here). Tools are NOT passed through — these wrappers
+    use plain chat APIs. That's fine for fallback: when credits run out,
+    a no-tool conversational reply beats a 500 / silence.
+
+    Order:
+        1. Gemini direct (free up to 15 RPM, fast)
+        2. Groq (free + fastest open-weight inference)
+        3. DeepSeek (cheap + good function-following)
+        4. Cerebras (free + very fast)
+    """
+    import asyncio as _asyncio
+    import aiohttp as _aiohttp_lib
+
+    # Convert openjarvis Message objects → plain dict format for orchestrator
+    _msgs_plain: list[dict] = []
+    for m in messages:
+        role = getattr(m, "role", None)
+        if hasattr(role, "value"):
+            role = role.value
+        elif not isinstance(role, str):
+            role = "user"
+        content = getattr(m, "content", "") or ""
+        _msgs_plain.append({"role": role, "content": content})
+
+    async def _try_chain() -> dict | None:
+        async with _aiohttp_lib.ClientSession() as session:
+            from openjarvis.orchestrator.router import (
+                call_gemini_api, call_groq, call_deepseek, call_cerebras,
+            )
+            for label, coro in (
+                ("gemini", call_gemini_api(session, _msgs_plain)),
+                ("groq",   call_groq(session, _msgs_plain)),
+                ("deepseek", call_deepseek(session, _msgs_plain)),
+                ("cerebras", call_cerebras(session, _msgs_plain)),
+            ):
+                try:
+                    r = await _asyncio.wait_for(coro, timeout=8.0)
+                except Exception as exc:
+                    logging.getLogger("openjarvis.server").warning(
+                        "openjarvis.fallback.%s_failed: %s", label, exc,
+                    )
+                    continue
+                text = (r or {}).get("text") or ""
+                if text and "Error" not in text:
+                    logging.getLogger("openjarvis.server").warning(
+                        "openjarvis.fallback.%s_served len=%d", label, len(text),
+                    )
+                    return {
+                        "content": text, "usage": {}, "tool_calls": None,
+                        "finish_reason": "stop", "_fallback_via": label,
+                    }
+        return None
+
+    try:
+        loop = _asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_try_chain())
+        finally:
+            loop.close()
+    except Exception as exc:
+        logging.getLogger("openjarvis.server").warning(
+            "openjarvis.fallback.chain_failed: %s", exc,
+        )
+        return None
+
+
 def _record_cost(result: Any, *, model: str, latency_ms: int, role: str = "main") -> None:
     """Round 5.4 — record main-path engine call into cost_telemetry."""
     try:
@@ -1045,28 +1118,30 @@ def _handle_direct(
                     **kwargs,
                 )
             except Exception as _e_exc:
-                # Round 6 — surface OpenRouter 402-style credit refusals as a
-                # graceful chat reply instead of a 500. A 500 here causes the
-                # LiveKit OpenAI plugin to retry 4 times (~15s of dead air)
-                # before falling back to a hallucinated answer with no tools.
                 _emsg = str(_e_exc)
                 _is_payment = "402" in _emsg or "Payment Required" in _emsg or "more credits" in _emsg
                 if _is_payment:
+                    # Round 6 — TRUE FALLBACK CHAIN: try free-tier providers
+                    # before giving up. Order picked for cost (free first) +
+                    # quality + tool-call reliability. Each call is sync via
+                    # the orchestrator's existing provider wrappers.
                     logging.getLogger("openjarvis.server").warning(
-                        "openjarvis.engine.payment_required model=%s — degrading to friendly reply",
+                        "openjarvis.engine.payment_required model=%s — trying fallback chain",
                         model,
                     )
-                    result = {
-                        "content": (
-                            "Apologies, sir — I'm temporarily out of OpenRouter credits "
-                            "for this call. Top up at openrouter.ai/settings/credits or "
-                            "set a free-tier model (DeepSeek / Gemini direct) as the "
-                            "OPENJARVIS_MODEL env var, and try again."
-                        ),
-                        "usage": {},
-                        "tool_calls": None,
-                        "finish_reason": "stop",
-                    }
+                    result = _payment_fallback_chain(messages)
+                    if result is None:
+                        result = {
+                            "content": (
+                                "Apologies, sir — OpenRouter is out of credits AND "
+                                "my fallback providers (Gemini, Groq, DeepSeek, "
+                                "Cerebras) all failed to respond. Top up at "
+                                "openrouter.ai/settings/credits, or check that at "
+                                "least one of GEMINI_API_KEY / GROQ_API_KEY / "
+                                "DEEPSEEK_API_KEY / CEREBRAS_API_KEY is valid."
+                            ),
+                            "usage": {}, "tool_calls": None, "finish_reason": "stop",
+                        }
                 else:
                     raise
             _record_cost(result, model=model,
