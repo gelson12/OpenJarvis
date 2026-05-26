@@ -1274,42 +1274,77 @@ def _handle_agent(
     original_model = agent._model
     if model:
         agent._model = model
+    def _looks_like_provider_error(text: str) -> bool:
+        """Detect when the model RETURNED an error in the response text
+        instead of raising an exception. Real symptom from production:
+        Gemini 2.5 Flash overload returned `Error during generation: 503
+        UNAVAILABLE. ...` AS THE ASSISTANT REPLY, which then got spoken
+        verbatim to the user. We need to treat that as a recoverable
+        failure and race the fallback chain."""
+        if not text or len(text) > 800:
+            # Real assistant replies aren't long enough to be a wrapped error
+            return False
+        t = text.lower()
+        return (
+            "error during generation" in t
+            or ("503" in text and "unavailable" in t)
+            or "resource_exhausted" in t
+            or ("429" in text and "rate" in t)
+            or "high demand" in t
+            or "model overloaded" in t
+            or "service unavailable" in t
+        )
+
     try:
         try:
             result = agent.run(input_text, context=ctx)
+            # Round 6 fix — the model may have RETURNED an error string
+            # instead of raising. Treat that as a recoverable failure too.
+            if result and _looks_like_provider_error(getattr(result, "content", "") or ""):
+                raise RuntimeError(
+                    f"Provider error in response body: {(result.content or '')[:200]}"
+                )
         except Exception as _agent_exc:
-            # Round 6 — catch OpenRouter 402 here too. The agent path
-            # bypasses _handle_direct's 402 catcher, so without this every
-            # tool-bearing turn turns into a 500 → 15s of LiveKit retries
-            # → hallucinated "I don't have access" fallback. Route through
-            # the same parallel-race fallback we use elsewhere.
+            # Round 6 — broad provider-failure catcher. Originally only
+            # caught 402; user hit a Gemini 503 UNAVAILABLE (free-tier
+            # overload) that hung for 5 minutes before failing. Now
+            # catches every provider-side recoverable error and routes
+            # to the parallel-race fallback chain.
             _emsg = str(_agent_exc)
-            if "402" in _emsg or "Payment Required" in _emsg or "more credits" in _emsg:
+            _emsg_low = _emsg.lower()
+            _is_recoverable = any(s in _emsg for s in (
+                "402", "Payment Required", "more credits",          # OpenRouter credit
+                "503", "UNAVAILABLE", "Service Unavailable",        # Gemini / OpenAI overload
+                "429", "Too Many Requests", "rate limit", "RESOURCE_EXHAUSTED",
+                "500", "Internal Server Error",                      # upstream 5xx
+                "Bad Gateway", "502",                                # gateway errors
+                "Gateway Timeout", "504",                            # gateway timeouts
+                "Connection error", "Connection reset",              # transient network
+                "ReadTimeout", "ConnectTimeout",                     # httpx timeouts
+                "high demand",                                       # Google's overload msg
+            )) or any(s in _emsg_low for s in (
+                "overload", "unavailable", "timeout",
+            ))
+            if _is_recoverable:
                 logging.getLogger("openjarvis.server").warning(
-                    "openjarvis.agent.payment_required model=%s — racing fallback providers",
-                    model,
+                    "openjarvis.agent.recoverable_provider_failure model=%s err=%r "
+                    "— racing fallback providers",
+                    model, _emsg[:200],
                 )
                 _msgs_objs = _to_messages(req.messages)
                 _fallback = _payment_fallback_chain(_msgs_objs)
+                class _RR:
+                    def __init__(self, content):
+                        self.content = content
+                        self.metadata = {}
                 if _fallback and _fallback.get("content"):
-                    # Synthesise a minimal RunResult-shaped object so the
-                    # rest of this function can keep its existing flow.
-                    class _RR:
-                        def __init__(self, content):
-                            self.content = content
-                            self.metadata = {}
                     result = _RR(_fallback["content"])
                 else:
-                    class _RR:
-                        def __init__(self, content):
-                            self.content = content
-                            self.metadata = {}
                     result = _RR(
-                        "Apologies, sir — OpenRouter is out of credits and my "
-                        "free-tier fallback providers (Gemini, Groq, DeepSeek, "
-                        "Cerebras, Kimi, GLM, SambaNova) all failed to respond. "
-                        "Top up at openrouter.ai/settings/credits or check the "
-                        "fallback API keys."
+                        "Apologies, sir — the primary model was unavailable and "
+                        "all 14 fallback providers failed to respond within the "
+                        "race window. Try again in a moment; this is usually "
+                        "transient capacity pressure on the free tiers."
                     )
             else:
                 raise
