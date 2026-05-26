@@ -2759,7 +2759,10 @@ class Assistant(Agent):
         candidates: list[dict] = []
 
         # HUD audio widgets (visible panels that can produce sound).
-        audio_widget_kinds = {"youtube", "music", "browser"}
+        # `news` is included because show_news opens a companion YouTube
+        # widget by default — when the user says "mute the news" they mean
+        # the audio coming from that companion, not the silent headlines.
+        audio_widget_kinds = {"youtube", "music", "browser", "news"}
         # `mute` is a PREVENTIVE action — apply it to anything that
         # could produce sound, even if paused right now. Volume up/down/
         # set still respect playback state (no point boosting silence).
@@ -2778,10 +2781,21 @@ class Assistant(Agent):
             match_words = {wkind, title.lower()}
             if wkind == "youtube":
                 match_words.update({"youtube", "video", "the video", "panel"})
+                # The companion YouTube widget that `show_news` opens has
+                # title prefixed "News Video — …". If we see that, also
+                # match on news/headlines so "mute the news" routes here.
+                if title.lower().startswith("news video"):
+                    match_words.update({"news", "headlines", "the news"})
             elif wkind == "music":
                 match_words.update({"music", "the music", "panel"})
             elif wkind == "browser":
                 match_words.update({"browser", "the browser", "panel"})
+            elif wkind == "news":
+                # The headlines panel itself is silent; the audio comes
+                # from the companion YouTube widget (matched separately).
+                # But the user says "mute the news" so we still want this
+                # candidate to appear in the disambiguation list.
+                match_words.update({"news", "headlines", "the news", "panel"})
             candidates.append({
                 "label": title if wkind != "youtube" else "YouTube",
                 "target_kind": "widget",
@@ -3018,6 +3032,88 @@ class Assistant(Agent):
             await self.session.say(reply)
         except Exception:  # noqa: BLE001
             pass
+
+    async def _maybe_handle_music(self, text: str) -> bool:
+        """Handle "play music" / "play some music" / "music please" with
+        explicit disambiguation. Without this handler, the request falls
+        through to the LLM which says "I cannot play music" — useless.
+
+        Logic:
+          - If a laptop bridge is online and a music app (Spotify, etc.) is
+            already running there, ask: "On your laptop or via YouTube?"
+          - Otherwise offer the YouTube fallback: "I can search YouTube for
+            the music of your choice — what would you like?"
+          - If the user already specified an artist/song in the same turn
+            ("play Pink Floyd"), open the YouTube widget directly.
+        """
+        if not text:
+            return False
+        low = text.lower()
+        # Trigger: a play verb + music noun. "play me a song" / "music
+        # please" / "could you play music".
+        play_verb = re.search(r"\b(play|put on|throw on|queue|start)\b", low)
+        music_noun = re.search(
+            r"\b(music|song|songs|track|tune|tunes|playlist|album|"
+            r"some\s+music|bit\s+of\s+music)\b", low,
+        )
+        if not (play_verb and music_noun):
+            return False
+        # If the user explicitly said "on my laptop/pc/rog", let the
+        # desktop router handle it (Spotify on the bridge).
+        if _DESKTOP_MACHINE_RE.search(text):
+            return False
+        # Extract any artist/song after "play"
+        m = re.search(
+            r"\bplay\s+(?:me\s+|some\s+)?(.+?)(?:\s+please|\s*\?|\s*$)", low,
+        )
+        specific = ""
+        if m:
+            specific = m.group(1).strip()
+            # Strip the music-noun if it's the whole match ("play music")
+            specific = re.sub(
+                r"\b(music|song|songs|track|tune|tunes|playlist|album|"
+                r"some\s+music|bit\s+of\s+music)\b",
+                "", specific, flags=re.I,
+            ).strip()
+        if specific and len(specific) >= 3:
+            # User named something specific — open YouTube widget directly
+            try:
+                await self.search_youtube(specific)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("music search_youtube failed: %s", exc)
+                try:
+                    await self.session.say(
+                        "I couldn't reach YouTube just now, sir."
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            return True
+        # No specific track — disambiguate based on laptop presence
+        try:
+            await self._desktop._ensure()
+        except Exception:  # noqa: BLE001
+            pass
+        machines = []
+        try:
+            machines = self._desktop.online_machines() or []
+        except Exception:  # noqa: BLE001
+            pass
+        if machines:
+            reply = (
+                f"Would you like the music on your {machines[0]}, sir, or "
+                "would you prefer I open YouTube here on the HUD?"
+            )
+        else:
+            reply = (
+                "Your laptop bridge isn't connected, sir. Shall I open "
+                "YouTube here and search for some music of your choice? "
+                "Just tell me an artist or genre."
+            )
+        try:
+            await self.session.say(reply)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
     async def _maybe_handle_content(self, text: str) -> bool:
         """Handle search / video / news / maps / browser intents by regex.
@@ -4189,25 +4285,25 @@ class Assistant(Agent):
                 logger.debug("news-companion youtube fetch failed: %s", exc)
                 videos = []
             if videos:
-                async def _open_video_after_summary() -> None:
-                    try:
-                        await asyncio.sleep(4.0)
-                        await self._publish_ui(
-                            {
-                                "type": "open_widget",
-                                "kind": "youtube",
-                                "title": f"News Video — {video_query_short[:50]}",
-                                "payload": {
-                                    "query": video_query_short,
-                                    "videos": videos,
-                                },
-                            }
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "delayed news-video open failed: %s", exc
-                        )
-                asyncio.create_task(_open_video_after_summary())
+                # Open the companion YouTube widget immediately, in
+                # parallel with the headlines panel. The previous 4-second
+                # sleep was a UX delay the user explicitly asked to remove.
+                try:
+                    await self._publish_ui(
+                        {
+                            "type": "open_widget",
+                            "kind": "youtube",
+                            "title": f"News Video — {video_query_short[:50]}",
+                            "payload": {
+                                "query": video_query_short,
+                                "videos": videos,
+                            },
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "news-companion video open failed: %s", exc
+                    )
 
         where = f" on {topic}" if topic else ""
         if top_title:
@@ -4687,6 +4783,55 @@ class Assistant(Agent):
         if await self._maybe_handle_apk_repo_followup(text):
             raise StopResponse()
 
+        # Camera on/off — highly specific, runs FIRST among voice intents
+        # so phrases like "turn on the camera" never get swallowed by the
+        # desktop hint gate (which contains "open|launch|start|run").
+        _early_cam = _camera_intent(text)
+        if _early_cam is not None:
+            try:
+                await self._room.local_participant.publish_data(
+                    json.dumps({"type": "camera", "enabled": _early_cam}).encode(),
+                    reliable=True,
+                    topic=UI_COMMAND_TOPIC,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("camera command publish failed: %s", exc)
+            try:
+                await self.session.say(
+                    "Camera on, sir." if _early_cam else "Camera off, sir."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise StopResponse()
+
+        # Gesture mode — same rationale as camera. Must precede desktop +
+        # content dispatchers so "gesture mode" / "turn on gesture mode"
+        # never hits the desktop router (which produces the misleading
+        # "your laptop's desktop-bridge isn't connected" error).
+        _early_gm = _gesture_mode_intent(text)
+        if _early_gm is not None:
+            try:
+                if _early_gm:
+                    await self._room.local_participant.publish_data(
+                        json.dumps({"type": "camera", "enabled": True}).encode(),
+                        reliable=True,
+                        topic=UI_COMMAND_TOPIC,
+                    )
+                await self._room.local_participant.publish_data(
+                    json.dumps({"type": "gesture_mode", "enabled": _early_gm}).encode(),
+                    reliable=True,
+                    topic=UI_COMMAND_TOPIC,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("gesture-mode command publish failed: %s", exc)
+            try:
+                await self.session.say(
+                    "Gesture mode on, sir." if _early_gm else "Gesture mode off, sir."
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise StopResponse()
+
         # Volume — disambiguates across HUD widgets and desktop apps.
         # Runs BEFORE content + desktop so "mute" never falls into the
         # YouTube content matcher and never needs "on my laptop".
@@ -4709,6 +4854,12 @@ class Assistant(Agent):
         # Runs BEFORE content so a bare "yes" after "confirm the Marriott?"
         # doesn't get swallowed by a search/show handler.
         if await self._maybe_resume_accommodation_book(text):
+            raise StopResponse()
+
+        # Music intent — disambiguate laptop vs YouTube. Runs BEFORE
+        # content so "play some music" doesn't get misrouted to the
+        # generic websearch matcher.
+        if await self._maybe_handle_music(text):
             raise StopResponse()
 
         # Screen content — search / video / news / maps / live browser.
@@ -4777,46 +4928,9 @@ class Assistant(Agent):
         await self._maybe_auto_unmute()
         await self._maybe_auto_mute()
 
-        # 1) Camera on/off — structured command, short-circuit the turn.
-        want = _camera_intent(text)
-        if want is not None:
-            try:
-                await self._room.local_participant.publish_data(
-                    json.dumps({"type": "camera", "enabled": want}).encode(),
-                    reliable=True,
-                    topic=UI_COMMAND_TOPIC,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("camera command publish failed: %s", exc)
-                return
-            await self.session.say(
-                "Camera on, sir." if want else "Camera off, sir."
-            )
-            raise StopResponse()
-
-        # 1.5) Gesture mode — fullscreen blended camera overlay. Force
-        #      the camera on when entering so MediaPipe has frames.
-        gm = _gesture_mode_intent(text)
-        if gm is not None:
-            try:
-                if gm:
-                    await self._room.local_participant.publish_data(
-                        json.dumps({"type": "camera", "enabled": True}).encode(),
-                        reliable=True,
-                        topic=UI_COMMAND_TOPIC,
-                    )
-                await self._room.local_participant.publish_data(
-                    json.dumps({"type": "gesture_mode", "enabled": gm}).encode(),
-                    reliable=True,
-                    topic=UI_COMMAND_TOPIC,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("gesture-mode command publish failed: %s", exc)
-                return
-            await self.session.say(
-                "Gesture mode on, sir." if gm else "Gesture mode off, sir."
-            )
-            raise StopResponse()
+        # Camera + gesture mode are now handled at the top of _handle_turn
+        # (above the desktop/content dispatchers) so phrases like "play"
+        # / "open" / "video" don't get swallowed by _DESKTOP_HINT_RE.
 
         # 2) Vision — sample a frame and inject a description so the
         #    normal OpenJarvis text turn answers as if Jarvis can see.
@@ -4985,7 +5099,12 @@ def _build_cascade_session(ctx: agents.JobContext) -> AgentSession:
             model=model_name,
             base_url=f"{openjarvis_url}/v1",
             api_key=openjarvis_key,
-            timeout=8.0,
+            # 4s timeout (down from 8s). chat_completions consistently
+            # responds in 1-2s for trivial/simple turns on the post-Round-5
+            # backend; the prior 8s allowed 4 retries (~32s of dead air)
+            # when the backend stalled. 4s + the framework's 2 retries =
+            # max ~14s, which is the absolute ceiling for a voice turn.
+            timeout=4.0,
             extra_headers={
                 **_openjarvis_auth_headers(),
                 "X-OpenJarvis-Stream": "openai",
