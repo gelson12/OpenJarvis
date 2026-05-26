@@ -1648,23 +1648,59 @@ async def _handle_stream(
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
         except Exception as exc:
-            # Surface errors as a content chunk so the frontend can
-            # display them instead of silently failing.
             import logging
+            _log = logging.getLogger("openjarvis.server")
+            _log.error("Stream error: %s", exc, exc_info=True)
 
-            logging.getLogger("openjarvis.server").error(
-                "Stream error: %s",
-                exc,
-                exc_info=True,
+            # Round 6 — STREAMING-PATH FALLBACK. When the primary stream
+            # fails (Gemini 503, OpenRouter 402, timeouts, etc.), race the
+            # parallel-provider chain and yield its winner as a regular
+            # chunk. Without this, the raw exception was being yielded AS
+            # SPOKEN CONTENT (e.g. user heard "Error during generation:
+            # 503 UNAVAILABLE..." in their voice TTS). The agent + direct
+            # paths already have this; streaming was the missing third path.
+            _emsg = str(exc)
+            _emsg_low = _emsg.lower()
+            _recoverable = any(s in _emsg for s in (
+                "402","Payment Required","more credits",
+                "503","UNAVAILABLE","Service Unavailable",
+                "429","Too Many Requests","rate limit","RESOURCE_EXHAUSTED",
+                "500","Internal Server Error","502","Bad Gateway",
+                "504","Gateway Timeout","Connection error","Connection reset",
+                "ReadTimeout","ConnectTimeout","high demand",
+                "INVALID_ARGUMENT","function_declarations",
+            )) or any(s in _emsg_low for s in ("overload","unavailable","timeout"))
+
+            if _recoverable:
+                _log.warning(
+                    "openjarvis.stream.recoverable_failure err=%r — racing fallback providers",
+                    _emsg[:200],
+                )
+                _fb = _payment_fallback_chain(messages)
+                if _fb and _fb.get("content"):
+                    _txt = _fb["content"]
+                    # Yield the fallback as a single content chunk
+                    _content_chunk = ChatCompletionChunk(
+                        id=chunk_id, model=model,
+                        choices=[StreamChoice(delta=DeltaMessage(content=_txt),
+                                              finish_reason="stop")],
+                    )
+                    yield f"data: {_content_chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+            # Either non-recoverable or fallback also failed — give the
+            # user a clean spoken-friendly message, NOT the raw exception.
+            _polite = (
+                "Apologies, sir — the language model is briefly unavailable. "
+                "Give me a moment and try again."
             )
             error_chunk = ChatCompletionChunk(
                 id=chunk_id,
                 model=model,
                 choices=[
                     StreamChoice(
-                        delta=DeltaMessage(
-                            content=f"\n\nError during generation: {exc}",
-                        ),
+                        delta=DeltaMessage(content=_polite),
                         finish_reason="stop",
                     )
                 ],
