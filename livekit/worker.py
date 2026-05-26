@@ -47,6 +47,7 @@ import random
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from datetime import datetime, timedelta, timezone
 
@@ -132,6 +133,29 @@ SCREEN:
 - web_search, search_youtube, show_news and show_map open result panels;
   open_browser opens a live, interactive browser the user can click and scroll.
 - Call the matching tool when asked; keep the spoken reply to one sentence.
+
+CLARIFICATION (CRITICAL — this is how you handle 'didn't catch that'):
+The user's microphone is not always clean. When their message implies they
+didn't understand or hear your prior reply, you MUST re-state your prior
+reply more clearly — never say "I did not receive a query from you", never
+claim the message is empty.
+
+Treat ALL of these as a "please repeat" request, regardless of phrasing:
+  "I didn't catch that", "say again", "come again", "pardon?", "huh?",
+  "what?", "sorry?", "I beg your pardon", "one more time", "what was that",
+  "could you repeat", "I missed that", "I don't follow", "speak up",
+  "I didn't hear you", "what did you say", any short interjection that
+  signals confusion, OR any other variation you can plausibly read as
+  asking you to repeat.
+
+When this happens:
+  1. Re-state your previous response in one short sentence.
+  2. If unclear what to repeat, ask: "Apologies sir, which part shall I
+     repeat?" — NEVER say the user sent nothing.
+  3. Don't apologise excessively. One "of course, sir" is enough.
+
+If the user's message is genuinely empty or you cannot infer intent,
+respond with a single graceful question, NOT a refusal.
 """
 
 
@@ -214,6 +238,78 @@ def _camera_intent(text: str):
 # the widgets. Toggled by voice ("turn on/off gesture mode"); when
 # turning on we force the camera publication on too so MediaPipe has
 # frames.
+# "Didn't catch that" / "say again" / "repeat" — meta-clarification phrases
+# that ask Jarvis to re-state his prior response. Without intercepting,
+# these land on the LLM as a fresh (empty-feeling) query and the model
+# replies "I did not receive a query from you" — the worst possible UX.
+_REPEAT_LAST_RE = re.compile(
+    r"\b(?:"
+    # "didn't catch/hear/get/understand/follow that" + contractions
+    r"d(?:i|y|o)n[\'’]?t\s+(?:quite\s+|really\s+|just\s+)?"
+    r"(?:catch|hear|get|understand|follow)\s+(?:that|what\s+you\s+said|you|it)?|"
+    # "say that/it again", "say again"
+    r"say\s+(?:that|it)?\s*again|"
+    # "come again"
+    r"come\s+again|"
+    # "could/can/would you repeat", "repeat that/please/etc"
+    r"(?:could|can|would|will|please)\s+you\s+(?:please\s+)?repeat|"
+    r"repeat\s+(?:that|what|yourself|please|it|once\s+more)?|"
+    # "one more time"
+    r"one\s+more\s+time|"
+    # "what did/was you/that say"
+    r"what\s+(?:did|was)\s+(?:you|that)\s+(?:say|said)?|"
+    # "i missed that/what you said"
+    r"i\s+missed\s+(?:that|what\s+you\s+said|it)|"
+    # "pardon?" / "I beg your pardon"
+    r"(?:i\s+beg\s+your\s+)?pardon|"
+    # "not quite sure/clear what you said/mean"
+    r"not\s+quite\s+(?:sure|clear)\s+what\s+you\s+(?:said|mean)|"
+    # "i don't follow/get that/understand"
+    r"i\s+don[\'’]?t\s+(?:follow|get\s+that|understand)|"
+    # "speak up" / "louder please"
+    r"speak\s+up|louder\s+please|louder,?\s+sir"
+    r")\b|"
+    # Bare interjections at the END of the utterance (anchored)
+    r"(?:^|\s)(?:huh|what|sorry|eh|hmm)\??\s*$",
+    re.IGNORECASE,
+)
+
+
+def _last_assistant_from_ctx(turn_ctx: Any) -> str:
+    """Pull the most recent assistant message text from a LiveKit chat
+    context. Best-effort across livekit-agents versions — tries the
+    common attribute / dict shapes and returns "" on miss."""
+    if turn_ctx is None:
+        return ""
+    items = (
+        getattr(turn_ctx, "items", None)
+        or getattr(turn_ctx, "messages", None)
+        or []
+    )
+    for item in reversed(list(items)):
+        role = (
+            getattr(item, "role", None)
+            or (item.get("role") if isinstance(item, dict) else None)
+        )
+        if role != "assistant":
+            continue
+        content = (
+            getattr(item, "text_content", None)
+            or getattr(item, "content", None)
+            or (item.get("content") if isinstance(item, dict) else None)
+            or ""
+        )
+        if isinstance(content, list):
+            # Some versions store content as a list of segments
+            content = " ".join(
+                str(c.get("text") if isinstance(c, dict) else c)
+                for c in content if c
+            )
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
 _GESTURE_MODE_WORD = re.compile(r"\bgesture(?:\s+mode|\s+control)?\b", re.I)
 _GESTURE_MODE_OFF = re.compile(
     r"\b(off|disable|stop|exit|leave|cancel|hide|turn it off)\b", re.I
@@ -2118,6 +2214,11 @@ class Assistant(Agent):
         self._cti_up: bool = False
         self._cti_last_active: float = 0.0
         self._cti_idle_task: asyncio.Task | None = None
+        # Last assistant reply (for "repeat that" / "I didn't catch that"
+        # clarification handling). Updated by `_remember_say` whenever WE
+        # speak; also pulled from turn_ctx as a fallback when the framework
+        # spoke (e.g. an LLM-produced reply that bypassed session.say).
+        self._last_assistant_text: str = ""
         # Wake/sleep: dormant on connect, woken by "Hey Jarvis".
         self._awake = False
         # Set by the interim-transcript wake listener: the next turn is
@@ -4752,6 +4853,35 @@ class Assistant(Agent):
                 self._awake = False
                 await self.session.say("Goodbye, sir.")
                 raise StopResponse()
+
+        # ── Repeat-last clarification (BEFORE Hermes + all intents) ───────
+        # If the user signals they didn't catch the prior reply, re-speak
+        # what we just said. Regex covers the common phrasings (~90% of
+        # cases) instantly without an LLM call. For phrasings the regex
+        # misses, the AGENT_INSTRUCTION system prompt now explicitly tells
+        # the LLM how to handle them gracefully — so the long tail still
+        # gets handled, just via the (slightly slower) LLM path.
+        if _REPEAT_LAST_RE.search(text):
+            last = self._last_assistant_text.strip()
+            if not last:
+                last = _last_assistant_from_ctx(turn_ctx)
+            if last:
+                # Cap length so very long prior replies don't sound silly
+                snippet = last if len(last) <= 280 else (last[:270] + "…")
+                try:
+                    await self.session.say(f"Of course, sir — {snippet}")
+                    self._last_assistant_text = snippet
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    await self.session.say(
+                        "Apologies sir, I don't have a prior reply to repeat. "
+                        "What would you like me to do?"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            raise StopResponse()
 
         # Hermes selective routing — multi-step queries go to Hermes for the
         # full Tier 1+2 agentic stack (planner decomposes into subtasks,
