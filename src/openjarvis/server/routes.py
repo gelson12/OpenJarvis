@@ -1669,7 +1669,14 @@ async def _handle_stream(
                 "504","Gateway Timeout","Connection error","Connection reset",
                 "ReadTimeout","ConnectTimeout","high demand",
                 "INVALID_ARGUMENT","function_declarations",
-            )) or any(s in _emsg_low for s in ("overload","unavailable","timeout"))
+                # Tool-call validation failures from Groq/Llama models that
+                # hallucinate tool names. Falling back to a more disciplined
+                # provider (Claude/OpenAI) usually succeeds where the
+                # primary model produced an invalid tool reference.
+                "tool call validation failed",
+                "not in request.tools",
+                "Unknown function",
+            )) or any(s in _emsg_low for s in ("overload","unavailable","timeout","validation failed"))
 
             if _recoverable:
                 _log.warning(
