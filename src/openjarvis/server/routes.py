@@ -985,17 +985,39 @@ def _payment_fallback_chain(messages: Any) -> dict | None:
             "_fallback_via": winner.get("model", "?"),
         }
 
-    try:
+    # CRITICAL: _payment_fallback_chain is called from sync handlers
+    # (_handle_direct / _handle_agent) which ARE blocking the main FastAPI
+    # event loop. Calling asyncio.new_event_loop().run_until_complete here
+    # raises "Cannot run the event loop while another loop is running".
+    # Fix: run the race on a SEPARATE thread that owns its own event loop,
+    # so we never touch FastAPI's loop. Bounded by a generous 15s join.
+    import threading as _threading
+    _container: dict = {"result": None}
+
+    def _run_in_thread() -> None:
         loop = _asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(_race())
+            _container["result"] = loop.run_until_complete(_race())
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("openjarvis.server").warning(
+                "openjarvis.fallback.thread_race_failed: %s", exc,
+            )
         finally:
-            loop.close()
-    except Exception as exc:
+            try:
+                loop.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    t = _threading.Thread(target=_run_in_thread, name="openjarvis-fallback-race",
+                          daemon=True)
+    t.start()
+    t.join(timeout=15.0)
+    if t.is_alive():
         logging.getLogger("openjarvis.server").warning(
-            "openjarvis.fallback.race_failed: %s", exc,
+            "openjarvis.fallback.race_timed_out — thread still running after 15s",
         )
         return None
+    return _container["result"]
 
 
 def _record_cost(result: Any, *, model: str, latency_ms: int, role: str = "main") -> None:
