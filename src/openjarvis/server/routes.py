@@ -167,6 +167,72 @@ _TOOL_GROUP_TRIGGERS: dict[str, tuple[str, ...]] = {
 # Map tool name → group_id. Built once on first request from the registry.
 _TOOL_NAME_TO_GROUP: dict[str, str] | None = None
 
+# Cached "configured integrations" system-prompt block. Refreshed every
+# _INTEG_BLOCK_TTL seconds — env vars rarely change at runtime so even a
+# stale block is cheap to keep. Set None to force rebuild on next call.
+_CONFIGURED_INTEG_BLOCK: str | None = None
+_CONFIGURED_INTEG_BLOCK_TS: float = 0.0
+_INTEG_BLOCK_TTL: float = 60.0
+
+
+def _configured_integrations_system_block() -> str:
+    """Build a "Configured integrations" system message based on env probe.
+
+    The LLM uses this as ground truth instead of hedging. Without this,
+    Gemini-class models reflexively answer "I don't have automatic
+    access to your emails" even when gmail tools are injected, because
+    they treat tool availability as conditional. With this block in the
+    system prompt, the LLM knows the OAuth tokens are ALREADY on the
+    server and can speak confidently.
+
+    Returns "" if no integrations are configured.
+    """
+    global _CONFIGURED_INTEG_BLOCK, _CONFIGURED_INTEG_BLOCK_TS
+    import time as _time_mod
+    now = _time_mod.time()
+    if (
+        _CONFIGURED_INTEG_BLOCK is not None
+        and (now - _CONFIGURED_INTEG_BLOCK_TS) < _INTEG_BLOCK_TTL
+    ):
+        return _CONFIGURED_INTEG_BLOCK
+    try:
+        from openjarvis.server.integrations_routes import _entries_by_integration
+        from openjarvis.core.env import is_configured as _ic
+    except Exception:
+        _CONFIGURED_INTEG_BLOCK = ""
+        _CONFIGURED_INTEG_BLOCK_TS = now
+        return ""
+
+    grouped = _entries_by_integration()
+    configured_integrations: list[str] = []
+    for integration, specs in sorted(grouped.items()):
+        if not specs:
+            continue
+        # Integration is "configured" if ALL its required vars are set.
+        if all(_ic(s.name) for s in specs):
+            configured_integrations.append(integration)
+
+    if not configured_integrations:
+        _CONFIGURED_INTEG_BLOCK = ""
+        _CONFIGURED_INTEG_BLOCK_TS = now
+        return ""
+
+    block = (
+        "SERVER CAPABILITIES — these integrations are ALREADY authenticated "
+        "via OAuth refresh tokens / API keys stored in the OpenJarvis "
+        "service environment. You can call their tools directly without "
+        "asking the user to connect, authorize, or configure anything:\n"
+        f"  {', '.join(configured_integrations)}\n"
+        "When the user asks 'do you have access to my [X]?', the answer "
+        "for any integration in this list is YES — confirm it briefly and "
+        "offer to use it. NEVER say 'I'd need to connect' or 'I can only "
+        "access them if you authorize' for an integration in this list — "
+        "those statements are factually wrong; the credentials are present."
+    )
+    _CONFIGURED_INTEG_BLOCK = block
+    _CONFIGURED_INTEG_BLOCK_TS = now
+    return block
+
 # Maximum tools sent in a single request. The auto-inject catalog is 100+
 # tools; sending all of them costs ~40 K input tokens per turn AND degrades
 # tool-call accuracy (every major frontier model gets confused past
@@ -415,6 +481,37 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     agent = getattr(request.app.state, "agent", None)
     model = request_body.model
 
+    # Round 6 — inject a "you have these integrations" system message so
+    # the LLM never has to GUESS what credentials are wired. Replaces the
+    # "I don't have automatic access to your emails" hallucination with a
+    # factual "Yes, sir — Gmail and Outlook are connected; here's what I
+    # found" response, even before the model decides whether to call a
+    # tool. Cached 60s; pure env probe, zero external calls.
+    try:
+        _integ_block = _configured_integrations_system_block()
+        if _integ_block and request_body.messages:
+            from openjarvis.server.models import ChatMessage
+            # Prepend the integrations awareness block as a system message.
+            # We insert AFTER any existing system messages so the agent's
+            # primary instructions still anchor the prompt.
+            _msgs = list(request_body.messages)
+            _insert_at = 0
+            for _i, _m in enumerate(_msgs):
+                if _m.role != "system":
+                    break
+                _insert_at = _i + 1
+            _msgs.insert(
+                _insert_at,
+                ChatMessage(role="system", content=_integ_block, name=None,
+                            tool_call_id=None),
+            )
+            request_body.messages = _msgs
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "configured-integrations system-block inject failed",
+            exc_info=True,
+        )
+
     # Inject memory context into messages before dispatching
     config = getattr(request.app.state, "config", None)
     memory_backend = getattr(request.app.state, "memory_backend", None)
@@ -626,6 +723,14 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             # the client requested — never reduce below the request value.
             if suggested > request_body.max_tokens:
                 request_body.max_tokens = suggested
+            # Round 6 fix — when tools were auto-injected, the ~8k token
+            # tool-definition payload eats most of OpenRouter's free-tier
+            # per-request credit budget. Cap max_tokens to leave room for
+            # the tool defs so we don't hit 402 Payment Required → 500.
+            # 400 is enough for any conversational reply; tool-using turns
+            # rarely need more output than that anyway.
+            if _auto_inject_domain_groups and request_body.max_tokens > 400:
+                request_body.max_tokens = 400
         except Exception:
             logging.getLogger("openjarvis.server").debug(
                 "Complexity analysis failed",
@@ -931,13 +1036,39 @@ def _handle_direct(
         elif result is None:
             # Neither speculative nor orchestrator filled result — raw single-engine path
             _t0 = _time.time()
-            result = engine.generate(
-                messages,
-                model=model,
-                temperature=req.temperature,
-                max_tokens=req.max_tokens,
-                **kwargs,
-            )
+            try:
+                result = engine.generate(
+                    messages,
+                    model=model,
+                    temperature=req.temperature,
+                    max_tokens=req.max_tokens,
+                    **kwargs,
+                )
+            except Exception as _e_exc:
+                # Round 6 — surface OpenRouter 402-style credit refusals as a
+                # graceful chat reply instead of a 500. A 500 here causes the
+                # LiveKit OpenAI plugin to retry 4 times (~15s of dead air)
+                # before falling back to a hallucinated answer with no tools.
+                _emsg = str(_e_exc)
+                _is_payment = "402" in _emsg or "Payment Required" in _emsg or "more credits" in _emsg
+                if _is_payment:
+                    logging.getLogger("openjarvis.server").warning(
+                        "openjarvis.engine.payment_required model=%s — degrading to friendly reply",
+                        model,
+                    )
+                    result = {
+                        "content": (
+                            "Apologies, sir — I'm temporarily out of OpenRouter credits "
+                            "for this call. Top up at openrouter.ai/settings/credits or "
+                            "set a free-tier model (DeepSeek / Gemini direct) as the "
+                            "OPENJARVIS_MODEL env var, and try again."
+                        ),
+                        "usage": {},
+                        "tool_calls": None,
+                        "finish_reason": "stop",
+                    }
+                else:
+                    raise
             _record_cost(result, model=model,
                          latency_ms=int((_time.time() - _t0) * 1000),
                          role="main_raw")
