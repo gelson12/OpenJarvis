@@ -654,8 +654,10 @@ class CloudEngine(InferenceEngine):
                     break
 
         usage_data = data.get("usage", {})
-        prompt_tokens = usage_data.get("input_tokens", 0)
-        completion_tokens = usage_data.get("output_tokens", 0)
+        # `or 0` coalesces None → 0 so the next line's int + int doesn't
+        # raise TypeError when provider returns null for token counts.
+        prompt_tokens = usage_data.get("input_tokens", 0) or 0
+        completion_tokens = usage_data.get("output_tokens", 0) or 0
 
         return {
             "content": content,
@@ -834,8 +836,10 @@ class CloudEngine(InferenceEngine):
                 content_parts.append(block.text)
 
         content = "\n".join(content_parts) if content_parts else ""
-        prompt_tokens = resp.usage.input_tokens if resp.usage else 0
-        completion_tokens = resp.usage.output_tokens if resp.usage else 0
+        # `or 0` coalesces None → 0 (some Anthropic responses return None
+        # for token counts when only tool_use blocks are produced).
+        prompt_tokens = (resp.usage.input_tokens or 0) if resp.usage else 0
+        completion_tokens = (resp.usage.output_tokens or 0) if resp.usage else 0
 
         result: Dict[str, Any] = {
             "content": content,
@@ -991,8 +995,13 @@ class CloudEngine(InferenceEngine):
                 content = ""
 
         um = resp.usage_metadata
-        prompt_tokens = getattr(um, "prompt_token_count", 0) if um else 0
-        completion_tokens = getattr(um, "candidates_token_count", 0) if um else 0
+        # `or 0` because Gemini sometimes returns None for these fields when
+        # the model emits only function_calls (no text candidates). Without
+        # the coalesce, the next line's `prompt_tokens + completion_tokens`
+        # raises `TypeError: int + NoneType` → 500 → user gets an empty
+        # response. This was the calendar-query 500 we hit on 2026-05-26.
+        prompt_tokens = (getattr(um, "prompt_token_count", 0) or 0) if um else 0
+        completion_tokens = (getattr(um, "candidates_token_count", 0) or 0) if um else 0
 
         result: Dict[str, Any] = {
             "content": content,
