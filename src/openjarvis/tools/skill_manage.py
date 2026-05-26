@@ -40,6 +40,13 @@ class SkillManageTool(BaseTool):
                     },
                     "steps": {
                         "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool_name": {"type": "string"},
+                                "arguments_template": {"type": "object"},
+                            },
+                        },
                         "description": (
                             "List of step dicts with tool_name and optional"
                             " arguments_template (for create)."

@@ -669,6 +669,13 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 latest_user, request_body.messages,
             )
             if relevant_tools:
+                # Round 6.1 — schema sanitizer. Gemini's strict JSON-schema
+                # validator rejects `type:array` without `items` with a 400
+                # INVALID_ARGUMENT. OpenAI / Anthropic are lenient. Walk
+                # every tool spec recursively and add a safe default
+                # `items` to any array property that lacks one, so a single
+                # misbehaving tool can't blow up the whole request.
+                _sanitize_tool_schemas(relevant_tools)
                 request_body.tools = relevant_tools
                 # Strip "always_on" / "always_on_only" labels — those don't
                 # imply a domain intent that requires preserved tool routing.
@@ -900,6 +907,34 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         bus=bus,
         complexity_info=complexity_info,
     )
+
+
+def _sanitize_tool_schemas(tool_specs: list[dict]) -> None:
+    """In-place fix for tool JSON schemas that Gemini rejects but OpenAI
+    accepts. Gemini's validator requires every `type: array` to declare
+    `items`; without one it returns:
+
+      400 INVALID_ARGUMENT. GenerateContentRequest.tools[0]
+      .function_declarations[N].parameters.properties[X].items: missing field
+
+    Walks every spec recursively. If we find `{"type": "array"}` without
+    `items`, inject a permissive `items: {type: string}` so the schema
+    validates while still allowing array values. Idempotent."""
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            t = node.get("type")
+            if t == "array" and "items" not in node:
+                node["items"] = {"type": "string"}
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+    try:
+        _walk(tool_specs)
+    except Exception:
+        # Defensive: never let sanitization itself break the request.
+        pass
 
 
 def _payment_fallback_chain(messages: Any) -> dict | None:
@@ -1322,6 +1357,11 @@ def _handle_agent(
                 "Connection error", "Connection reset",              # transient network
                 "ReadTimeout", "ConnectTimeout",                     # httpx timeouts
                 "high demand",                                       # Google's overload msg
+                # 400 INVALID_ARGUMENT typically means schema-validation
+                # rejection (Gemini stricter than OpenAI). Falling back to
+                # a permissive provider succeeds; the schema sanitizer
+                # above is the prevention, this is the safety net.
+                "INVALID_ARGUMENT", "function_declarations",
             )) or any(s in _emsg_low for s in (
                 "overload", "unavailable", "timeout",
             ))
