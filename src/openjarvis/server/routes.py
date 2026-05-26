@@ -564,9 +564,17 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
             )
             if relevant_tools:
                 request_body.tools = relevant_tools
-                logging.getLogger("openjarvis.server").info(
-                    "auto-injected %d tools (groups=%s) into request",
+                # WARNING level so prod logs surface this — openjarvis logger
+                # defaults to WARNING+. Critical for diagnosing tool routing.
+                logging.getLogger("openjarvis.server").warning(
+                    "openjarvis.tools.auto_injected count=%d groups=%s names=%s",
                     len(relevant_tools), enabled_groups,
+                    [t.get("function", {}).get("name") for t in relevant_tools[:8]],
+                )
+            else:
+                logging.getLogger("openjarvis.server").warning(
+                    "openjarvis.tools.no_inject query=%r enabled_groups=%s",
+                    (latest_user or "")[:80], enabled_groups,
                 )
         except Exception:
             logging.getLogger("openjarvis.server").debug(
