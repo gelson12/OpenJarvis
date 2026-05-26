@@ -803,7 +803,21 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                         _orch_mode = "consensus"
                 except Exception:
                     pass
-                best = _orch_pick_best(responses, mode=_orch_mode, domain=_orch_domain)
+                # Round 6 quality-pick: embedding pre-filter + LLM judge.
+                # When enabled, gives us a quality-aware winner instead of
+                # the legacy length-based heuristic. Falls back to
+                # pick_best automatically on miss.
+                best = None
+                try:
+                    from openjarvis.orchestrator import quality_pick as _qp
+                    if _qp._enabled():
+                        best = await _qp.pick_quality(
+                            query_text_for_complexity, responses, top_n=3,
+                        )
+                except Exception:
+                    best = None
+                if best is None:
+                    best = _orch_pick_best(responses, mode=_orch_mode, domain=_orch_domain)
                 _text = best.get("text", "")
                 if _text and "Error" not in _text:
                     logging.getLogger("openjarvis.server").info(
@@ -941,7 +955,23 @@ def _payment_fallback_chain(messages: Any) -> dict | None:
         if not cleaned:
             # If only OpenRouter responded (and primary failed), nothing useful.
             return None
-        winner = _pick_best(cleaned)
+        # Quality pick first (Round 6) — embedding pre-filter + LLM judge.
+        # Falls back to length-based pick_best on any failure.
+        winner = None
+        try:
+            from openjarvis.orchestrator import quality_pick as _qp
+            if _qp._enabled():
+                # Pull the last user question from the conversation for the judge
+                _q = ""
+                for m in reversed(_msgs_plain):
+                    if m.get("role") == "user" and m.get("content"):
+                        _q = m["content"]
+                        break
+                winner = await _qp.pick_quality(_q, cleaned, top_n=3)
+        except Exception:
+            winner = None
+        if winner is None:
+            winner = _pick_best(cleaned)
         text = winner.get("text") or ""
         if not text:
             return None
