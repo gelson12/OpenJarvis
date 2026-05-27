@@ -5,6 +5,7 @@ livekit-plugins-deepgram
 livekit-plugins-google
 livekit-plugins-silero
 livekit-plugins-noise-cancellation
+livekit-plugins-turn-detector
 google-genai>=1.0
 requests
 python-dotenv

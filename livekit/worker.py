@@ -65,6 +65,21 @@ from livekit.agents.utils.images import encode, EncodeOptions, ResizeOptions
 from livekit.plugins import openai, deepgram, silero, noise_cancellation
 from openai import AsyncOpenAI
 
+# Semantic turn-detector (Phase 3 — replaces VAD-only turn-end). Optional
+# import so the worker still boots even if the plugin isn't installed on a
+# given machine; falls back to VAD endpointing in that case.
+try:
+    from livekit.plugins.turn_detector.english import EnglishModel as _TurnDetectorEnglish
+    _TURN_DETECTOR_AVAILABLE = True
+except Exception as _exc:  # noqa: BLE001
+    _TurnDetectorEnglish = None  # type: ignore[assignment]
+    _TURN_DETECTOR_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "livekit-plugins-turn-detector unavailable (%s) — "
+        "falling back to VAD-only turn endpointing (the user may experience "
+        "premature interruption on natural breath pauses)", _exc,
+    )
+
 # Gemini Live (primary low-latency path). Imported lazily-guarded so a
 # missing google-genai install doesn't crash worker startup — the cascade
 # path stays usable on its own.
@@ -5550,7 +5565,32 @@ def _build_cascade_session(ctx: agents.JobContext) -> AgentSession:
         logger.error("Deepgram TTS init failed: %s", exc)
         raise RuntimeError("TTS provider unavailable") from exc
 
-    return AgentSession(
+    # Phase 3 — TTS event diagnostics. The user reports "different voices
+    # between sentences" in long replies. The worker has a SINGLE Aura
+    # instance with no chunking or fallback chain in worker code, so if the
+    # report is real the bug is inside the plugin / streaming path. Wire
+    # `tts_*` events so a single `session.say()` should emit exactly one
+    # `tts_started`+`tts_completed` pair; multiple per utterance would
+    # confirm a real bug.
+    for _evt in ("metrics_collected", "tts_started", "tts_completed"):
+        try:
+            tts.on(
+                _evt,
+                lambda ev, _name=_evt: logger.info(
+                    "tts_event: %s metadata=%r", _name, getattr(ev, "label", ev)
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            # Plugin doesn't expose this event — silently skip.
+            pass
+
+    # Phase 3 — semantic turn-detection. Replaces VAD-only endpointing
+    # (Silero min_silence_duration=0.20s was firing on natural breath
+    # pauses, causing Jarvis to interrupt the user mid-sentence). When the
+    # turn-detector plugin is installed, AgentSession defers turn-end
+    # decisions to a small model trained on speech-completion patterns;
+    # VAD still drives wake-word and acoustic-silence cleanup.
+    session_kwargs = dict(
         # NOTE: preemptive_generation left at its default (True). The
         # wake-gate fix in commit 1e6dcc2 stops mutating
         # new_message.content, so the framework's speculative mid-turn
@@ -5576,6 +5616,13 @@ def _build_cascade_session(ctx: agents.JobContext) -> AgentSession:
         ),
         tts=tts,
     )
+    if _TURN_DETECTOR_AVAILABLE and _TurnDetectorEnglish is not None:
+        try:
+            session_kwargs["turn_detection"] = _TurnDetectorEnglish()
+            logger.info("turn-detector: EnglishModel active (semantic endpointing)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("turn-detector init failed (%s) — VAD endpointing only", exc)
+    return AgentSession(**session_kwargs)
 
 
 def _attach_wake_listener(session: AgentSession, assistant: "Assistant") -> None:
