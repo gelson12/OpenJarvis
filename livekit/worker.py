@@ -616,13 +616,53 @@ _CONTENT_VERB = re.compile(
     r"launch|see)\b", re.I
 )
 
-# Accommodation booking intent. Catches "find me a hotel", "book a place",
-# "Airbnb in Lisbon", etc. See `brain/Accommodation Booking — Feasibility &
-# Architecture` in the user's Obsidian vault.
+# Accommodation booking intent. Broad pattern to catch the many ways users
+# naturally ask for a place to stay — Phase 1's narrow regex missed
+# "houses to rent", "spend the weekend in X", "places to stay", etc.,
+# falling them through to the LLM which can't actually book. See
+# `brain/Accommodation Booking — Feasibility & Architecture` in the vault.
 _ACCOMMODATION_RE = re.compile(
-    r"\b(hotel|airbnb|accommodation|vacation\s+rental|short\s+let|"
-    r"book\s+(?:a\s+|me\s+)?(?:room|place|hotel|stay)|where\s+to\s+stay|"
-    r"find\s+(?:me\s+)?(?:a\s+|an\s+)?(?:hotel|place|stay|room))\b", re.I
+    r"\b("
+    # Direct accommodation nouns
+    r"hotel|hotels|airbnb|airbnbs|hostel|hostels|motel|motels|inn|inns|"
+    r"b\s*&\s*b|bed\s+and\s+breakfast|"
+    r"vacation\s+rental|holiday\s+rental|short\s+let|short\s+stay|"
+    r"villa|villas|cottage|cottages|chalet|chalets|guest\s*house|"
+    r"resort|resorts|condo|condos|condominium|"
+    # Generic accommodation words
+    r"accommodation|accommodations|accomodation|accomodations|"
+    r"lodging|lodgings|"
+    # "book X" with various accommodation nouns
+    r"book\s+(?:a\s+|an\s+|me\s+|us\s+|the\s+)?"
+        r"(?:room|rooms|place|places|hotel|hotels|stay|night|nights|"
+        r"apartment|apartments|villa|villas|house|houses|flat|flats|"
+        r"airbnb|cottage|chalet)|"
+    # "where/place(s) to stay"
+    r"where\s+to\s+stay|"
+    r"place[s]?\s+to\s+stay|"
+    # find/show/list + accommodation noun (incl. "show me all available...")
+    r"(?:find|show|list|see|get|need|want|looking\s+for)\s+"
+        r"(?:me\s+)?(?:all\s+(?:the\s+)?)?(?:available\s+)?"
+        r"(?:a\s+|an\s+|some\s+|the\s+)?"
+        r"(?:hotel|hotels|place|places|stay|stays|room|rooms|"
+        r"apartment|apartments|villa|villas|flat|flats|house|houses|"
+        r"airbnb|airbnbs|rental|rentals|listing|listings|"
+        r"accommodation|accommodations|lodging|spot|spots)|"
+    # Rent verb in either direction
+    r"(?:rent|renting|let|hire)\s+(?:a\s+|an\s+|some\s+)?"
+        r"(?:house|houses|apartment|apartments|flat|flats|villa|villas|"
+        r"room|rooms|place|places|cottage|chalet|car)|"
+    r"(?:house|houses|apartment|apartments|flat|flats|villa|villas|"
+        r"room|rooms|place|places|cottage|chalet)\s+(?:to\s+)?"
+        r"(?:rent|let|hire)|"
+    # Trip / weekend / vacation intent
+    r"(?:spend|spending|stay|staying)\s+(?:the|a|some)?\s*"
+        r"(?:weekend|week|night|nights|holiday|vacation|few\s+days)|"
+    r"(?:weekend|week|holiday|vacation|trip|getaway|stay)\s+"
+        r"(?:in|to|at|near|around)|"
+    r"need\s+(?:a\s+|an\s+|some\s+)?(?:place|room|hotel|stay|"
+        r"apartment|villa|accommodation)"
+    r")\b", re.I
 )
 _ACCOMMODATION_BOOK_RE = re.compile(
     r"\b(?:book|reserve)\s+(?:the\s+|that\s+|it\b)", re.I
@@ -2337,6 +2377,11 @@ class Assistant(Agent):
         self._accommodation_init_attempted = False
         self._accommodation_last_results: list = []
         self._accommodation_pending_book: dict | None = None
+        # Multi-turn slot-fill state. When the search handler asks "where
+        # would you like to stay?", set this so the next turn — which
+        # likely won't contain the keyword regex — still routes back to
+        # the accommodation handler via _maybe_resume_accommodation_search.
+        self._accommodation_pending_search: dict | None = None
 
     def _has_widget(self, kind: str) -> bool:
         """True when a panel of `kind` is currently visible on the HUD."""
@@ -3336,8 +3381,17 @@ class Assistant(Agent):
             except Exception:  # noqa: BLE001
                 pass
             return True
-        location = _accommodation_nlu.parse_location(text)
+        # Combine with prior in-progress turn (multi-turn slot fill) so
+        # "Somewhere in Lisbon" after "find me a place for the weekend"
+        # parses with full context.
+        prior = self._accommodation_pending_search or {}
+        combined_text = ((prior.get("prior_text") or "") + " " + (text or "")).strip()
+        location = _accommodation_nlu.parse_location(combined_text)
         if not location:
+            self._accommodation_pending_search = {
+                "prior_text": combined_text,
+                "created_at": time.time(),
+            }
             try:
                 await self.session.say(
                     "Where would you like to stay, sir? Tell me a city or area."
@@ -3345,9 +3399,12 @@ class Assistant(Agent):
             except Exception:  # noqa: BLE001
                 pass
             return True
-        check_in, check_out = _accommodation_nlu.parse_dates(text)
-        guests = _accommodation_nlu.parse_guests(text)
-        preferred = _accommodation_nlu.parse_provider_preference(text)
+        check_in, check_out = _accommodation_nlu.parse_dates(combined_text)
+        guests = _accommodation_nlu.parse_guests(combined_text)
+        preferred = _accommodation_nlu.parse_provider_preference(combined_text)
+        # Slots filled — clear pending so a future "find me a hotel"
+        # starts clean.
+        self._accommodation_pending_search = None
         query = _AccommodationSearchQuery(
             location=location,
             check_in=check_in,
@@ -3356,8 +3413,20 @@ class Assistant(Agent):
             currency=os.environ.get("ACCOMMODATION_DEFAULT_CURRENCY", "GBP"),
             preferred_providers=preferred,
         )
+        # Speak BEFORE awaiting the provider call so voice never goes
+        # silent during the 30-90s Apify cold-start.
+        is_apify_query = preferred == ["apify_airbnb"]
         try:
-            properties = await asyncio.wait_for(service.search(query, limit=12), timeout=20.0)
+            await self.session.say(
+                "Just a moment, sir — looking into that for you."
+                if not is_apify_query
+                else "Just a moment, sir — Airbnb takes a little longer to search."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # 90s timeout exceeds Apify's 60s HTTP cap + headroom.
+        try:
+            properties = await asyncio.wait_for(service.search(query, limit=12), timeout=90.0)
         except asyncio.TimeoutError:
             try:
                 await self.session.say("The search took too long, sir — try again in a moment.")
@@ -3476,8 +3545,14 @@ class Assistant(Agent):
             except Exception:  # noqa: BLE001
                 pass
             return True
+        # Speak before the prebook call so voice doesn't go silent while
+        # the provider round-trip lands.
         try:
-            quote = await asyncio.wait_for(service.quote(target), timeout=15.0)
+            await self.session.say("One moment, sir — locking in the price.")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            quote = await asyncio.wait_for(service.quote(target), timeout=20.0)
         except Exception as exc:  # noqa: BLE001
             logger.error("accommodation quote failed: %s", exc)
             try:
@@ -3491,13 +3566,6 @@ class Assistant(Agent):
             "is_redirect": False,
             "created_at": time.time(),
         }
-        nights_text = ""
-        try:
-            # Best-effort: pull nights from the property if exposed by the search
-            # cache; otherwise just speak the total.
-            pass
-        except Exception:  # noqa: BLE001
-            pass
         try:
             await self.session.say(
                 f"Locked in {quote.price_total:.0f} {quote.price_currency} total at "
@@ -3611,6 +3679,24 @@ class Assistant(Agent):
             return False
         if _ACCOMMODATION_BOOK_RE.search(text) and self._accommodation_last_results:
             return await self._handle_accommodation_book_start(text)
+        return await self._handle_accommodation_search(text)
+
+    async def _maybe_resume_accommodation_search(self, text: str) -> bool:
+        """Continue an in-progress accommodation search when the previous
+        turn was missing a required slot (typically location). Routes the
+        current turn back to the search handler EVEN IF the keyword regex
+        doesn't match — so "Somewhere in Lisbon" after "find me a place
+        for the weekend" completes the search rather than falling through
+        to the LLM. 120s TTL; explicit topic-switch words clear pending."""
+        pending = self._accommodation_pending_search
+        if not pending:
+            return False
+        if time.time() - pending["created_at"] > 120:
+            self._accommodation_pending_search = None
+            return False
+        if re.search(r"\b(weather|time|news|forget|never\s*mind|cancel|stop)\b", text or "", re.I):
+            self._accommodation_pending_search = None
+            return False
         return await self._handle_accommodation_search(text)
 
     # ── Email-watch SSE subscriber (mid-session push) ───────────────────
@@ -5224,6 +5310,13 @@ class Assistant(Agent):
         # Runs BEFORE content so a bare "yes" after "confirm the Marriott?"
         # doesn't get swallowed by a search/show handler.
         if await self._maybe_resume_accommodation_book(text):
+            raise StopResponse()
+
+        # Accommodation search — multi-turn slot-fill continuation.
+        # Runs BEFORE content so a follow-up like "in Lisbon" after
+        # "find me a place for the weekend" routes back to the accommodation
+        # handler instead of being misread as a generic search.
+        if await self._maybe_resume_accommodation_search(text):
             raise StopResponse()
 
         # Music intent — disambiguate laptop vs YouTube. Runs BEFORE

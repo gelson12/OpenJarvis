@@ -30,7 +30,8 @@ export type WidgetKind =
   | 'apps'
   | 'system'
   | 'cti'
-  | 'site';
+  | 'site'
+  | 'accommodation';
 
 /** A live widget panel rendered on screen. */
 export interface WidgetInstance {
@@ -112,6 +113,36 @@ export interface SitePayload {
   prompt: string;  // original user request (for header subtitle)
 }
 
+/** A single accommodation listing — item in the `accommodation` widget
+ * payload. Mirrors the normalized `Property` dataclass from the
+ * accommodation Python module. */
+export interface AccommodationProperty {
+  provider_id: string;
+  external_id: string;
+  name: string;
+  price_total: number;
+  price_currency: string;
+  rating: number | null;
+  review_count: number | null;
+  address: string;
+  images: string[];
+  lat: number;
+  lng: number;
+}
+
+/** `accommodation` widget payload — either a search-results carousel OR a
+ * post-booking checkout-link card (when `checkout_url` is set and the
+ * Telegram handoff fell back to HUD delivery). */
+export interface AccommodationPayload {
+  query: string;
+  check_in?: string;
+  check_out?: string;
+  properties?: AccommodationProperty[];
+  checkout_url?: string;
+  price_total?: number;
+  price_currency?: string;
+}
+
 /** Commands the worker sends to the browser on {@link JARVIS_UI_TOPIC}. */
 export type JarvisUIMessage =
   | { type: 'open_widget'; kind: WidgetKind; title?: string; payload?: unknown; id?: string }
@@ -151,6 +182,7 @@ export const WIDGET_KINDS: WidgetKind[] = [
   'system',
   'cti',
   'site',
+  'accommodation',
 ];
 
 /** Default panel size per widget kind, in CSS pixels. */
@@ -167,6 +199,7 @@ export const WIDGET_DEFAULT_SIZE: Record<WidgetKind, { w: number; h: number }> =
   system: { w: 340, h: 260 },
   cti: { w: 900, h: 640 },
   site: { w: 900, h: 640 },
+  accommodation: { w: 880, h: 580 },
 };
 
 /** Default header text per widget kind. */
@@ -183,4 +216,5 @@ export const WIDGET_DEFAULT_TITLE: Record<WidgetKind, string> = {
   system: 'System Status',
   cti: 'Intelligence',
   site: 'Generated Site',
+  accommodation: 'Stays',
 };
