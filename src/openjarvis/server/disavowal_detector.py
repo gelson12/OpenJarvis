@@ -200,18 +200,33 @@ def record_if_disavowal(
         logger.debug("disavowal_detector: write failed: %s", exc)
         return event
 
-    # Best-effort mirroring to durable backends (Round 8.7). None of these
-    # can raise — they swallow their own errors so the hot path stays clean.
+    # Round 9.6 — durable backend mirrors run in fire-and-forget threads
+    # so a slow Postgres or obsidian-mind call cannot stall the chat
+    # response. The local JSONL append above is already on disk; the
+    # mirrors are best-effort durability, not load-bearing for the
+    # current turn.
+    def _bg_mirror(ev: Dict[str, Any]) -> None:
+        try:
+            from openjarvis.server import learning_pg as _pg
+            _pg.mirror_disavowal(ev)
+        except Exception as exc:
+            logger.debug("bg pg mirror skipped: %s", exc)
+        try:
+            from openjarvis.server import learning_mind as _mind
+            _mind.index_disavowal(ev)
+        except Exception as exc:
+            logger.debug("bg mind index skipped: %s", exc)
+
     try:
-        from openjarvis.server import learning_pg as _pg
-        _pg.mirror_disavowal(event)
+        threading.Thread(
+            target=_bg_mirror, args=(event,),
+            name="openjarvis-disavow-mirror",
+            daemon=True,
+        ).start()
     except Exception as exc:
-        logger.debug("disavowal_detector: pg mirror skipped: %s", exc)
-    try:
-        from openjarvis.server import learning_mind as _mind
-        _mind.index_disavowal(event)
-    except Exception as exc:
-        logger.debug("disavowal_detector: mind index skipped: %s", exc)
+        # Threading shouldn't fail, but never let mirror setup break the
+        # hot path. Fall back to inline best-effort.
+        logger.debug("disavowal_detector: bg-mirror start failed: %s", exc)
 
     logger.warning(
         "openjarvis.disavowal.detected domain=%s user=%r groups=%s",

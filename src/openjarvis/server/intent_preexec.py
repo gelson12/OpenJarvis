@@ -86,10 +86,68 @@ def _next_week_window() -> Tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 
+def _recent_past_window(days: int = 30) -> Tuple[str, str]:
+    """Look-back window for 'last meeting' / 'recent' / 'previous' queries.
+    Defaults to the last 30 days ending at the current moment."""
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=days)).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    return start.isoformat(), now.isoformat()
+
+
+def _last_week_window() -> Tuple[str, str]:
+    """Monday 00:00 through Sunday 23:59 of the previous week (UTC)."""
+    now = datetime.now(timezone.utc)
+    start_this_week = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    start = start_this_week - timedelta(days=7)
+    end = start_this_week - timedelta(seconds=1)
+    return start.isoformat(), end.isoformat()
+
+
+_PAST_LANG_RE = re.compile(
+    r"\b("
+    r"last\s+(?:meeting|appointment|event|call|interview)|"
+    r"previous\s+(?:meeting|appointment|event|call|interview)|"
+    r"most\s+recent\s+(?:meeting|appointment|event|call|interview)|"
+    r"recent\s+(?:meeting|appointment|event|call|interview|meetings|appointments)|"
+    # bare temporal-past adjectives
+    r"past\s+(?:meeting|meetings|week|month|days|appointments)|"
+    # explicit "when was the last"
+    r"when\s+(?:was|did)|"
+    r"what\s+(?:was|were)\s+(?:my|the)\s+(?:last|previous|most\s+recent|recent)|"
+    # "had a meeting" / "i had" past tense
+    r"i\s+had\s+(?:a\s+)?(?:meeting|appointment|event|call)|"
+    # "previously" / "earlier this week"
+    r"previously|earlier\s+(?:this|last)\s+(?:week|month)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_past_query(text: str) -> bool:
+    """True when the user's phrasing clearly asks about PAST calendar
+    events (not today/tomorrow/future). Used to choose between the
+    look-back window and the default today window."""
+    return bool(_PAST_LANG_RE.search(text or ""))
+
+
 def _resolve_window(text: str) -> Optional[Tuple[str, str, str]]:
     """Detect the date window mentioned in `text`. Returns (label, start, end)
     or None if no recognised window."""
     t = text.lower()
+    # Past-tense / recent-history queries take precedence over other
+    # anchors because "last meeting" / "most recent" override default-today.
+    if _is_past_query(t):
+        # "last week" -> Mon..Sun of previous calendar week; everything
+        # else falls back to a 30-day look-back ending now.
+        if re.search(r"\blast\s+week\b", t):
+            s, e = _last_week_window()
+            return ("last week", s, e)
+        s, e = _recent_past_window(30)
+        return ("the last 30 days", s, e)
     if re.search(r"\btoday\b.*\btomorrow\b|\btomorrow\b.*\btoday\b", t):
         s, e = _today_tomorrow_window()
         return ("today and tomorrow", s, e)
@@ -154,13 +212,21 @@ _CALENDAR_SIGNAL_RE = re.compile(
     r"do\s+i\s+have|did\s+i\s+have|have\s+i\s+got|am\s+i|"
     r"is\s+there|are\s+there|"
     # question words paired with calendar
-    r"what(?:'s|\s+is)?\s+(?:on|in|scheduled|my)|"
-    r"when\s+is|which\s+(?:day|time)|"
+    r"what(?:'s|\s+is|\s+was|\s+were)?\s+(?:on|in|scheduled|my|the|"
+    r"last|previous|most\s+recent|recent)|"
+    r"when\s+(?:is|was|did)|which\s+(?:day|time)|"
     # strong time anchors (any of these next to a calendar noun is decisive)
     r"today|tomorrow|tonight|"
     r"this\s+(?:morning|afternoon|evening|week)|"
     r"next\s+(?:week|monday|tuesday|wednesday|thursday|friday|"
     r"saturday|sunday)|"
+    # past-tense discriminators — let "last meeting" / "most recent
+    # appointment" / "previous event" trip the calendar broad match
+    r"last\s+(?:meeting|appointment|event|call|interview|week|month)|"
+    r"previous\s+(?:meeting|appointment|event|call|interview|week|month)|"
+    r"most\s+recent|recent\s+(?:meeting|meetings|appointment|"
+    r"appointments|event|events)|"
+    r"i\s+had\s+(?:a\s+)?(?:meeting|appointment|event|call)|"
     # "scheduled" as a discriminator — strong calendar signal even alone
     r"scheduled|booked"
     r")\b",
@@ -510,6 +576,18 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
                 "intent_preexec: matched calendar intent but tool returned None"
             )
             return None
+        # Hotfix #2: when the user explicitly asked about past meetings,
+        # nudge the LLM to surface the MOST RECENT entry rather than dump
+        # the full list. The look-back tool result contains every event
+        # in the window — the user wants the latest one.
+        past_nudge = ""
+        if _is_past_query(text):
+            past_nudge = (
+                "  6. The user asked about a PAST meeting (e.g. 'last meeting',\n"
+                "     'most recent'). Pick the SINGLE most-recent event from\n"
+                "     the list above and answer with its date + subject.\n"
+                "     Do not list every event unless asked.\n"
+            )
         block = (
             f"PRE-EXECUTED TOOL RESULT (from {tool_name}, window: "
             f"{cal['window_label']}):\n{result}\n\n"
@@ -525,7 +603,8 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
             "     retrieved it). NEVER respond with 'I don't have a tool\n"
             "     for that' — you DO have it and you JUST used it.\n"
             "  5. If the result shows no events, say so honestly\n"
-            "     ('No meetings on your calendar today, sir.')."
+            "     ('No meetings on your calendar today, sir.').\n"
+            f"{past_nudge}"
         )
         logger.info(
             "intent_preexec.calendar served via %s window=%s",

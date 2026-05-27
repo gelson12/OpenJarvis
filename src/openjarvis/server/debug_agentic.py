@@ -453,6 +453,56 @@ def _probe_eval() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Round 9.7 — self-improvement loop probes
+# ---------------------------------------------------------------------------
+
+def _probe_learned_intents() -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    try:
+        from openjarvis.server import learned_intents as _li
+        out.update(_li.snapshot())
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _probe_learned_prompt_hints() -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    try:
+        from openjarvis.server import learned_prompt_hints as _ph
+        out.update(_ph.snapshot())
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _probe_disavowal_detector() -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    try:
+        from openjarvis.server import disavowal_detector as _dd
+        out.update(_dd.snapshot())
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _probe_learning_mirrors() -> Dict[str, Any]:
+    """Combined block for the two durable mirrors (Postgres + Obsidian Mind)."""
+    out: Dict[str, Any] = {"postgres": {}, "obsidian_mind": {}}
+    try:
+        from openjarvis.server import learning_pg as _pg
+        out["postgres"] = _pg.snapshot()
+    except Exception as e:
+        out["postgres"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from openjarvis.server import learning_mind as _mind
+        out["obsidian_mind"] = _mind.snapshot()
+    except Exception as e:
+        out["obsidian_mind"] = {"error": f"{type(e).__name__}: {e}"}
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
 
@@ -481,6 +531,11 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
     skill_proposer_block = _probe_skill_proposer()
     domain_classifier_block = _probe_domain_classifier()
     eval_block = _probe_eval()
+    # Round 9.7 — universal self-improvement loop visibility
+    learned_intents_block = _probe_learned_intents()
+    learned_prompt_hints_block = _probe_learned_prompt_hints()
+    disavowal_detector_block = _probe_disavowal_detector()
+    learning_mirrors_block = _probe_learning_mirrors()
 
     return {
         "_timestamp": datetime.now(timezone.utc).isoformat(),
@@ -505,6 +560,11 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
         "skill_proposer": skill_proposer_block,
         "domain_classifier": domain_classifier_block,
         "eval": eval_block,
+        # Round 8 + 9 — self-improvement loop
+        "disavowal_detector": disavowal_detector_block,
+        "learned_intents": learned_intents_block,
+        "learned_prompt_hints": learned_prompt_hints_block,
+        "learning_mirrors": learning_mirrors_block,
     }
 
 

@@ -102,6 +102,20 @@ def _interval() -> int:
         return 300
 
 
+def _jaccard_min() -> float:
+    """Minimum Jaccard token overlap to group two disavowals into one
+    cluster. Round 9.4 lowered the default from 0.5 to 0.35 because real
+    English variants ('roman empire fall' / 'british empire collapse')
+    share only ~2/6 = 0.33 tokens — the old threshold silently swallowed
+    them. Exposed as env so it can be raised on noisy production data."""
+    try:
+        v = float(os.environ.get("OPENJARVIS_LEARNED_CLUSTER_JACCARD_MIN", "0.35"))
+        # Clamp to a sane range to avoid pathological values
+        return max(0.10, min(0.95, v))
+    except Exception:
+        return 0.35
+
+
 def _store_path() -> Path:
     base = os.environ.get("OPENJARVIS_HOME", "").strip()
     d = Path(base) if base else Path.home() / ".openjarvis"
@@ -110,6 +124,35 @@ def _store_path() -> Path:
     except Exception:
         pass
     return d / "learned_intents.json"
+
+
+def _heartbeat_path() -> Path:
+    """File-based heartbeat so the daemon's liveness is observable from
+    outside the uvicorn process (e.g. `railway ssh python -c snapshot`)."""
+    base = os.environ.get("OPENJARVIS_HOME", "").strip()
+    d = Path(base) if base else Path.home() / ".openjarvis"
+    return d / "_promoter_heartbeat.json"
+
+
+def _write_heartbeat() -> None:
+    try:
+        _heartbeat_path().write_text(
+            json.dumps({"ts": time.time(),
+                        "iso": datetime.now(timezone.utc).isoformat()}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _read_heartbeat() -> Optional[Dict[str, Any]]:
+    p = _heartbeat_path()
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -228,11 +271,24 @@ def _domain_of(rec: Dict[str, Any]) -> str:
 def _cluster_disavowals(
     disavowals: List[Dict[str, Any]], domain: str,
 ) -> List[List[Dict[str, Any]]]:
-    """Naive greedy clustering by Jaccard >= 0.5 on significant tokens."""
+    """Cluster disavowals within a domain into groups likely to be the
+    same intent. Two-pass:
+
+    1. Greedy Jaccard on significant tokens (threshold from env, default
+       0.35). Cheap, offline, deterministic.
+    2. If any disavowal didn't fit in a Jaccard cluster, ask
+       obsidian-mind for semantically-similar past disavowals (handles
+       cases where token overlap is low but meaning is the same, e.g.
+       'last meeting I had' vs 'most recent calendar entry'). The
+       semantic candidate set is treated as a cluster anchor and matched
+       by user_text/ts against the local disavowal log.
+
+    Falls back to pure Jaccard when Mind is unreachable."""
     by_dom = [d for d in disavowals if _domain_of(d) == domain]
     if not by_dom:
         return []
     tokens = [_significant_tokens(d.get("user_text", "")) for d in by_dom]
+    threshold = _jaccard_min()
     clusters: List[List[int]] = []
     used: Set[int] = set()
     for i, ti in enumerate(tokens):
@@ -243,10 +299,52 @@ def _cluster_disavowals(
         for j in range(i + 1, len(tokens)):
             if j in used:
                 continue
-            if _jaccard(ti, tokens[j]) >= 0.5:
+            if _jaccard(ti, tokens[j]) >= threshold:
                 cluster_idx.append(j)
                 used.add(j)
         clusters.append(cluster_idx)
+
+    # 9.3 — Semantic fallback for the orphans (disavowals that ended up
+    # in singleton clusters). Ask obsidian-mind for similar past failures
+    # by content embedding; if it returns ≥ threshold matches that are
+    # ALSO in our local log, merge them in.
+    try:
+        from openjarvis.server import learning_mind as _mind
+        if _mind._enabled():  # cheap env check; no network if disabled
+            text_by_iso = {(d.get("iso") or ""): idx for idx, d in enumerate(by_dom)}
+            text_by_user = {(d.get("user_text") or "").strip().lower(): idx
+                            for idx, d in enumerate(by_dom)}
+            for c_i, cluster in enumerate(clusters):
+                if len(cluster) >= _threshold():
+                    continue  # already big enough
+                anchor_text = by_dom[cluster[0]].get("user_text", "")
+                if not anchor_text:
+                    continue
+                candidates = _mind.semantic_cluster_candidates(
+                    anchor_text, k=20, domain=domain,
+                )
+                merged_any = False
+                for cand in candidates:
+                    cand_text = (cand.get("user_text") or "").strip().lower()
+                    if not cand_text:
+                        continue
+                    # Match by exact user_text OR by iso timestamp
+                    j = text_by_user.get(cand_text)
+                    if j is None and cand.get("iso"):
+                        j = text_by_iso.get(cand["iso"])
+                    if j is None or j in used or j in cluster:
+                        continue
+                    cluster.append(j)
+                    used.add(j)
+                    merged_any = True
+                if merged_any:
+                    logger.info(
+                        "openjarvis.cluster.semantic_merged domain=%s new_size=%d",
+                        domain, len(cluster),
+                    )
+    except Exception as exc:
+        logger.debug("learned_intents: semantic fallback failed: %s", exc)
+
     return [[by_dom[i] for i in c] for c in clusters]
 
 
@@ -347,7 +445,15 @@ def _vault_writeback(promo: Dict[str, Any]) -> None:
         client = get_default_client()
         ymd = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         domain = promo["domain"]
-        slug = re.sub(r"[^a-z0-9]+", "-", promo["pattern"].lower()).strip("-")[:50]
+        # Round 9.1: slug from the first sample user_text, NOT the regex.
+        # The regex contains `\b` word-boundary anchors that leak as the
+        # letter "b" through the slugifier (e.g. "bempire-b-collapse").
+        sample = ""
+        if promo.get("sample_phrases"):
+            sample = promo["sample_phrases"][0] or ""
+        if not sample:
+            sample = promo.get("pattern") or "pattern"
+        slug = re.sub(r"[^a-z0-9]+", "-", sample.lower()).strip("-")[:50] or "pattern"
         path = f"brain/jarvis-learnings/{domain}/{ymd}-{slug}.md"
         body_lines = [
             f"# Learned pattern — {domain}",
@@ -499,12 +605,16 @@ def promote_from_disavowals() -> List[Dict[str, Any]]:
 def _promoter_loop() -> None:
     interval = _interval()
     logger.info("openjarvis.learned_intents.promoter started interval=%ds", interval)
+    # Write initial heartbeat so snapshot reports the daemon is alive
+    # immediately after boot, not after the first full interval.
+    _write_heartbeat()
     while True:
         try:
             time.sleep(interval)
         except Exception:
             time.sleep(300)
         if not _enabled():
+            _write_heartbeat()
             continue
         try:
             promotions = promote_from_disavowals()
@@ -515,6 +625,9 @@ def _promoter_loop() -> None:
                 )
         except Exception as exc:
             logger.warning("learned_intents.promoter run failed: %s", exc)
+        # Every successful iteration (including no-op runs) updates the
+        # heartbeat. Out-of-process snapshot callers read this file.
+        _write_heartbeat()
 
 
 def start_promoter_daemon() -> None:
@@ -539,10 +652,21 @@ def snapshot() -> Dict[str, Any]:
     patterns = store.get("patterns", {})
     history = store.get("history", [])
     per_domain_count = {dom: len(pats or []) for dom, pats in patterns.items()}
+    # Round 9.2 — heartbeat-based liveness check, observable from any process.
+    hb = _read_heartbeat() or {}
+    hb_ts = hb.get("ts")
+    secs_since = (time.time() - hb_ts) if isinstance(hb_ts, (int, float)) else None
+    interval_sec = _interval()
+    # daemon_alive is True if a heartbeat landed within 2x the configured
+    # interval (with a 30s grace) — covers normal pauses without flagging
+    # a healthy daemon as dead.
+    daemon_alive = (
+        secs_since is not None and secs_since <= (2 * interval_sec + 30)
+    )
     return {
         "enabled": _enabled(),
         "threshold": _threshold(),
-        "interval_sec": _interval(),
+        "interval_sec": interval_sec,
         # New canonical key. Keep 'categories' alias for backward compat
         # with /v1/_debug/agentic consumers.
         "domains": per_domain_count,
@@ -551,5 +675,10 @@ def snapshot() -> Dict[str, Any]:
         "total_patterns": sum(len(p or []) for p in patterns.values()),
         "total_promotions_ever": len(history),
         "recent_promotions": history[-5:],
+        # In-process flag (legacy) — only truthful in the uvicorn worker
         "daemon_running": _PROMOTER_THREAD is not None and _PROMOTER_THREAD.is_alive(),
+        # Out-of-process heartbeat — truthful from any caller
+        "daemon_alive_heartbeat": daemon_alive,
+        "seconds_since_last_heartbeat": secs_since,
+        "last_heartbeat_iso": hb.get("iso"),
     }
