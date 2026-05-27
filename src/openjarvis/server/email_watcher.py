@@ -359,11 +359,21 @@ def start_poller(notify_callback: Callable[[Dict[str, Any]], None]) -> None:
 
 _WATCH_INTENT_RE = re.compile(
     r"\b("
-    r"(?:let\s+me\s+know|notify\s+me|tell\s+me|alert\s+me|watch\s+for|"
-    r"keep\s+an?\s+eye(?:\s+out)?|wait\s+for)\s+"
-    r"(?:.{0,40})?(?:when|if)\s+(?:.{0,60})?\bemail"
+    # "let me know / notify / tell / alert / wait / monitor / be on the lookout
+    #  / keep an eye / waiting for / look out for" + when/if + email reference
+    r"(?:let\s+me\s+know|notify\s+me|tell\s+me|alert\s+me|warn\s+me|"
+    r"watch\s+(?:for|out\s+for)?|keep\s+an?\s+eye(?:\s+out)?|"
+    r"wait\s+for|waiting\s+for|monitor\s+for|"
+    r"be\s+on\s+(?:the\s+)?lookout|on\s+the\s+lookout|"
+    r"trigger\s+(?:on|when)|"
+    r"set\s+up\s+(?:an?\s+)?(?:alert|reminder|watch|monitor|trigger))\s+"
+    r"(?:.{0,80})?(?:when|if|for)\s+(?:.{0,120})?\b(?:emails?|messages?|mail|inbox)"
     r"|"
-    r"(?:watch\s+(?:my\s+)?(?:inbox|email)\s+for)"
+    # "watch my inbox for", "set up an alert for emails from X"
+    r"(?:watch|monitor|notify\s+me\s+about)\s+(?:my\s+)?(?:inbox|email|emails?)\s+for"
+    r"|"
+    # Direct trigger: "if X emails me let me know"
+    r"if\s+\S+\s+emails?\s+me"
     r")\b",
     re.IGNORECASE,
 )

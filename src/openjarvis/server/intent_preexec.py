@@ -114,11 +114,20 @@ def _resolve_window(text: str) -> Optional[Tuple[str, str, str]]:
 
 _CALENDAR_INTENT_RE = re.compile(
     r"\b("
-    r"(?:check|show|tell|what|do\s+i\s+have|see|list|read)\s+(?:me\s+|out\s+)?"
-    r"(?:my\s+|the\s+)?(?:outlook\s+|google\s+|work\s+)?"
-    r"(?:calendar|meetings?|appointments?|schedule|agenda|events?)|"
+    # any verb that could possibly mean "look it up"
+    r"(?:check|verify|confirm|show|tell|see|list|read|find|get|"
+    r"look(?:\s+up)?|access|retrieve|pull|fetch|review|inspect|view|"
+    r"open|do\s+i\s+have|have\s+i\s+got|any|some|what|when|which|who)\s+"
+    r"(?:me\s+|out\s+|for\s+|up\s+)?"
+    r"(?:my\s+|the\s+|a\s+|an\s+)?(?:outlook\s+|google\s+|work\s+|"
+    r"personal\s+)?"
+    r"(?:calendar|meetings?|appointments?|schedule|agenda|events?|"
+    r"bookings?|reservations?)|"
     r"(?:any|some|my)\s+(?:meetings?|appointments?|events?)|"
-    r"what['\s]?s?\s+(?:on\s+)?(?:my\s+)?(?:calendar|schedule|agenda)"
+    r"what['\s]?s?\s+(?:on\s+)?(?:my\s+)?(?:calendar|schedule|agenda)|"
+    # bare nouns near time anchors — "calendar today", "meetings tomorrow"
+    r"(?:calendar|meetings?|events?|appointments?|schedule|agenda)\s+"
+    r"(?:today|tomorrow|this\s+week|next\s+week|now)"
     r")\b",
     re.IGNORECASE,
 )
@@ -160,11 +169,26 @@ def _detect_calendar_intent(text: str) -> Optional[Dict[str, Any]]:
 
 _EMAIL_SEARCH_INTENT_RE = re.compile(
     r"\b("
-    r"(?:check|show|tell|see|list|read|search|find|any)\s+(?:me\s+|for\s+)?"
-    r"(?:my\s+|the\s+)?(?:outlook\s+|gmail\s+|work\s+)?"
-    r"(?:emails?|messages?|inbox|mail)|"
+    # any plausible "look it up" verb
+    r"(?:check|verify|confirm|show|tell|see|list|read|search|find|"
+    r"get|look(?:\s+up)?|access|retrieve|pull|fetch|review|inspect|"
+    r"view|open|any|some|what|when|which|who|do\s+i\s+have|"
+    r"have\s+i\s+(?:got|received))\s+"
+    r"(?:me\s+|for\s+|out\s+|up\s+|the\s+|my\s+)?"
+    r"(?:last\s+|latest\s+|newest\s+|most\s+recent\s+|new\s+|recent\s+|"
+    r"first\s+|today['\s]?s?\s+|yesterday['\s]?s?\s+)?"
+    r"(?:my\s+|the\s+|a\s+|an\s+)?(?:outlook\s+|gmail\s+|hotmail\s+|"
+    r"work\s+|personal\s+)?"
+    r"(?:emails?|messages?|mail|inbox|notifications?)|"
+    # "last/who sent/from <name>" phrasing
+    r"(?:who(?:'s|\s+is|\s+was)?\s+the\s+(?:last|latest|most\s+recent)\s+"
+    r"(?:person|sender|one))|"
     r"(?:emails?|messages?|mail)\s+from\s+\S+|"
-    r"unread\s+(?:emails?|messages?|mail)"
+    r"(?:from\s+\S+)\s+(?:emails?|messages?|mail)|"
+    r"unread\s+(?:emails?|messages?|mail)|"
+    # bare "any new mail" / "anything from X"
+    r"any\s+(?:new\s+|recent\s+|unread\s+)?(?:emails?|mail|messages?)|"
+    r"anything\s+from\s+\S+"
     r")\b",
     re.IGNORECASE,
 )

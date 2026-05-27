@@ -1510,7 +1510,31 @@ def _handle_agent(
 
     try:
         try:
-            result = agent.run(input_text, context=ctx)
+            # Round 7e — HARD TIMEOUT on agent.run so a stuck provider can
+            # never freeze the user for >15s. agent.run is sync; we run it
+            # in a thread and join with a deadline. On timeout, raise a
+            # synthetic RuntimeError that the recoverable-error catcher
+            # below routes to the fallback chain.
+            import threading as _agent_t
+            import queue as _agent_q
+            _ar_q: "_agent_q.Queue" = _agent_q.Queue(maxsize=1)
+            def _ar_worker():
+                try:
+                    _r = agent.run(input_text, context=ctx)
+                    _ar_q.put(("ok", _r))
+                except BaseException as _ar_exc:
+                    _ar_q.put(("err", _ar_exc))
+            _ar_th = _agent_t.Thread(target=_ar_worker, name="agent-run", daemon=True)
+            _ar_th.start()
+            try:
+                _ar_kind, _ar_val = _ar_q.get(timeout=15.0)
+            except _agent_q.Empty:
+                raise RuntimeError(
+                    "agent.run timeout after 15s — provider unresponsive"
+                )
+            if _ar_kind == "err":
+                raise _ar_val
+            result = _ar_val
             # Round 6 fix — the model may have RETURNED an error string
             # instead of raising. Treat that as a recoverable failure too.
             if result and _looks_like_provider_error(getattr(result, "content", "") or ""):
