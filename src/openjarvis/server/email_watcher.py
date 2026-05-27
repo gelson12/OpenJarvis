@@ -382,16 +382,42 @@ _WATCH_FROM_RE = re.compile(
     r"\bfrom\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?|\S+@\S+\.\S+)",
     re.IGNORECASE,
 )
+# Catch "when Pedro emails me" / "Pedro sends me" / "Pedro's email" — i.e.
+# a capitalised proper name immediately followed by an email-action verb,
+# without requiring the literal word "from". Original regex missed this
+# extremely common phrasing.
+_WATCH_NAME_EMAILS_RE = re.compile(
+    r"\b(?:when\s+|if\s+)?"
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)"
+    r"(?:'s\s+|\s+)"
+    r"(?:emails?(?:\s+me)?|sends?(?:\s+me)?(?:\s+(?:an?\s+)?(?:email|message))?|"
+    r"messages?(?:\s+me)?|writes?(?:\s+me)?|gets?\s+back\s+to\s+me)",
+)
+# Plain "<email-address> emails me" or "<email-address>"
+_WATCH_EMAIL_ADDR_RE = re.compile(r"\b([\w.+-]+@[\w-]+\.[\w.-]+)\b", re.IGNORECASE)
 
 
 def detect_watch_intent(text: str) -> Optional[Dict[str, str]]:
     """Returns {sender, provider} if the user wants to set up an email watch."""
     if not text or not _WATCH_INTENT_RE.search(text):
         return None
+    # Try "from <Name>" first
+    sender = None
     m = _WATCH_FROM_RE.search(text)
-    if not m:
+    if m:
+        sender = m.group(1).strip()
+    # Then "when <Name> emails me"
+    if not sender:
+        m2 = _WATCH_NAME_EMAILS_RE.search(text)
+        if m2:
+            sender = m2.group(1).strip()
+    # Finally bare email address
+    if not sender:
+        m3 = _WATCH_EMAIL_ADDR_RE.search(text)
+        if m3:
+            sender = m3.group(1).strip()
+    if not sender:
         return None
-    sender = m.group(1).strip()
     provider = "outlook"
     if re.search(r"\bgmail\b", text, re.I):
         provider = "gmail"
