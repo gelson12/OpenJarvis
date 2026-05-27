@@ -360,13 +360,16 @@ def create_app(
     # messages on the next user turn (no LiveKit data-channel push yet).
     try:
         from openjarvis.server import email_watcher as _ew
-        def _notify_log(match):
+        from openjarvis.server import email_alerts_routes as _ea
+        app.include_router(_ea.router)
+        def _notify_via_sse(match):
             logger.warning(
                 "openjarvis.email_watcher.match watch=%s subject=%r",
                 match.get("watch", {}).get("id"),
                 (match.get("message", {}).get("subject") or "")[:80],
             )
-        _ew.start_poller(_notify_log)
+            _ea.push_alert(match)
+        _ew.start_poller(_notify_via_sse)
     except Exception as _exc:
         logger.warning("email_watcher startup failed: %s", _exc)
 

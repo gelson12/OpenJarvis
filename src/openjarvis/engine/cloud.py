@@ -302,6 +302,74 @@ def _is_anthropic_model(model: str) -> bool:
     )
 
 
+def _drop_orphaned_tool_results(chat_msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove tool_result blocks that don't have a matching tool_use in the
+    IMMEDIATELY-PREVIOUS assistant message. Anthropic's API strictly
+    requires pairing; LiveKit's conversation history occasionally drops or
+    reorders the tool_use, producing orphaned tool_results that 400 every
+    request. We're permissive: drop the orphan, keep the conversation
+    flowing.
+    """
+    if not chat_msgs:
+        return chat_msgs
+    cleaned: List[Dict[str, Any]] = []
+    for i, msg in enumerate(chat_msgs):
+        if not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
+        if msg.get("role") != "user":
+            cleaned.append(msg)
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            cleaned.append(msg)
+            continue
+        # This is a user message with structured content (likely tool_results)
+        # Find the previous assistant's tool_use ids (if any).
+        prev_use_ids: set = set()
+        # Walk backwards from current i looking for the most recent assistant msg
+        for j in range(len(cleaned) - 1, -1, -1):
+            prev = cleaned[j]
+            if not isinstance(prev, dict):
+                continue
+            if prev.get("role") != "assistant":
+                # Any other role between us and the assistant is fine, keep looking
+                # UNLESS it's another user — that breaks the pair
+                if prev.get("role") == "user":
+                    break
+                continue
+            prev_content = prev.get("content")
+            if isinstance(prev_content, list):
+                for block in prev_content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        bid = block.get("id")
+                        if bid:
+                            prev_use_ids.add(bid)
+            break  # found the assistant; stop scanning
+        # Now filter the current msg's content blocks
+        new_blocks = []
+        had_orphan = False
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                tid = block.get("tool_use_id")
+                if tid and tid not in prev_use_ids:
+                    had_orphan = True
+                    continue  # drop the orphan
+            new_blocks.append(block)
+        if not new_blocks:
+            # All blocks were orphans — drop the whole user message
+            if had_orphan:
+                continue
+        elif had_orphan:
+            cleaned.append({"role": "user", "content": new_blocks})
+        else:
+            cleaned.append(msg)
+        if not had_orphan and msg not in (cleaned[-1] if cleaned else None,):
+            # Defensive: don't double-append; the branch above already appended
+            pass
+    return cleaned
+
+
 def _is_google_model(model: str) -> bool:
     return (
         "gemini" in model.lower()
@@ -571,6 +639,18 @@ class CloudEngine(InferenceEngine):
                 chat_msgs.append({"role": "assistant", "content": content_blocks})
             else:
                 chat_msgs.append({"role": m.role.value, "content": m.content})
+        # Round 7c hotfix — strip ORPHANED tool_result blocks before
+        # returning. Anthropic's strict validator rejects requests where a
+        # `tool_result` block references a `tool_use_id` that has no
+        # matching `tool_use` in the IMMEDIATELY-PREVIOUS assistant
+        # message. This happens when LiveKit's conversation history
+        # reorders/drops tool_use entries (we saw it in production every
+        # turn after Claude called a tool once). Without this sanitizer
+        # the user gets:
+        #   anthropic.BadRequestError: 400 INVALID_ARGUMENT.
+        #   'unexpected tool_use_id found in tool_result blocks'
+        # on every subsequent voice turn.
+        chat_msgs = _drop_orphaned_tool_results(chat_msgs)
         return system_text, chat_msgs
 
     @staticmethod
