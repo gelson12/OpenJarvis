@@ -601,14 +601,30 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         _watch_intent = _ew.detect_watch_intent(_latest_user_for_watch)
         _watch_created_msg = None
         if _watch_intent:
-            wid = _ew.add_watch(_watch_intent["sender"],
-                                provider=_watch_intent["provider"])
+            wid = _ew.add_watch(
+                sender=_watch_intent.get("sender", ""),
+                provider=_watch_intent.get("provider", "outlook"),
+                subject_contains=_watch_intent.get("subject_contains", ""),
+                folders=_watch_intent.get("folders"),
+            )
             if wid:
+                _desc_bits = []
+                if _watch_intent.get("sender"):
+                    _desc_bits.append(f"from {_watch_intent['sender']!r}")
+                if _watch_intent.get("subject_contains"):
+                    _desc_bits.append(f"about {_watch_intent['subject_contains']!r}")
+                _folders = _watch_intent.get("folders") or ["inbox"]
+                _folder_label = (
+                    "inbox+junkmail" if set(_folders) == {"inbox", "junkemail"}
+                    else ("junkmail" if _folders == ["junkemail"] else "inbox")
+                )
                 _watch_created_msg = (
-                    f"WATCH CREATED: monitoring {_watch_intent['provider']} for "
-                    f"emails from {_watch_intent['sender']!r}. I will check "
-                    "every minute and alert the user when a match arrives. "
-                    "Tell the user briefly that the watch is active."
+                    f"WATCH CREATED: monitoring {_watch_intent.get('provider', 'outlook')} "
+                    f"{_folder_label} for emails "
+                    + (" and ".join(_desc_bits) if _desc_bits else "(any)")
+                    + ". I will check every minute and alert the user when a "
+                    "match arrives. Tell the user briefly that the watch is "
+                    "active, naming what's being watched."
                 )
         # 2) Surface any pending triggered watches as alerts
         _pending_alerts = []

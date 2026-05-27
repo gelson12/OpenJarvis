@@ -96,20 +96,42 @@ def _make_id(sender: str, ts: float) -> str:
 # CRUD
 # ---------------------------------------------------------------------------
 
-def add_watch(sender: str, *, provider: str = "outlook",
-              subject_contains: str = "") -> Optional[str]:
-    """Add a watch. Returns the watch_id or None if invalid input."""
+def add_watch(sender: str = "", *, provider: str = "outlook",
+              subject_contains: str = "",
+              folders: Optional[List[str]] = None) -> Optional[str]:
+    """Add a watch. Returns the watch_id or None if invalid input.
+
+    A watch must specify at least one of `sender` or `subject_contains`.
+    `folders` is a list of Outlook well-known folder names to scan; defaults
+    to ['inbox']. Use ['inbox', 'junkemail'] to also check junk mail.
+    """
     sender = (sender or "").strip()
-    if not sender:
+    subject_contains = (subject_contains or "").strip()
+    # Round 9-followup: support topic-only watches (no sender required).
+    if not sender and not subject_contains:
         return None
     if provider not in ("outlook", "gmail"):
         provider = "outlook"
+    # Default + sanitize folder list
+    if not folders:
+        folders = ["inbox"]
+    valid_outlook = {"inbox", "junkemail", "drafts", "sentitems",
+                     "deleteditems", "archive"}
+    folders = [f.lower() for f in folders if isinstance(f, str)]
+    if provider == "outlook":
+        folders = [f for f in folders if f in valid_outlook] or ["inbox"]
+    # Deduplicate, preserve order
+    seen: set = set()
+    folders = [f for f in folders if not (f in seen or seen.add(f))]
     now = time.time()
-    wid = _make_id(sender, now)
+    # Include subject + folders in the id seed so distinct watches with the
+    # same sender don't collide.
+    wid = _make_id(f"{sender}|{subject_contains}|{','.join(folders)}", now)
     watch = {
         "id": wid,
         "sender": sender,
-        "subject_contains": subject_contains.strip(),
+        "subject_contains": subject_contains,
+        "folders": folders,
         "provider": provider,
         "active": True,
         "triggered": False,
@@ -125,8 +147,9 @@ def add_watch(sender: str, *, provider: str = "outlook",
         data["watches"].append(watch)
         _save(data)
     logger.info(
-        "openjarvis.email_watcher.add id=%s sender=%r provider=%s",
-        wid, sender[:60], provider,
+        "openjarvis.email_watcher.add id=%s sender=%r subject=%r "
+        "folders=%s provider=%s",
+        wid, sender[:60], subject_contains[:60], folders, provider,
     )
     return wid
 
@@ -195,42 +218,74 @@ def mark_notified(watch_id: str) -> bool:
 # Provider-side check
 # ---------------------------------------------------------------------------
 
-def _check_outlook(sender: str, subject_contains: str = "") -> List[Dict[str, Any]]:
-    """Returns list of matching messages [{id, subject, sender, received_at}]."""
+def _check_outlook(
+    sender: str = "",
+    subject_contains: str = "",
+    folders: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Returns list of matching messages [{id, subject, sender, received_at,
+    folder}] scanned across the requested folders (defaults to ['inbox'])."""
     try:
         from openjarvis.core.registry import ToolRegistry
         cls = ToolRegistry.get("outlook_list_messages")
         if cls is None:
             return []
-        filters = []
-        if "@" in sender:
-            filters.append(f"from/emailAddress/address eq '{sender}'")
-        else:
-            filters.append(f"contains(from/emailAddress/name,'{sender}')")
+        filters: List[str] = []
+        if sender:
+            if "@" in sender:
+                filters.append(f"from/emailAddress/address eq '{sender}'")
+            else:
+                # Escape single quotes by doubling per OData syntax
+                safe = sender.replace("'", "''")
+                filters.append(f"contains(from/emailAddress/name,'{safe}')")
         if subject_contains:
-            filters.append(f"contains(subject,'{subject_contains}')")
-        kwargs = {"top": 5, "filter": " and ".join(filters)}
-        result = cls().execute(**kwargs)
-        content = getattr(result, "content", "") or ""
-        # Parse JSON if it looks like JSON
-        try:
-            parsed = json.loads(content)
-        except Exception:
-            return []
-        # outlook_list_messages returns {value: [...]} or [...] depending on path
-        msgs = parsed.get("value") if isinstance(parsed, dict) else parsed
-        if not isinstance(msgs, list):
-            return []
-        out = []
-        for m in msgs:
-            out.append({
-                "id": m.get("id"),
-                "subject": (m.get("subject") or "").strip(),
-                "sender": (m.get("from", {}).get("emailAddress", {}).get("name")
-                           or m.get("from", {}).get("emailAddress", {}).get("address")
-                           or sender),
-                "received_at": m.get("receivedDateTime"),
-            })
+            safe = subject_contains.replace("'", "''")
+            filters.append(f"contains(subject,'{safe}')")
+        # Always restrict to "recent" so we don't keep matching the same
+        # stale message forever (a 24h window covers all polling cadences).
+        from datetime import timedelta
+        recent_iso = (datetime.now(timezone.utc) - timedelta(days=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        filters.append(f"receivedDateTime ge {recent_iso}")
+        folders = folders or ["inbox"]
+        out: List[Dict[str, Any]] = []
+        for folder in folders:
+            kwargs: Dict[str, Any] = {"top": 5}
+            if folder and folder != "inbox":
+                kwargs["folder_id"] = folder
+            elif folder == "inbox":
+                # Explicit inbox is OK; tool defaults there if omitted, but
+                # being explicit makes the request self-documenting.
+                kwargs["folder_id"] = "inbox"
+            if filters:
+                kwargs["filter"] = " and ".join(filters)
+            try:
+                result = cls().execute(**kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "email_watcher: outlook check failed folder=%s: %s",
+                    folder, exc,
+                )
+                continue
+            content = getattr(result, "content", "") or ""
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                continue
+            msgs = parsed.get("value") if isinstance(parsed, dict) else parsed
+            if not isinstance(msgs, list):
+                continue
+            for m in msgs:
+                out.append({
+                    "id": m.get("id"),
+                    "subject": (m.get("subject") or "").strip(),
+                    "sender": (m.get("from", {}).get("emailAddress", {}).get("name")
+                               or m.get("from", {}).get("emailAddress", {}).get("address")
+                               or sender or "(unknown)"),
+                    "received_at": m.get("receivedDateTime"),
+                    "folder": folder,
+                })
         return out
     except Exception as exc:
         logger.warning("email_watcher: outlook check failed: %s", exc)
@@ -281,18 +336,23 @@ def check_now() -> List[Dict[str, Any]]:
             if not w.get("active") or w.get("triggered"):
                 continue
             provider = w.get("provider", "outlook")
-            sender = w.get("sender", "")
-            subj = w.get("subject_contains", "")
+            sender = w.get("sender", "") or ""
+            subj = w.get("subject_contains", "") or ""
+            folders = w.get("folders") or ["inbox"]
+            if not sender and not subj:
+                # Invalid watch (legacy or corrupted) — skip silently
+                continue
             if provider == "gmail":
                 hits = _check_gmail(sender, subj)
             else:
-                hits = _check_outlook(sender, subj)
+                hits = _check_outlook(sender, subj, folders=folders)
             w["last_check_ts"] = time.time()
             if hits:
                 first = hits[0]
                 w["triggered"] = True
                 w["matched_message_id"] = first.get("id")
                 w["matched_subject"] = first.get("subject")
+                w["matched_folder"] = first.get("folder")
                 w["matched_at"] = datetime.now(timezone.utc).isoformat()
                 matches.append({"watch": dict(w), "message": first})
         if matches:
@@ -359,18 +419,26 @@ def start_poller(notify_callback: Callable[[Dict[str, Any]], None]) -> None:
 
 _WATCH_INTENT_RE = re.compile(
     r"\b("
-    # "let me know / notify / tell / alert / wait / monitor / be on the lookout
-    #  / keep an eye / waiting for / look out for" + when/if + email reference
+    # "let me know / notify / tell / alert / monitor / be on the lookout
+    #  / keep an eye / look out for" + when/if + email reference
     r"(?:let\s+me\s+know|notify\s+me|tell\s+me|alert\s+me|warn\s+me|"
     r"watch\s+(?:for|out\s+for)?|keep\s+an?\s+eye(?:\s+out)?|"
-    r"wait\s+for|waiting\s+for|monitor\s+for|"
+    r"monitor\s+for|"
     r"be\s+on\s+(?:the\s+)?lookout|on\s+the\s+lookout|"
     r"trigger\s+(?:on|when)|"
     r"set\s+up\s+(?:an?\s+)?(?:alert|reminder|watch|monitor|trigger))\s+"
-    r"(?:.{0,80})?(?:when|if|for)\s+(?:.{0,120})?\b(?:emails?|messages?|mail|inbox)"
+    r"(?:.{0,80})?(?:when|if|for)\s+(?:.{0,120})?\b(?:emails?|messages?|mail|inbox|"
+    r"junk(?:mail)?|spam|anything|something)"
+    r"|"
+    # "wait for an email about X" / "waiting for VIQU to email"
+    # The verb consumes the connector 'for' so we can't require a second
+    # when/if/for. Match the verb directly followed by email-domain noun.
+    r"(?:wait(?:ing)?\s+for|expecting|anticipating)\s+(?:an?\s+|the\s+)?"
+    r"(?:emails?|messages?|mail|reply|response)"
     r"|"
     # "watch my inbox for", "set up an alert for emails from X"
-    r"(?:watch|monitor|notify\s+me\s+about)\s+(?:my\s+)?(?:inbox|email|emails?)\s+for"
+    r"(?:watch|monitor|notify\s+me\s+about)\s+(?:my\s+)?"
+    r"(?:inbox|email|emails?|junk(?:mail)?|spam)\s+for"
     r"|"
     # Direct trigger: "if X emails me let me know"
     r"if\s+\S+\s+emails?\s+me"
@@ -379,49 +447,110 @@ _WATCH_INTENT_RE = re.compile(
 )
 
 _WATCH_FROM_RE = re.compile(
-    r"\bfrom\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?|\S+@\S+\.\S+)",
+    # Order matters: full email address first (otherwise the proper-name
+    # alternative grabs just the local part under re.IGNORECASE). Then
+    # all-caps acronyms (e.g. "VIQU"), then proper-case names.
+    r"\bfrom\s+(\S+@\S+\.\S+|[A-Z]{2,}|[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)",
     re.IGNORECASE,
 )
 # Catch "when Pedro emails me" / "Pedro sends me" / "Pedro's email" — i.e.
-# a capitalised proper name immediately followed by an email-action verb,
-# without requiring the literal word "from". Original regex missed this
-# extremely common phrasing.
+# a capitalised proper name immediately followed by an email-action verb.
 _WATCH_NAME_EMAILS_RE = re.compile(
     r"\b(?:when\s+|if\s+)?"
-    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)"
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?|[A-Z]{2,})"
     r"(?:'s\s+|\s+)"
     r"(?:emails?(?:\s+me)?|sends?(?:\s+me)?(?:\s+(?:an?\s+)?(?:email|message))?|"
     r"messages?(?:\s+me)?|writes?(?:\s+me)?|gets?\s+back\s+to\s+me)",
 )
-# Plain "<email-address> emails me" or "<email-address>"
+# Plain email address anywhere in the text.
 _WATCH_EMAIL_ADDR_RE = re.compile(r"\b([\w.+-]+@[\w-]+\.[\w.-]+)\b", re.IGNORECASE)
 
+# Topic/subject extraction. The phrasings span many forms — we keep this
+# focused on patterns that clearly delimit a topic phrase.
+_WATCH_TOPIC_RE = re.compile(
+    r"\b(?:"
+    r"about|regarding|concerning|on\s+the\s+(?:topic|subject)\s+of|"
+    r"with\s+(?:the\s+)?(?:subject|topic|title)|"
+    # Mention verbs in any form: mention/mentions/mentioning/mentioned/that-mentions
+    r"mentioning|(?:that\s+)?mention(?:s|ed)?|"
+    r"containing|with\s+the\s+(?:word|phrase|term)|"
+    r"to\s+do\s+with"
+    r")\s+"
+    r"(?:['\"]([^'\"\n]{2,80})['\"]"            # quoted phrase wins
+    r"|([A-Za-z][\w\s.&'-]{1,60}?)"             # else greedy stop on punctuation
+    r")(?=$|[.,!?;:]|\s+(?:lands?|arrives?|comes?|shows?|appears?|in\s+(?:my|the)|"
+    r"and|or|but)\b)",
+    re.IGNORECASE,
+)
 
-def detect_watch_intent(text: str) -> Optional[Dict[str, str]]:
-    """Returns {sender, provider} if the user wants to set up an email watch."""
+# Folder hint extraction. "junkmail", "junk mail", "spam", "spam folder",
+# "junk folder" → tell the watcher to include the JunkEmail folder.
+_WATCH_JUNK_RE = re.compile(
+    r"\b(junk\s*mail|junk\s+folder|junk|spam(?:\s+folder)?)\b",
+    re.IGNORECASE,
+)
+# Explicit inbox mention (rare; mostly we default).
+_WATCH_INBOX_RE = re.compile(r"\b(inbox|mailbox)\b", re.IGNORECASE)
+
+
+def _extract_folders(text: str) -> List[str]:
+    """Return the list of Outlook folders to scan based on the user's
+    phrasing. Defaults to ['inbox']. 'junkmail' / 'spam' adds 'junkemail'.
+    If BOTH are mentioned, both are scanned. The order preserved is
+    inbox-first so most relevant matches surface first."""
+    has_junk = bool(_WATCH_JUNK_RE.search(text or ""))
+    has_inbox = bool(_WATCH_INBOX_RE.search(text or ""))
+    if has_junk and has_inbox:
+        return ["inbox", "junkemail"]
+    if has_junk:
+        return ["junkemail"]
+    return ["inbox"]
+
+
+def detect_watch_intent(text: str) -> Optional[Dict[str, Any]]:
+    """Returns {sender, provider, subject_contains, folders} if the user
+    wants to set up an email watch. Either `sender` or `subject_contains`
+    must be present — topic-only watches are now supported."""
     if not text or not _WATCH_INTENT_RE.search(text):
         return None
-    # Try "from <Name>" first
-    sender = None
+    # Sender extraction — try in priority order: "from <Name>" → name-emails-me
+    # → bare email address.
+    sender = ""
     m = _WATCH_FROM_RE.search(text)
     if m:
         sender = m.group(1).strip()
-    # Then "when <Name> emails me"
     if not sender:
         m2 = _WATCH_NAME_EMAILS_RE.search(text)
         if m2:
             sender = m2.group(1).strip()
-    # Finally bare email address
     if not sender:
         m3 = _WATCH_EMAIL_ADDR_RE.search(text)
         if m3:
             sender = m3.group(1).strip()
-    if not sender:
+
+    # Topic extraction — independent of sender.
+    subject = ""
+    mt = _WATCH_TOPIC_RE.search(text)
+    if mt:
+        # group 1 = quoted, group 2 = unquoted
+        subject = (mt.group(1) or mt.group(2) or "").strip(" .,;:!?'\"")
+
+    # Need at least one signal — sender OR subject.
+    if not sender and not subject:
         return None
+
     provider = "outlook"
     if re.search(r"\bgmail\b", text, re.I):
         provider = "gmail"
-    return {"sender": sender, "provider": provider}
+
+    folders = _extract_folders(text)
+
+    return {
+        "sender": sender,
+        "subject_contains": subject,
+        "provider": provider,
+        "folders": folders,
+    }
 
 
 # ---------------------------------------------------------------------------
