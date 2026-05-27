@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from typing import Any
 
@@ -480,6 +481,88 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     engine = request.app.state.engine
     agent = getattr(request.app.state, "agent", None)
     model = request_body.model
+
+    # Round 7d — ANTI-HALLUCINATION FOLLOW-UP GUARD.
+    # If the prior assistant turn (or a system message in this turn) had a
+    # successful pre-execution AND the user's current message looks like a
+    # short clarifying follow-up ("Today?", "Really?", "Are you sure?",
+    # "What?"), inject a strong reminder so the LLM doesn't disavow the
+    # prior REAL data. This was the exact failure mode in production:
+    # turn 1 returned correct calendar data, turn 2 ("Today?") triggered
+    # Claude to apologise and claim it "doesn't have a tool for that".
+    try:
+        if request_body.messages and len(request_body.messages) >= 2:
+            _last_user = ""
+            for _m in reversed(request_body.messages):
+                if _m.role == "user" and _m.content:
+                    _last_user = _m.content
+                    break
+            # Find the most recent prior assistant or system message
+            _prior_content = ""
+            for _m in reversed(request_body.messages[:-1]):
+                if _m.role in ("assistant", "system") and _m.content:
+                    _prior_content = _m.content
+                    break
+            _looks_like_clarif = bool(
+                _last_user
+                and len(_last_user.split()) <= 5
+                and re.search(
+                    r"^(today|tomorrow|really|are you sure|sure\??|what|when|"
+                    r"yes|no|huh|why|how|hmm|wait|hold on|repeat|"
+                    r"and|so|then|actually|truly)\??\.?$",
+                    _last_user.strip(),
+                    re.IGNORECASE,
+                )
+            )
+            _prior_was_preexec = bool(
+                _prior_content
+                and ("PRE-EXECUTED TOOL RESULT" in _prior_content
+                     or "PENDING EMAIL ALERTS" in _prior_content
+                     or "SERVER CAPABILITIES" in _prior_content)
+            )
+            # ALSO trigger when prior assistant answered with specific data
+            # like "you have no events" or "X sent you an email" — short
+            # follow-up against THIS deserves the no-disavow guard too.
+            _prior_had_data = bool(
+                _prior_content
+                and re.search(
+                    r"\b(no\s+(?:events|meetings|emails)|"
+                    r"sent\s+you\s+an?\s+email|"
+                    r"you\s+have\s+\d+|"
+                    r"calendar|inbox|meetings?|appointments?)\b",
+                    _prior_content,
+                    re.IGNORECASE,
+                )
+            )
+            if _looks_like_clarif and (_prior_was_preexec or _prior_had_data):
+                from openjarvis.server.models import ChatMessage
+                _guard = (
+                    "ANTI-DISAVOW GUARD: The user's short message is a "
+                    "FOLLOW-UP to your prior reply, NOT a challenge that "
+                    "requires backtracking. You ALREADY had the real tool "
+                    "data when you answered last turn — do NOT now say 'I "
+                    "don't have a tool for that' or 'I apologise for the "
+                    "assumption'. CONFIRM your prior answer or add detail. "
+                    "If they ask 'Today?' or 'Really?', the right answer is "
+                    "'Yes, sir — today, [date].' or 'Yes, that's correct.' "
+                    "NOT an apology. NEVER claim a tool is unavailable when "
+                    "you just used it successfully one turn ago."
+                )
+                _msgs = list(request_body.messages)
+                _msgs.insert(
+                    max(0, len(_msgs) - 1),
+                    ChatMessage(role="system", content=_guard,
+                                name=None, tool_call_id=None),
+                )
+                request_body.messages = _msgs
+                logging.getLogger("openjarvis.server").warning(
+                    "openjarvis.anti_disavow.guard_injected user=%r",
+                    _last_user[:60],
+                )
+    except Exception as _ad_exc:
+        logging.getLogger("openjarvis.server").debug(
+            "anti-disavow guard skipped: %s", _ad_exc,
+        )
 
     # Round 7b — EMAIL WATCH intent + pending-alert surfacing.
     # If the user said "let me know when Pedro emails me" → create a

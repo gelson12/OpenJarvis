@@ -317,10 +317,19 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
         block = (
             f"PRE-EXECUTED TOOL RESULT (from {tool_name}, window: "
             f"{cal['window_label']}):\n{result}\n\n"
-            "INSTRUCTION: Summarise these REAL results in one short sentence. "
-            "Do NOT call the tool again. Do NOT say you'll check — you "
-            "already have the data above. If the result shows no events, "
-            "say so honestly."
+            "ABSOLUTE INSTRUCTIONS (you MUST follow these):\n"
+            "  1. Summarise these REAL results in one short sentence.\n"
+            "  2. Do NOT call the tool again — it already ran.\n"
+            "  3. Do NOT say 'I'll check' — you already have the data.\n"
+            "  4. Do NOT apologise for or disavow this result. The tool was\n"
+            "     actually invoked successfully against the user's real\n"
+            "     Outlook/Calendar account just now. If the user asks a\n"
+            "     follow-up like 'Today?' / 'really?' / 'are you sure?',\n"
+            "     CONFIRM the data above is correct (you literally just\n"
+            "     retrieved it). NEVER respond with 'I don't have a tool\n"
+            "     for that' — you DO have it and you JUST used it.\n"
+            "  5. If the result shows no events, say so honestly\n"
+            "     ('No meetings on your calendar today, sir.')."
         )
         logger.info(
             "intent_preexec.calendar served via %s window=%s",
@@ -347,8 +356,17 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
         block = (
             f"PRE-EXECUTED TOOL RESULT (from {tool_name}{sender_part}"
             f"{unread_part}):\n{result}\n\n"
-            "INSTRUCTION: Summarise these REAL results in one short sentence. "
-            "Do NOT call the tool again. If the result is empty, say so honestly."
+            "ABSOLUTE INSTRUCTIONS (you MUST follow these):\n"
+            "  1. Summarise these REAL results in one short sentence.\n"
+            "  2. Do NOT call the tool again — it already ran.\n"
+            "  3. Do NOT apologise for or disavow this result — the tool\n"
+            "     was actually invoked successfully just now.\n"
+            "  4. If the user asks a follow-up like 'really?' / 'are you\n"
+            "     sure?', CONFIRM the data above. NEVER backtrack with\n"
+            "     'I don't have a tool for that' — you DO have it and\n"
+            "     you just used it.\n"
+            "  5. If the result is empty, say so honestly ('No matching\n"
+            "     emails, sir.')."
         )
         logger.info(
             "intent_preexec.email served via %s sender=%s unread=%s",
