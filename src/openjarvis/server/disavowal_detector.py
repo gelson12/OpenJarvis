@@ -78,7 +78,11 @@ _DISAVOWAL_PATTERNS: List[re.Pattern] = [
 ]
 
 
-_CATEGORY_HINTS: Dict[str, List[str]] = {
+# Low-confidence fallback hints used ONLY when domain_classifier returns
+# "general" but the user clearly meant email/calendar/watch. The primary
+# domain inference now goes through openjarvis.learning.domain_classifier
+# so every domain (history, science, code, etc.) gets logged.
+_TOOL_DOMAIN_HINTS: Dict[str, List[str]] = {
     "email": ["email", "inbox", "mail", "message", "gmail", "outlook"],
     "calendar": ["calendar", "meeting", "event", "appointment", "schedule", "agenda"],
     "watch": ["notify", "alert", "let me know", "watch", "lookout", "monitor", "wait for", "trigger"],
@@ -107,16 +111,44 @@ def _looks_like_disavowal(assistant_text: str) -> bool:
     return any(p.search(assistant_text) for p in _DISAVOWAL_PATTERNS)
 
 
+def _infer_domain(user_text: str, assistant_text: str) -> str:
+    """Universal domain inference. Primary path: the shared
+    domain_classifier (10 domains). Secondary fallback: tool-domain
+    hint overlap (email/calendar/watch) — used only when the classifier
+    returns 'general' but the text obviously refers to a tool domain.
+
+    Always returns a non-empty domain string ('general' on miss). The
+    pre-Round-8 behaviour returned 'unknown'; we keep that as the value
+    indicating "no tool-domain match AND classifier returned general AND
+    no hint score" — preserved for backward compat in record_if_disavowal.
+    """
+    # Primary — shared classifier
+    try:
+        from openjarvis.learning.domain_classifier import infer_domain as _classify
+        primary = _classify(user_text or "")
+    except Exception:
+        primary = "general"
+
+    # Tool-domain fallback (only kicks in when classifier was non-specific)
+    if primary == "general":
+        blob = f"{user_text or ''} {assistant_text or ''}".lower()
+        best_cat = None
+        best_score = 0
+        for cat, hints in _TOOL_DOMAIN_HINTS.items():
+            score = sum(1 for h in hints if h in blob)
+            if score > best_score:
+                best_cat = cat
+                best_score = score
+        if best_cat and best_score >= 1:
+            return best_cat
+
+    return primary
+
+
+# Backward-compat shim: older callers (and tests) used _infer_category.
 def _infer_category(user_text: str, assistant_text: str) -> str:
-    blob = f"{user_text or ''} {assistant_text or ''}".lower()
-    best_cat = "unknown"
-    best_score = 0
-    for cat, hints in _CATEGORY_HINTS.items():
-        score = sum(1 for h in hints if h in blob)
-        if score > best_score:
-            best_cat = cat
-            best_score = score
-    return best_cat
+    d = _infer_domain(user_text, assistant_text)
+    return d if d != "general" else "unknown"
 
 
 def record_if_disavowal(
@@ -140,14 +172,12 @@ def record_if_disavowal(
     # strong-enough evidence the LLM had the tools (auto-inject is
     # near-universal in production now).
     groups = injected_tool_groups or []
-    category = _infer_category(user_text, assistant_text)
-    if not groups and category == "unknown":
-        return None  # nothing actionable to promote
-    has_relevant_tools = bool(groups) and any(
-        g not in ("always_on", "always_on_only") for g in groups
-    )
-    if groups and not has_relevant_tools and category == "unknown":
-        return None  # only always_on injected, no domain match → skip
+    domain = _infer_domain(user_text, assistant_text)
+    # Round 8: log EVERY disavowal regardless of domain. Previously we
+    # dropped non-tool-domain events ("unknown" category); now history,
+    # science, code, math, etc. all flow through the learning loop.
+    # The only filter we keep is the empty-text safety net (handled by
+    # _looks_like_disavowal above).
     event = {
         "ts": time.time(),
         "iso": datetime.now(timezone.utc).isoformat(),
@@ -155,7 +185,11 @@ def record_if_disavowal(
         "assistant_text": (assistant_text or "").strip()[:600],
         "injected_tool_groups": list(groups),
         "injected_tool_names": list(injected_tool_names or [])[:20],
-        "inferred_category": category,
+        # New canonical field. Keep 'inferred_category' as an alias for
+        # backward compatibility with existing log records (read path
+        # tolerates both).
+        "inferred_domain": domain,
+        "inferred_category": domain if domain in _TOOL_DOMAIN_HINTS else "unknown",
         "session_id": session_id,
     }
     try:
@@ -166,9 +200,22 @@ def record_if_disavowal(
         logger.debug("disavowal_detector: write failed: %s", exc)
         return event
 
+    # Best-effort mirroring to durable backends (Round 8.7). None of these
+    # can raise — they swallow their own errors so the hot path stays clean.
+    try:
+        from openjarvis.server import learning_pg as _pg
+        _pg.mirror_disavowal(event)
+    except Exception as exc:
+        logger.debug("disavowal_detector: pg mirror skipped: %s", exc)
+    try:
+        from openjarvis.server import learning_mind as _mind
+        _mind.index_disavowal(event)
+    except Exception as exc:
+        logger.debug("disavowal_detector: mind index skipped: %s", exc)
+
     logger.warning(
-        "openjarvis.disavowal.detected category=%s user=%r groups=%s",
-        category, event["user_text"][:80], groups,
+        "openjarvis.disavowal.detected domain=%s user=%r groups=%s",
+        domain, event["user_text"][:80], groups,
     )
     return event
 
@@ -189,8 +236,11 @@ def read_recent(*, limit: int = 200, category: Optional[str] = None) -> List[Dic
                     rec = json.loads(line)
                 except Exception:
                     continue
-                if category and rec.get("inferred_category") != category:
-                    continue
+                if category:
+                    # Backward compat: accept either field name.
+                    rec_dom = rec.get("inferred_domain") or rec.get("inferred_category")
+                    if rec_dom != category:
+                        continue
                 out.append(rec)
     except Exception as exc:
         logger.debug("disavowal_detector: read failed: %s", exc)

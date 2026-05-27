@@ -325,58 +325,118 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
     text = latest_user_text.strip()
 
     # ── Self-improvement layer: check LEARNED intents first ─────────────
-    # learned_intents.match_category() returns the category if any auto-
-    # promoted pattern (from prior disavowals) matches. This is how the
-    # loop closes: failures yesterday → patterns auto-promoted overnight →
-    # today they bypass the LLM entirely.
+    # learned_intents.match_learned() returns the full match dict
+    # ({domain, action, hint_text, regex}) when any auto-promoted pattern
+    # (from prior disavowals across ANY domain) matches.
+    #
+    # This is how the loop closes universally (Round 8):
+    #   * action="preexec" — the domain has a server-side tool executor
+    #     (email/calendar/watch). Fire it directly.
+    #   * action="prompt_hint" — the domain has no tool executor
+    #     (history/science/code/math/…). Inject the learned hint as a
+    #     system context block so the LLM picks the right fallback
+    #     (web_search, knowledge_search, honest reasoning) instead of
+    #     disavowing again.
     try:
         from openjarvis.server import learned_intents as _li
-        _learned_cat = _li.match_category(text)
+        _learned = _li.match_learned(text)
     except Exception:
-        _learned_cat = None
+        _learned = None
 
-    if _learned_cat == "calendar":
-        # Force calendar pre-execution regardless of hardcoded regex
-        cal = _detect_calendar_intent(text) or {
-            "provider": "outlook" if not _PREFER_GOOGLE_RE.search(text) else "google",
-            "start": _today_window()[0],
-            "end": _today_window()[1],
-            "window_label": "today",
-        }
-        if cal["provider"] == "outlook":
-            tool_name = "outlook_list_events"
-            result = _run_outlook_list_events(cal["start"], cal["end"])
-        else:
-            tool_name = "calendar_list_events"
-            result = _run_calendar_list_events(cal["start"], cal["end"])
-        if result:
-            block = (
-                f"PRE-EXECUTED TOOL RESULT (via LEARNED intent, from "
-                f"{tool_name}, window: {cal['window_label']}):\n{result}\n\n"
-                "INSTRUCTION: This pattern was auto-promoted because past "
-                "failures matched it. Trust the data above and summarise."
-            )
-            logger.info("intent_preexec.LEARNED.calendar served via %s", tool_name)
-            return {"tool_name": tool_name, "result": result, "context_block": block}
+    if _learned and _learned.get("action") == "preexec":
+        domain = _learned.get("domain")
+        if domain == "calendar":
+            cal = _detect_calendar_intent(text) or {
+                "provider": "outlook" if not _PREFER_GOOGLE_RE.search(text) else "google",
+                "start": _today_window()[0],
+                "end": _today_window()[1],
+                "window_label": "today",
+            }
+            if cal["provider"] == "outlook":
+                tool_name = "outlook_list_events"
+                result = _run_outlook_list_events(cal["start"], cal["end"])
+            else:
+                tool_name = "calendar_list_events"
+                result = _run_calendar_list_events(cal["start"], cal["end"])
+            if result:
+                block = (
+                    f"PRE-EXECUTED TOOL RESULT (via LEARNED intent, from "
+                    f"{tool_name}, window: {cal['window_label']}):\n{result}\n\n"
+                    "INSTRUCTION: This pattern was auto-promoted because past "
+                    "failures matched it. Trust the data above and summarise."
+                )
+                logger.info("intent_preexec.LEARNED.calendar served via %s", tool_name)
+                return {"tool_name": tool_name, "result": result, "context_block": block}
 
-    if _learned_cat == "email":
-        # Default to outlook + recent
-        provider = "outlook" if not _PREFER_GOOGLE_RE.search(text) else "gmail"
-        if provider == "outlook":
-            tool_name = "outlook_list_messages"
-            result = _run_outlook_list_messages(sender=None, is_unread=False)
-        else:
-            tool_name = "gmail_list_messages"
-            result = _run_gmail_list_messages(sender=None, is_unread=False)
-        if result:
+        elif domain == "email":
+            provider = "outlook" if not _PREFER_GOOGLE_RE.search(text) else "gmail"
+            if provider == "outlook":
+                tool_name = "outlook_list_messages"
+                result = _run_outlook_list_messages(sender=None, is_unread=False)
+            else:
+                tool_name = "gmail_list_messages"
+                result = _run_gmail_list_messages(sender=None, is_unread=False)
+            if result:
+                block = (
+                    f"PRE-EXECUTED TOOL RESULT (via LEARNED intent, from "
+                    f"{tool_name}):\n{result}\n\n"
+                    "INSTRUCTION: This pattern was auto-promoted from past "
+                    "failures. Trust this real data — summarise in one sentence."
+                )
+                logger.info("intent_preexec.LEARNED.email served via %s", tool_name)
+                return {"tool_name": tool_name, "result": result, "context_block": block}
+
+        # 'watch' domain has its own scheduling path elsewhere; if/when
+        # it grows a pre-executor here, add the elif branch above. For
+        # now, fall through to hardcoded regex detection below.
+
+    elif _learned and _learned.get("action") == "prompt_hint":
+        hint_text = _learned.get("hint_text")
+        if hint_text:
             block = (
-                f"PRE-EXECUTED TOOL RESULT (via LEARNED intent, from "
-                f"{tool_name}):\n{result}\n\n"
-                "INSTRUCTION: This pattern was auto-promoted from past "
-                "failures. Trust this real data — summarise in one sentence."
+                f"LEARNED PROMPT HINT (auto-promoted from past failures in "
+                f"domain={_learned.get('domain')}):\n{hint_text}\n\n"
+                "Follow this hint for the user's question below. Do NOT "
+                "claim you can't help — use the suggested fallback path."
             )
-            logger.info("intent_preexec.LEARNED.email served via %s", tool_name)
-            return {"tool_name": tool_name, "result": result, "context_block": block}
+            logger.info(
+                "intent_preexec.LEARNED.prompt_hint domain=%s",
+                _learned.get("domain"),
+            )
+            return {
+                "tool_name": None,
+                "result": None,
+                "context_block": block,
+            }
+
+    # ── Independent lookup in the prompt-hint store ─────────────────────
+    # learned_prompt_hints stores its hints separately from
+    # learned_intents.json (so the daemon can populate it without touching
+    # the patterns store). Check it too so we still inject the hint when
+    # the user's phrasing matches a hint regex even if no learned-intent
+    # entry was created.
+    try:
+        from openjarvis.server import learned_prompt_hints as _hints_mod
+        _hint_hit = _hints_mod.lookup(text)
+    except Exception:
+        _hint_hit = None
+    if _hint_hit:
+        hint_text = _hint_hit.get("hint_text")
+        if hint_text:
+            block = (
+                f"LEARNED PROMPT HINT (auto-promoted, domain="
+                f"{_hint_hit.get('domain')}):\n{hint_text}\n\n"
+                "Follow this hint instead of disavowing capability."
+            )
+            logger.info(
+                "intent_preexec.HINT.matched domain=%s",
+                _hint_hit.get("domain"),
+            )
+            return {
+                "tool_name": None,
+                "result": None,
+                "context_block": block,
+            }
 
     # Calendar (hardcoded regex path)
     cal = _detect_calendar_intent(text)

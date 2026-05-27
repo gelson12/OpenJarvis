@@ -61,6 +61,15 @@ _LOCK = threading.Lock()
 _PROMOTER_THREAD: Optional[threading.Thread] = None
 
 
+# Round 8: domains that have a server-side tool pre-executor wired in
+# ``intent_preexec``. For these, learned patterns dispatch via
+# ``action="preexec"`` (fire the tool directly). For every other domain
+# (history, science, code, math, language, logic, multistep, automation,
+# geography, general, …) the action is ``"prompt_hint"`` — we inject a
+# learned hint as a system message instead.
+_PREEXEC_DOMAINS = frozenset({"email", "calendar", "watch"})
+
+
 _STOP_WORDS = frozenset({
     "the", "a", "an", "and", "or", "but", "if", "then", "with", "for", "to",
     "of", "in", "on", "at", "by", "from", "as", "is", "are", "was", "were",
@@ -136,17 +145,56 @@ def load_patterns() -> Dict[str, List[str]]:
 
 def match_category(text: str) -> Optional[str]:
     """Returns the first category whose learned pattern matches `text`, or
-    None. Cheap hot-path call — used per chat turn by intent_preexec."""
+    None. Cheap hot-path call — used per chat turn by intent_preexec.
+
+    Legacy string-returning API retained for backward compatibility:
+    callers that need the action/hint metadata should call
+    :func:`match_learned` instead.
+    """
+    m = match_learned(text)
+    return m["domain"] if m else None
+
+
+def match_learned(text: str) -> Optional[Dict[str, Any]]:
+    """Round-8 universal matcher. Returns
+    ``{"domain": str, "action": "preexec"|"prompt_hint", "hint_text": str|None,
+       "regex": str}`` for the first hit, else None.
+
+    Pattern entries in ``learned_intents.json`` may be either:
+      * legacy string (regex only) — treated as ``action="preexec"`` for
+        the three tool domains, ``action="prompt_hint"`` otherwise.
+      * new dict ``{"regex","action","hint_text",...}`` — used as-is.
+    """
     if not text or not _enabled():
         return None
-    patterns = load_patterns()
+    data = _load_store()
+    patterns = data.get("patterns", {}) or {}
     if not patterns:
         return None
-    for category, regex_strs in patterns.items():
-        for rs in regex_strs:
+    for domain, entries in patterns.items():
+        for entry in entries or []:
+            if isinstance(entry, str):
+                regex_str = entry
+                action = "preexec" if domain in _PREEXEC_DOMAINS else "prompt_hint"
+                hint_text: Optional[str] = None
+            elif isinstance(entry, dict):
+                regex_str = entry.get("regex") or ""
+                action = entry.get("action") or (
+                    "preexec" if domain in _PREEXEC_DOMAINS else "prompt_hint"
+                )
+                hint_text = entry.get("hint_text")
+            else:
+                continue
+            if not regex_str:
+                continue
             try:
-                if re.search(rs, text, re.IGNORECASE):
-                    return category
+                if re.search(regex_str, text, re.IGNORECASE):
+                    return {
+                        "domain": domain,
+                        "action": action,
+                        "hint_text": hint_text,
+                        "regex": regex_str,
+                    }
             except re.error:
                 continue
     return None
@@ -169,14 +217,22 @@ def _jaccard(a: Set[str], b: Set[str]) -> float:
     return len(a & b) / max(len(a | b), 1)
 
 
+def _domain_of(rec: Dict[str, Any]) -> str:
+    """Backward-compat reader: pre-Round-8 records use 'inferred_category',
+    new records use 'inferred_domain'. Treat 'unknown' as 'general' so
+    legacy entries still cluster."""
+    d = rec.get("inferred_domain") or rec.get("inferred_category") or "general"
+    return "general" if d == "unknown" else d
+
+
 def _cluster_disavowals(
-    disavowals: List[Dict[str, Any]], category: str,
+    disavowals: List[Dict[str, Any]], domain: str,
 ) -> List[List[Dict[str, Any]]]:
     """Naive greedy clustering by Jaccard >= 0.5 on significant tokens."""
-    by_cat = [d for d in disavowals if d.get("inferred_category") == category]
-    if not by_cat:
+    by_dom = [d for d in disavowals if _domain_of(d) == domain]
+    if not by_dom:
         return []
-    tokens = [_significant_tokens(d.get("user_text", "")) for d in by_cat]
+    tokens = [_significant_tokens(d.get("user_text", "")) for d in by_dom]
     clusters: List[List[int]] = []
     used: Set[int] = set()
     for i, ti in enumerate(tokens):
@@ -191,11 +247,36 @@ def _cluster_disavowals(
                 cluster_idx.append(j)
                 used.add(j)
         clusters.append(cluster_idx)
-    return [[by_cat[i] for i in c] for c in clusters]
+    return [[by_dom[i] for i in c] for c in clusters]
+
+
+def _corpus_common_tokens(
+    disavowals: List[Dict[str, Any]], domain: str,
+) -> Set[str]:
+    """Tokens that appear in >=80% of disavowals in this domain — they
+    are too generic to be discriminative within the domain (e.g. "email"
+    in every email disavowal). Derived dynamically rather than hardcoded
+    so it scales to any new domain.
+
+    Only kicks in once the domain has enough samples (>=5). For small
+    corpora we keep every shared token — otherwise a 3-member cluster
+    that shares its entire distinctive set would lose every candidate
+    token and never promote."""
+    members = [d for d in disavowals if _domain_of(d) == domain]
+    if len(members) < 5:
+        return set()
+    freq: Dict[str, int] = defaultdict(int)
+    for m in members:
+        for tok in _significant_tokens(m.get("user_text", "")):
+            freq[tok] += 1
+    threshold = max(3, int(0.8 * len(members)))
+    return {tok for tok, c in freq.items() if c >= threshold}
 
 
 def _pattern_from_cluster(
     cluster: List[Dict[str, Any]],
+    *,
+    common_tokens_to_drop: Optional[Set[str]] = None,
 ) -> Optional[str]:
     """Extract a single discriminative regex from the cluster's user
     texts. Strategy: find the common significant tokens (intersection)
@@ -205,29 +286,103 @@ def _pattern_from_cluster(
     if not token_sets:
         return None
     common = set.intersection(*token_sets) if token_sets else set()
-    # Drop noisy common words that nearly always appear
-    common.discard("email")
-    common.discard("emails")
-    common.discard("calendar")
-    common.discard("meeting")
-    common.discard("meetings")
-    # Keep ones that are distinctive (verb-like)
-    distinctive = sorted(common)
+    # Drop tokens that are too generic within the surrounding domain
+    # corpus (dynamically derived — no per-domain hardcoded list).
+    if common_tokens_to_drop:
+        common -= common_tokens_to_drop
+    distinctive = sorted(common, key=lambda t: -len(t))[:3]
     if not distinctive:
         return None
-    # Build: \bword1\b.*?\bword2\b (order-independent within reason)
-    # Pick the 2-3 most-discriminative (longest) tokens.
-    distinctive = sorted(distinctive, key=lambda t: -len(t))[:3]
-    # Use lookaheads for order-independence
+    # Build: (?=.*\bword1\b)(?=.*\bword2\b).+ — order-independent.
     parts = [f"(?=.*\\b{re.escape(t)}\\b)" for t in distinctive]
     pattern = "^" + "".join(parts) + ".+"
     return pattern
 
 
+def _entry_regex(entry: Any) -> str:
+    """Read the regex out of a store entry (string or dict)."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return entry.get("regex") or ""
+    return ""
+
+
+def _memory_writeback(promo: Dict[str, Any]) -> None:
+    """Append a learning line to MEMORY.md so the user can see what was
+    learned. Disabled by env: OPENJARVIS_MEMORY_WRITEBACK_ON_PROMOTION.
+    Best-effort — failures must not block promotion."""
+    if os.environ.get("OPENJARVIS_MEMORY_WRITEBACK_ON_PROMOTION", "true").lower() not in (
+        "1", "true", "yes", "on",
+    ):
+        return
+    try:
+        from openjarvis.tools.memory_manage import MemoryManageTool
+        sample = (promo.get("sample_phrases") or [""])[0][:100]
+        ymd = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        entry = (
+            f"[{ymd}] Learned: domain={promo['domain']} "
+            f"action={promo['action']} matched {promo['member_count']} past "
+            f"failures. Sample: {sample!r}."
+        )
+        MemoryManageTool()._add(entry)
+    except Exception as exc:
+        logger.debug("learned_intents: memory writeback failed: %s", exc)
+
+
+def _vault_writeback(promo: Dict[str, Any]) -> None:
+    """Mirror the promotion to the Obsidian vault for human review.
+    Best-effort — vault outages must not block promotion."""
+    if os.environ.get("OPENJARVIS_LEARNING_VAULT_MIRROR_ENABLED", "true").lower() not in (
+        "1", "true", "yes", "on",
+    ):
+        return
+    if not os.environ.get("OBSIDIAN_VAULT_URL", "").strip():
+        return
+    try:
+        from openjarvis.integrations.obsidian_vault import (
+            get_default_client,
+            VaultUnavailableError,
+        )
+        client = get_default_client()
+        ymd = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        domain = promo["domain"]
+        slug = re.sub(r"[^a-z0-9]+", "-", promo["pattern"].lower()).strip("-")[:50]
+        path = f"brain/jarvis-learnings/{domain}/{ymd}-{slug}.md"
+        body_lines = [
+            f"# Learned pattern — {domain}",
+            "",
+            f"- **Action:** {promo['action']}",
+            f"- **Regex:** `{promo['pattern']}`",
+            f"- **Member count:** {promo['member_count']}",
+            f"- **Promoted at:** {promo['promoted_at']}",
+            "",
+            "## Sample failing phrases",
+            "",
+        ]
+        for s in promo.get("sample_phrases", [])[:5]:
+            body_lines.append(f"- {s}")
+        if promo.get("hint_text"):
+            body_lines += ["", "## Auto-drafted hint", "", promo["hint_text"]]
+        try:
+            client.write_file(path, "\n".join(body_lines) + "\n")
+        except VaultUnavailableError as exc:
+            logger.debug("learned_intents: vault write_file unavailable: %s", exc)
+            return
+        # Append to a rolling index for fast human review.
+        try:
+            line = f"- [{ymd}] **{domain}** ({promo['action']}, n={promo['member_count']}) — [[{path}]]\n"
+            client.append_to_file("brain/jarvis-learnings/INDEX.md", line)
+        except VaultUnavailableError:
+            pass
+    except Exception as exc:
+        logger.debug("learned_intents: vault writeback failed: %s", exc)
+
+
 def promote_from_disavowals() -> List[Dict[str, Any]]:
-    """Read recent disavowals, cluster them, and add promoted patterns
-    to the store. Returns the list of newly-promoted patterns (each:
-    {category, pattern, member_count, sample_phrases})."""
+    """Read recent disavowals, cluster them across ALL domains (Round 8 —
+    universal), and add promoted patterns to the store. Returns the list
+    of newly-promoted patterns."""
     if not _enabled():
         return []
     try:
@@ -237,28 +392,73 @@ def promote_from_disavowals() -> List[Dict[str, Any]]:
     disavowals = _dd.read_recent(limit=500)
     if not disavowals:
         return []
+    # Dynamic domain set — every domain that appears in the log gets a
+    # promotion pass (history, science, code, math, etc.), not just the
+    # legacy email/calendar/watch trio.
+    domains_in_log = sorted({_domain_of(d) for d in disavowals if _domain_of(d)})
     threshold = _threshold()
     new_promotions: List[Dict[str, Any]] = []
+    # Late imports so the module loads cleanly even when these aren't
+    # installed (every helper below is best-effort by contract).
+    try:
+        from openjarvis.server import learned_prompt_hints as _hints
+    except Exception:
+        _hints = None  # type: ignore[assignment]
+    try:
+        from openjarvis.server import learning_pg as _pg
+    except Exception:
+        _pg = None  # type: ignore[assignment]
+
     with _LOCK:
         store = _load_store()
         patterns = store.setdefault("patterns", {})
         history = store.setdefault("history", [])
-        for category in ("email", "calendar", "watch"):
-            clusters = _cluster_disavowals(disavowals, category)
+        for domain in domains_in_log:
+            common_drop = _corpus_common_tokens(disavowals, domain)
+            clusters = _cluster_disavowals(disavowals, domain)
             for cluster in clusters:
                 if len(cluster) < threshold:
                     continue
-                pat = _pattern_from_cluster(cluster)
+                pat = _pattern_from_cluster(cluster, common_tokens_to_drop=common_drop)
                 if not pat:
                     continue
-                existing = patterns.get(category, [])
-                if pat in existing:
+                existing_entries = patterns.get(domain, []) or []
+                if any(_entry_regex(e) == pat for e in existing_entries):
                     continue  # already promoted
-                existing.append(pat)
-                patterns[category] = existing
-                promo = {
+
+                action = "preexec" if domain in _PREEXEC_DOMAINS else "prompt_hint"
+                hint_text: Optional[str] = None
+                if action == "prompt_hint" and _hints is not None:
+                    try:
+                        hint_text = _hints.draft_hint_for_cluster(cluster, domain)
+                        _hints.add_hint(
+                            domain=domain,
+                            regex=pat,
+                            hint_text=hint_text,
+                            member_count=len(cluster),
+                        )
+                    except Exception as exc:
+                        logger.debug("hint draft failed: %s", exc)
+
+                # Persist into the unified store as a dict entry so the
+                # runtime matcher can dispatch on action.
+                entry = {
+                    "regex": pat,
+                    "action": action,
+                    "hint_text": hint_text,
+                    "member_count": len(cluster),
                     "promoted_at": datetime.now(timezone.utc).isoformat(),
-                    "category": category,
+                }
+                existing_entries.append(entry)
+                patterns[domain] = existing_entries
+
+                promo = {
+                    "promoted_at": entry["promoted_at"],
+                    "domain": domain,
+                    # Keep legacy 'category' alias for daily_self_report
+                    "category": domain,
+                    "action": action,
+                    "hint_text": hint_text,
                     "pattern": pat,
                     "member_count": len(cluster),
                     "sample_phrases": [c.get("user_text", "")[:120] for c in cluster[:5]],
@@ -266,9 +466,27 @@ def promote_from_disavowals() -> List[Dict[str, Any]]:
                 history.append(promo)
                 new_promotions.append(promo)
                 logger.warning(
-                    "openjarvis.learned_intents.promoted category=%s pattern=%r members=%d",
-                    category, pat, len(cluster),
+                    "openjarvis.learned_intents.promoted domain=%s action=%s "
+                    "pattern=%r members=%d",
+                    domain, action, pat, len(cluster),
                 )
+
+                # Round 8.7 — durable mirrors. Each is best-effort.
+                if _pg is not None:
+                    try:
+                        _pg.mirror_pattern(
+                            domain=domain,
+                            regex=pat,
+                            action=action,
+                            hint_text=hint_text,
+                            member_count=len(cluster),
+                            promoted_at=entry["promoted_at"],
+                        )
+                    except Exception as exc:
+                        logger.debug("pg mirror_pattern failed: %s", exc)
+                _vault_writeback(promo)
+                _memory_writeback(promo)
+
         if new_promotions:
             _save_store(store)
     return new_promotions
@@ -320,12 +538,17 @@ def snapshot() -> Dict[str, Any]:
     store = _load_store()
     patterns = store.get("patterns", {})
     history = store.get("history", [])
+    per_domain_count = {dom: len(pats or []) for dom, pats in patterns.items()}
     return {
         "enabled": _enabled(),
         "threshold": _threshold(),
         "interval_sec": _interval(),
-        "categories": {cat: len(pats) for cat, pats in patterns.items()},
-        "total_patterns": sum(len(p) for p in patterns.values()),
+        # New canonical key. Keep 'categories' alias for backward compat
+        # with /v1/_debug/agentic consumers.
+        "domains": per_domain_count,
+        "categories": per_domain_count,
+        "preexec_domains": sorted(_PREEXEC_DOMAINS),
+        "total_patterns": sum(len(p or []) for p in patterns.values()),
         "total_promotions_ever": len(history),
         "recent_promotions": history[-5:],
         "daemon_running": _PROMOTER_THREAD is not None and _PROMOTER_THREAD.is_alive(),
