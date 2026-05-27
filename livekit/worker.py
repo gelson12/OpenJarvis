@@ -2258,6 +2258,12 @@ class Assistant(Agent):
         # speak; also pulled from turn_ctx as a fallback when the framework
         # spoke (e.g. an LLM-produced reply that bypassed session.say).
         self._last_assistant_text: str = ""
+        # Email-watch alert state — populated by the SSE subscriber when
+        # the server pushes a match. The next "read it" or "open it" voice
+        # intent acts on this. Cleared after user acts (or after 5 min).
+        self._pending_email_alert: dict | None = None
+        self._pending_email_alert_at: float = 0.0
+        self._email_alert_task: asyncio.Task | None = None
         # Wake/sleep: dormant on connect, woken by "Hey Jarvis".
         self._awake = False
         # Set by the interim-transcript wake listener: the next turn is
@@ -3607,6 +3613,194 @@ class Assistant(Agent):
             return await self._handle_accommodation_book_start(text)
         return await self._handle_accommodation_search(text)
 
+    # ── Email-watch SSE subscriber (mid-session push) ───────────────────
+    async def _start_email_alert_subscriber(self) -> None:
+        """Subscribe to the server's email-watch SSE stream and SPEAK
+        alerts proactively when a match arrives, instead of waiting for
+        the user's next turn.
+
+        Idempotent — repeated calls are no-ops once the task is running.
+        """
+        if self._email_alert_task is not None and not self._email_alert_task.done():
+            return
+        self._email_alert_task = asyncio.create_task(self._email_alert_loop())
+
+    async def _email_alert_loop(self) -> None:
+        """Long-lived SSE subscriber. Auto-reconnects with backoff."""
+        openjarvis_url = os.environ.get("OPENJARVIS_URL", "http://localhost:8000").rstrip("/")
+        url = f"{openjarvis_url}/v1/email_alerts/stream"
+        auth = None
+        u = os.environ.get("OPENJARVIS_BASIC_AUTH_USER", "").strip()
+        p = os.environ.get("OPENJARVIS_BASIC_AUTH_PASSWORD", "").strip()
+        if u and p:
+            auth = (u, p)
+        backoff = 2.0
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=None, auth=auth) as client:
+                    async with client.stream("GET", url) as r:
+                        if r.status_code != 200:
+                            logger.warning(
+                                "email_alert SSE bad status: %s", r.status_code,
+                            )
+                        else:
+                            backoff = 2.0  # reset on successful connect
+                            logger.info("email_alert SSE connected to %s", url)
+                            data_lines: list[str] = []
+                            event_name = ""
+                            async for raw in r.aiter_lines():
+                                if not raw:
+                                    if data_lines and event_name == "email_alert":
+                                        payload_text = "\n".join(data_lines)
+                                        try:
+                                            match = json.loads(payload_text)
+                                            await self._handle_email_alert(match)
+                                        except Exception as exc:  # noqa: BLE001
+                                            logger.warning(
+                                                "email_alert parse failed: %s", exc,
+                                            )
+                                    data_lines, event_name = [], ""
+                                    continue
+                                if raw.startswith(":"):
+                                    continue  # comment / heartbeat
+                                if raw.startswith("event:"):
+                                    event_name = raw[6:].strip()
+                                elif raw.startswith("data:"):
+                                    data_lines.append(raw[5:].lstrip())
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "email_alert SSE error: %s — retry in %.1fs", exc, backoff,
+                )
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                return
+            backoff = min(backoff * 2, 60.0)
+
+    async def _handle_email_alert(self, match: dict) -> None:
+        """Speak a proactive alert + arm the pending state for the user's
+        next 'read it' / 'open it' response."""
+        sender = (match.get("watch", {}).get("sender") or "someone")
+        subject = (match.get("message", {}).get("subject") or "")
+        self._pending_email_alert = match
+        self._pending_email_alert_at = time.time()
+        msg = (
+            f"Sir — {sender} has just sent you an email"
+            + (f", subject {subject!r}." if subject else ".")
+            + " Would you like me to read it, or open it on the HUD?"
+        )
+        try:
+            await self.session.say(msg)
+            self._last_assistant_text = msg
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("email alert speak failed: %s", exc)
+
+    async def _maybe_handle_email_alert_followup(self, text: str) -> bool:
+        """Handle 'read it' / 'open it' after a watch alert was spoken."""
+        if not self._pending_email_alert:
+            return False
+        # Expire if older than 5 minutes
+        if (time.time() - self._pending_email_alert_at) > 300:
+            self._pending_email_alert = None
+            return False
+        t = (text or "").lower()
+        # READ — fetch body and speak summary
+        if re.search(r"\b(read|read\s+it|read\s+it\s+to\s+me|tell\s+me\s+(?:the|what\s+it\s+says))\b", t):
+            match = self._pending_email_alert
+            self._pending_email_alert = None
+            message_id = (match.get("message", {}) or {}).get("id")
+            subject = (match.get("message", {}) or {}).get("subject", "")
+            sender = (match.get("watch", {}) or {}).get("sender", "the sender")
+            body_preview = await self._fetch_email_body(message_id) if message_id else ""
+            if body_preview:
+                speech = (
+                    f"From {sender}, subject {subject}. "
+                    f"The message says: {body_preview[:400]}"
+                )
+            else:
+                speech = (
+                    f"From {sender}, subject {subject}. "
+                    "I couldn't retrieve the body — the message may have been moved or deleted."
+                )
+            try:
+                await self.session.say(speech)
+                self._last_assistant_text = speech
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        # OPEN — show in HUD browser widget pointed at Outlook web
+        if re.search(r"\b(open\s+(?:it|the\s+email|on\s+(?:the\s+)?hud)|show\s+(?:it|me\s+the\s+email|me\s+on\s+(?:the\s+)?hud)|display)\b", t):
+            self._pending_email_alert = None
+            outlook_url = "https://outlook.live.com/mail/0/inbox"
+            try:
+                await self.open_browser(outlook_url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("open_browser for email alert failed: %s", exc)
+                try:
+                    await self.session.say(
+                        "I couldn't open the HUD browser, sir — try saying 'read it' instead."
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    await self.session.say("Opening your inbox on the HUD, sir.")
+                except Exception:  # noqa: BLE001
+                    pass
+            return True
+        # DISMISS / NEVERMIND
+        if re.search(r"\b(no|nope|never\s*mind|forget\s+it|later|not\s+now|skip)\b", t):
+            self._pending_email_alert = None
+            try:
+                await self.session.say("Very well, sir — I've noted it.")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        return False
+
+    async def _fetch_email_body(self, message_id: str) -> str:
+        """Best-effort fetch of an Outlook message body via the server-side
+        outlook_get_message tool. Returns plain-text preview or ''.
+        """
+        if not message_id:
+            return ""
+        openjarvis_url = os.environ.get("OPENJARVIS_URL", "http://localhost:8000").rstrip("/")
+        u = os.environ.get("OPENJARVIS_BASIC_AUTH_USER", "").strip()
+        p = os.environ.get("OPENJARVIS_BASIC_AUTH_PASSWORD", "").strip()
+        auth = (u, p) if u and p else None
+        try:
+            async with httpx.AsyncClient(timeout=8.0, auth=auth) as client:
+                # The simplest path: call chat_completions with a forced
+                # tool-call instruction. But there's no direct REST endpoint
+                # for arbitrary tool invocations. Use the agentic chat
+                # path with an explicit fetch-this-message prompt.
+                payload = {
+                    "model": os.environ.get("OPENJARVIS_MODEL", "claude-haiku-4-5-20251001"),
+                    "messages": [{
+                        "role": "user",
+                        "content": (
+                            f"Call outlook_get_message with id='{message_id}' "
+                            "and return ONLY the bodyPreview field's text as plain prose, "
+                            "nothing else."
+                        ),
+                    }],
+                    "max_tokens": 400,
+                    "stream": False,
+                }
+                resp = await client.post(
+                    f"{openjarvis_url}/v1/chat/completions", json=payload,
+                )
+                if resp.status_code != 200:
+                    return ""
+                data = resp.json()
+                return ((data.get("choices") or [{}])[0]
+                        .get("message", {}).get("content") or "").strip()[:500]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fetch_email_body failed: %s", exc)
+            return ""
+
     async def _wake_greeting(self) -> str:
         """Greeting spoken when the user wakes Jarvis with no follow-up.
 
@@ -4893,6 +5087,13 @@ class Assistant(Agent):
                 await self.session.say("Goodbye, sir.")
                 raise StopResponse()
 
+        # ── Email-watch alert FOLLOWUP (read it / open it / dismiss) ──
+        # If a server-side email watch just fired and we asked the user
+        # "would you like me to read or open?", this intercepts their
+        # answer before everything else. Expires after 5 minutes.
+        if await self._maybe_handle_email_alert_followup(text):
+            raise StopResponse()
+
         # ── Repeat-last clarification (BEFORE Hermes + all intents) ───────
         # If the user signals they didn't catch the prior reply, re-speak
         # what we just said. Regex covers the common phrasings (~90% of
@@ -5400,6 +5601,14 @@ async def entrypoint(ctx: agents.JobContext):
         logger.info(
             "voice: cascade ACTIVE (Deepgram → OpenJarvis → Aura)"
         )
+
+    # Subscribe to the server-side email watch SSE stream so we can SPEAK
+    # alerts mid-session ("Sir — Pedro just emailed you..."). Idempotent
+    # across both realtime and cascade paths. Non-fatal if it fails.
+    try:
+        await assistant._start_email_alert_subscriber()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("email_alert subscriber failed to start: %s", exc)
 
     # Relay live-browser interactions (click / scroll / key / navigate)
     # from the browser widget back to the worker's Playwright page.
