@@ -324,7 +324,61 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
 
     text = latest_user_text.strip()
 
-    # Calendar
+    # ── Self-improvement layer: check LEARNED intents first ─────────────
+    # learned_intents.match_category() returns the category if any auto-
+    # promoted pattern (from prior disavowals) matches. This is how the
+    # loop closes: failures yesterday → patterns auto-promoted overnight →
+    # today they bypass the LLM entirely.
+    try:
+        from openjarvis.server import learned_intents as _li
+        _learned_cat = _li.match_category(text)
+    except Exception:
+        _learned_cat = None
+
+    if _learned_cat == "calendar":
+        # Force calendar pre-execution regardless of hardcoded regex
+        cal = _detect_calendar_intent(text) or {
+            "provider": "outlook" if not _PREFER_GOOGLE_RE.search(text) else "google",
+            "start": _today_window()[0],
+            "end": _today_window()[1],
+            "window_label": "today",
+        }
+        if cal["provider"] == "outlook":
+            tool_name = "outlook_list_events"
+            result = _run_outlook_list_events(cal["start"], cal["end"])
+        else:
+            tool_name = "calendar_list_events"
+            result = _run_calendar_list_events(cal["start"], cal["end"])
+        if result:
+            block = (
+                f"PRE-EXECUTED TOOL RESULT (via LEARNED intent, from "
+                f"{tool_name}, window: {cal['window_label']}):\n{result}\n\n"
+                "INSTRUCTION: This pattern was auto-promoted because past "
+                "failures matched it. Trust the data above and summarise."
+            )
+            logger.info("intent_preexec.LEARNED.calendar served via %s", tool_name)
+            return {"tool_name": tool_name, "result": result, "context_block": block}
+
+    if _learned_cat == "email":
+        # Default to outlook + recent
+        provider = "outlook" if not _PREFER_GOOGLE_RE.search(text) else "gmail"
+        if provider == "outlook":
+            tool_name = "outlook_list_messages"
+            result = _run_outlook_list_messages(sender=None, is_unread=False)
+        else:
+            tool_name = "gmail_list_messages"
+            result = _run_gmail_list_messages(sender=None, is_unread=False)
+        if result:
+            block = (
+                f"PRE-EXECUTED TOOL RESULT (via LEARNED intent, from "
+                f"{tool_name}):\n{result}\n\n"
+                "INSTRUCTION: This pattern was auto-promoted from past "
+                "failures. Trust this real data — summarise in one sentence."
+            )
+            logger.info("intent_preexec.LEARNED.email served via %s", tool_name)
+            return {"tool_name": tool_name, "result": result, "context_block": block}
+
+    # Calendar (hardcoded regex path)
     cal = _detect_calendar_intent(text)
     if cal:
         if cal["provider"] == "outlook":

@@ -373,6 +373,18 @@ def create_app(
     except Exception as _exc:
         logger.warning("email_watcher startup failed: %s", _exc)
 
+    # Round 7 — start the SELF-IMPROVEMENT LOOP promoter daemon.
+    # Reads ~/.openjarvis/disavowals.jsonl every 5 minutes, clusters new
+    # entries, and auto-promotes failing-phrase patterns into
+    # ~/.openjarvis/learned_intents.json which intent_preexec consults
+    # FIRST on every chat turn. This is what makes Jarvis self-correct
+    # without manual regex extensions for every phrasing variant.
+    try:
+        from openjarvis.server import learned_intents as _li
+        _li.start_promoter_daemon()
+    except Exception as _exc:
+        logger.warning("learned_intents promoter failed to start: %s", _exc)
+
     # Restore SendBlue channel bindings from database on startup
     _restore_sendblue_bindings(app)
 

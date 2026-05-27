@@ -482,6 +482,26 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     agent = getattr(request.app.state, "agent", None)
     model = request_body.model
 
+    # Round 7g — DAILY SELF-REPORT. On the first chat turn of a new UTC
+    # day, surface yesterday's self-improvement metrics (disavowals
+    # detected, intent patterns auto-promoted, skills proposed) as a
+    # brief system message so the LLM can mention it to the user.
+    # Idempotent within a day.
+    try:
+        from openjarvis.server import daily_self_report as _dsr
+        _daily_block = _dsr.build_daily_report_if_due()
+        if _daily_block and request_body.messages:
+            from openjarvis.server.models import ChatMessage
+            _msgs = list(request_body.messages)
+            _msgs.insert(
+                max(0, len(_msgs) - 1),
+                ChatMessage(role="system", content=_daily_block,
+                            name=None, tool_call_id=None),
+            )
+            request_body.messages = _msgs
+    except Exception:
+        pass
+
     # Round 7d — ANTI-HALLUCINATION FOLLOW-UP GUARD.
     # If the prior assistant turn (or a system message in this turn) had a
     # successful pre-execution AND the user's current message looks like a
@@ -2404,6 +2424,22 @@ def _fire_post_turn_hooks_safe(*, request, latest_user_text: str,
             if _signals is None and isinstance(complexity_info, dict):
                 _signals = complexity_info.get("signals")
         inferred_domain = _id(latest_user_text, _signals)
+    except Exception:
+        pass
+
+    # Round 7f — DISAVOWAL DETECTOR (self-improvement loop).
+    # If the LLM disavowed a capability it should have ("I don't have a
+    # tool to do that..."), log a structured event. The learned_intents
+    # promoter daemon reads these events, clusters by category + phrasing,
+    # and auto-promotes new patterns into intent_preexec so the same
+    # query bypasses the LLM entirely on subsequent turns.
+    try:
+        from openjarvis.server import disavowal_detector as _dd
+        _dd.record_if_disavowal(
+            user_text=latest_user_text,
+            assistant_text=assistant_text,
+            session_id=session_id,
+        )
     except Exception:
         pass
 
