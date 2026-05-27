@@ -48,7 +48,11 @@ Thumbs.db
 *.log
 results/
 logs/
-traces/
+# `traces/` anchored to repo root so it ignores runtime trace output dirs,
+# NOT the `src/openjarvis/traces/` source package. The unanchored form was
+# excluding the source package from Hatchling's wheel build, crashing the
+# installed openjarvis on `from openjarvis.traces.store import TraceStore`.
+/traces/
 coding_task_*
 get-pip.py
 # Junk from mocked-path tests that write to their mock's __repr__ as a path
