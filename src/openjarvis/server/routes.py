@@ -481,6 +481,64 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     agent = getattr(request.app.state, "agent", None)
     model = request_body.model
 
+    # Round 7b — EMAIL WATCH intent + pending-alert surfacing.
+    # If the user said "let me know when Pedro emails me" → create a
+    # background watch and confirm. If a previously-armed watch fired
+    # since the last turn → prepend an alert system message so the LLM
+    # surfaces it naturally on this turn.
+    try:
+        from openjarvis.server import email_watcher as _ew
+        _latest_user_for_watch = ""
+        if request_body.messages:
+            for _m in reversed(request_body.messages):
+                if _m.role == "user" and _m.content:
+                    _latest_user_for_watch = _m.content
+                    break
+        # 1) Create-watch intent
+        _watch_intent = _ew.detect_watch_intent(_latest_user_for_watch)
+        _watch_created_msg = None
+        if _watch_intent:
+            wid = _ew.add_watch(_watch_intent["sender"],
+                                provider=_watch_intent["provider"])
+            if wid:
+                _watch_created_msg = (
+                    f"WATCH CREATED: monitoring {_watch_intent['provider']} for "
+                    f"emails from {_watch_intent['sender']!r}. I will check "
+                    "every minute and alert the user when a match arrives. "
+                    "Tell the user briefly that the watch is active."
+                )
+        # 2) Surface any pending triggered watches as alerts
+        _pending_alerts = []
+        for _w in _ew.list_watches(active_only=False):
+            if _w.get("triggered") and not _w.get("notified"):
+                _pending_alerts.append(
+                    f"{_w.get('sender')} sent an email"
+                    + (f" titled {_w.get('matched_subject')!r}" if _w.get('matched_subject') else "")
+                )
+                # Mark as notified so we don't re-alert on every turn
+                _ew.mark_notified(_w.get("id"))
+        if _watch_created_msg or _pending_alerts:
+            from openjarvis.server.models import ChatMessage
+            _bits = []
+            if _pending_alerts:
+                _bits.append(
+                    "PENDING EMAIL ALERTS (mention these to the user BEFORE "
+                    "answering their question, then offer to read or open): "
+                    + "; ".join(_pending_alerts)
+                )
+            if _watch_created_msg:
+                _bits.append(_watch_created_msg)
+            _alert_block = "\n\n".join(_bits)
+            _msgs = list(request_body.messages)
+            _msgs.insert(max(0, len(_msgs) - 1),
+                         ChatMessage(role="system", content=_alert_block,
+                                     name=None, tool_call_id=None))
+            request_body.messages = _msgs
+    except Exception as _ewexc:
+        logging.getLogger("openjarvis.server").debug(
+            "email_watcher pre-step skipped: %s", _ewexc,
+        )
+
     # Round 7 — INTENT PRE-EXECUTION. For unambiguous "check my calendar
     # today" / "any emails from X" style queries, execute the tool ourselves
     # server-side and inject the REAL result as a system message before the

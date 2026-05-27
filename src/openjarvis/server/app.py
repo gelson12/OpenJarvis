@@ -353,6 +353,23 @@ def create_app(
     except Exception as exc:
         logger.warning("openjarvis.round5.scheduler failed to start: %s", exc)
 
+    # Round 7b — start email-watcher poller. Idempotent. Persistent
+    # watches at ~/.openjarvis/email_watches.json are picked up on each
+    # server start. Notification callback is a logger-only stub for now;
+    # the chat_completions endpoint surfaces pending matches as system
+    # messages on the next user turn (no LiveKit data-channel push yet).
+    try:
+        from openjarvis.server import email_watcher as _ew
+        def _notify_log(match):
+            logger.warning(
+                "openjarvis.email_watcher.match watch=%s subject=%r",
+                match.get("watch", {}).get("id"),
+                (match.get("message", {}).get("subject") or "")[:80],
+            )
+        _ew.start_poller(_notify_log)
+    except Exception as _exc:
+        logger.warning("email_watcher startup failed: %s", _exc)
+
     # Restore SendBlue channel bindings from database on startup
     _restore_sendblue_bindings(app)
 
