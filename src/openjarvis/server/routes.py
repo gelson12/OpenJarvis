@@ -481,6 +481,43 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     agent = getattr(request.app.state, "agent", None)
     model = request_body.model
 
+    # Round 7 — INTENT PRE-EXECUTION. For unambiguous "check my calendar
+    # today" / "any emails from X" style queries, execute the tool ourselves
+    # server-side and inject the REAL result as a system message before the
+    # LLM call. The LLM then only has to summarise — no tool-calling
+    # discretion involved. This bypasses the "Claude/Gemini/Llama all hedge
+    # when they have tools" problem we hit repeatedly today.
+    try:
+        from openjarvis.server.intent_preexec import maybe_preexecute
+        _latest_user_for_preexec = ""
+        if request_body.messages:
+            for _m in reversed(request_body.messages):
+                if _m.role == "user" and _m.content:
+                    _latest_user_for_preexec = _m.content
+                    break
+        _preexec = maybe_preexecute(_latest_user_for_preexec)
+        if _preexec and _preexec.get("context_block"):
+            from openjarvis.server.models import ChatMessage
+            _msgs = list(request_body.messages)
+            # Insert the pre-execution result RIGHT BEFORE the latest user
+            # message so the LLM sees: ...prior, [tool result], user_query.
+            _insert_at = len(_msgs) - 1
+            _msgs.insert(
+                _insert_at,
+                ChatMessage(role="system", content=_preexec["context_block"],
+                            name=None, tool_call_id=None),
+            )
+            request_body.messages = _msgs
+            logging.getLogger("openjarvis.server").warning(
+                "openjarvis.intent_preexec.served tool=%s preview=%r",
+                _preexec.get("tool_name"),
+                (_preexec.get("result") or "")[:140],
+            )
+    except Exception as _pe_exc:
+        logging.getLogger("openjarvis.server").debug(
+            "intent_preexec skipped: %s", _pe_exc,
+        )
+
     # Round 6 — inject a "you have these integrations" system message so
     # the LLM never has to GUESS what credentials are wired. Replaces the
     # "I don't have automatic access to your emails" hallucination with a
