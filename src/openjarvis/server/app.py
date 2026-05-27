@@ -385,6 +385,18 @@ def create_app(
     except Exception as _exc:
         logger.warning("learned_intents promoter failed to start: %s", _exc)
 
+    # Hotfix: rehydrate ~/.openjarvis/disavowals.jsonl from Postgres so a
+    # Railway redeploy (which wipes ephemeral container storage) doesn't
+    # reset the accumulated learning state. Best-effort, no-op when PG is
+    # unavailable or local JSONL already has more rows than PG.
+    try:
+        from openjarvis.server import learning_pg as _pg
+        n = _pg.rehydrate_jsonl_from_pg()
+        if n > 0:
+            logger.warning("openjarvis.learning.rehydrated rows=%d from postgres", n)
+    except Exception as _exc:
+        logger.warning("learning_pg.rehydrate failed: %s", _exc)
+
     # Restore SendBlue channel bindings from database on startup
     _restore_sendblue_bindings(app)
 

@@ -132,6 +132,47 @@ _CALENDAR_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Sentence-level fallback: catches phrasings where the verb and the
+# calendar noun are far apart, e.g.
+#   "look into my outlook account and see if I have any scheduled for
+#    tomorrow in the calendar"
+# Requires: a calendar-domain noun AND (a query intent signal OR a
+# time anchor). The intent signal is broad — query verbs, possessive
+# "my", or auxiliary "do/have/any/anything".
+_CALENDAR_NOUN_RE = re.compile(
+    r"\b(calendar|meetings?|appointments?|schedule[d]?|agenda|"
+    r"events?|bookings?|reservations?)\b",
+    re.IGNORECASE,
+)
+_CALENDAR_SIGNAL_RE = re.compile(
+    r"\b("
+    # query verbs (whole-word, ensure context)
+    r"check|verify|confirm|show|tell|see|list|read|find|fetch|"
+    r"look\s+(?:up|into|at)|"
+    r"access|retrieve|pull|review|inspect|view|"
+    # explicit question + possessive patterns ("do I have", "is there")
+    r"do\s+i\s+have|did\s+i\s+have|have\s+i\s+got|am\s+i|"
+    r"is\s+there|are\s+there|"
+    # question words paired with calendar
+    r"what(?:'s|\s+is)?\s+(?:on|in|scheduled|my)|"
+    r"when\s+is|which\s+(?:day|time)|"
+    # strong time anchors (any of these next to a calendar noun is decisive)
+    r"today|tomorrow|tonight|"
+    r"this\s+(?:morning|afternoon|evening|week)|"
+    r"next\s+(?:week|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday)|"
+    # "scheduled" as a discriminator — strong calendar signal even alone
+    r"scheduled|booked"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _calendar_broad_match(text: str) -> bool:
+    """Broad sentence-level calendar intent. True if the message contains
+    a calendar noun AND any of: query verb, possessive, time anchor."""
+    return bool(_CALENDAR_NOUN_RE.search(text) and _CALENDAR_SIGNAL_RE.search(text))
+
 _PREFER_OUTLOOK_RE = re.compile(r"\b(outlook|hotmail|office\s*365|microsoft)\b", re.I)
 _PREFER_GOOGLE_RE = re.compile(r"\b(google|gmail|gcal)\b", re.I)
 
@@ -141,7 +182,9 @@ def _detect_calendar_intent(text: str) -> Optional[Dict[str, Any]]:
     calendar data, else None."""
     if not text:
         return None
-    if not _CALENDAR_INTENT_RE.search(text):
+    # Narrow regex first (high confidence); fall back to broad sentence
+    # match for phrasings where verb and calendar-noun are far apart.
+    if not (_CALENDAR_INTENT_RE.search(text) or _calendar_broad_match(text)):
         return None
     window = _resolve_window(text)
     if window is None:
@@ -198,11 +241,26 @@ _FROM_SENDER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Sentence-level fallback for email — same pattern as calendar:
+# email-domain noun + any query/possessive/time signal anywhere.
+_EMAIL_NOUN_RE = re.compile(
+    r"\b(emails?|messages?|mail|inbox|notifications?)\b",
+    re.IGNORECASE,
+)
+
+
+def _email_broad_match(text: str) -> bool:
+    """Broad sentence-level email intent. True if the message contains
+    an email noun AND a query/possessive/time signal (reusing the
+    calendar signal regex — same intent vocabulary)."""
+    return bool(_EMAIL_NOUN_RE.search(text) and _CALENDAR_SIGNAL_RE.search(text))
+
 
 def _detect_email_intent(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
-    if not _EMAIL_SEARCH_INTENT_RE.search(text):
+    # Narrow regex first; fall back to broad sentence match.
+    if not (_EMAIL_SEARCH_INTENT_RE.search(text) or _email_broad_match(text)):
         return None
     sender = None
     m = _FROM_SENDER_RE.search(text)
