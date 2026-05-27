@@ -10,11 +10,20 @@ from __future__ import annotations
 import shutil
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
 
 from openjarvis.core.types import StepType, Trace
 from openjarvis.learning.routing._utils import classify_query
-from openjarvis.traces.store import TraceStore
+
+# `traces.store.TraceStore` is only used as a type hint here. Deferring the
+# import under TYPE_CHECKING prevents the ModuleNotFoundError that took
+# down the container in production on 2026-05-27 — the build was
+# (intermittently) failing to ship `traces/store.py` and the top-level
+# import crashed the whole `openjarvis.cli` chain. With this lazy form,
+# the type annotation is purely cosmetic at runtime and the package
+# imports cleanly even if traces.store is missing.
+if TYPE_CHECKING:
+    from openjarvis.traces.store import TraceStore
 
 
 def _format_toml_value(value: Any) -> str:
@@ -64,7 +73,7 @@ class AgentConfigEvolver:
 
     def __init__(
         self,
-        trace_store: TraceStore,
+        trace_store: "TraceStore",
         *,
         config_dir: Union[str, Path],
         min_quality: float = 0.5,
