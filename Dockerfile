@@ -72,6 +72,14 @@ ENV OPENJARVIS_BUILD_TIME=${BUILD_TIME}
 RUN python -c "from livekit.plugins import silero; silero.VAD.load()" 2>/dev/null || \
     echo "Silero VAD prefetch skipped; worker will download it on first job"
 
+# Pre-download all livekit-plugin model files (turn-detector ONNX weights
+# in particular — without this the inference subprocess crash-loops with
+# "Could not find file 'model_q8.onnx'"). This is the canonical pattern
+# LiveKit recommends in the error message itself. Non-fatal: worker code
+# falls back to VAD-only endpointing if turn-detector init fails at runtime.
+RUN python -m livekit.agents download-files 2>&1 | tail -10 || \
+    echo "livekit download-files failed; turn-detector will fall back to VAD endpointing"
+
 # Belt-and-suspenders CRLF defence. Even with .gitattributes enforcing LF
 # on every commit, a Windows-side checkout / a `railway up` upload from a
 # misconfigured working tree CAN slip CRLF into the container. Bash on
