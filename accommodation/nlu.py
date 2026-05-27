@@ -98,12 +98,33 @@ _SOLO_RE = re.compile(
 _AIRBNB_RE = re.compile(r"\bairbnb\b", re.I)
 _HOTEL_RE = re.compile(r"\bhotel\b", re.I)
 
-# Location
-_LOCATION_RE = re.compile(
-    r"\b(?:in|at|near|around|to)\s+"
+# Location — two patterns, two passes.
+#
+# The primary anchors are `in/at/near/around <Place>`. We deliberately do
+# NOT include `to` here because users commonly say "houses to rent in
+# Lisbon" or "to spend the weekend in Lisbon" — anchoring on `to` greedily
+# captures "rent in Lisbon" or "spend the weekend in Lisbon" because the
+# capture is lazy until the lookahead. That polluted the location with the
+# verb phrase.
+#
+# A second pattern handles intentional `trip/going/visit to <Place>`
+# phrasings as a fallback when the primary anchors don't match.
+#
+# parse_location() finds ALL matches and returns the LAST one — so that
+# "X in Lisbon ... in Barcelona" returns Barcelona (the most recently
+# mentioned destination).
+_LOCATION_PRIMARY_RE = re.compile(
+    r"\b(?:in|at|near|around)\s+"
     r"([a-z][\w' .-]+?)"
     r"(?=\s+(?:for|on|next|this|tomorrow|tonight|over|with|from|between|"
-    r"starting|on\s+the|to\s+stay)|"
+    r"starting|on\s+the|to\s+stay|to\s+rent|to\s+let|to\s+book|to\s+find)|"
+    r"[.,?!]|$)", re.I,
+)
+_LOCATION_TRIP_RE = re.compile(
+    r"\b(?:trip|getaway|holiday|vacation|travel(?:ling|ing)?|"
+    r"going|visit(?:ing)?)\s+to\s+"
+    r"([a-z][\w' .-]+?)"
+    r"(?=\s+(?:for|on|next|this|tomorrow|tonight|over|with|from|between)|"
     r"[.,?!]|$)", re.I,
 )
 
@@ -112,11 +133,22 @@ _LOCATION_RE = re.compile(
 
 
 def parse_location(text: str) -> str:
-    """Extract city/area noun-phrase. Empty string means "couldn't find one"."""
-    m = _LOCATION_RE.search(text or "")
-    if not m:
+    """Extract city/area noun-phrase. Returns the LAST match so that
+    "find me somewhere ... in Lisbon" returns Lisbon (rather than an
+    earlier red-herring "in" phrase).
+
+    Falls back to "trip/going/visit to <Place>" when no primary
+    `in/at/near/around` anchor exists.
+    """
+    if not text:
         return ""
-    return m.group(1).strip().rstrip(".,?!").title()
+    matches = _LOCATION_PRIMARY_RE.findall(text)
+    if matches:
+        return matches[-1].strip().rstrip(".,?!").title()
+    matches = _LOCATION_TRIP_RE.findall(text)
+    if matches:
+        return matches[-1].strip().rstrip(".,?!").title()
+    return ""
 
 
 def parse_guests(text: str) -> int:

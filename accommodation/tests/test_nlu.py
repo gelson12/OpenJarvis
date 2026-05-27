@@ -38,6 +38,47 @@ def test_location_empty_when_missing():
     assert parse_location("find me a hotel for the weekend") == ""
 
 
+# ── Regression: bug from live voice test 2026-05-27 — the parser was
+#    grabbing "to <verb> ... in <place>" greedily and returning the verb
+#    phrase as the location ("Rent In Lisbon" instead of "Lisbon"). The
+#    two-pass parser drops `to` from primary anchors so this can't recur.
+
+
+def test_location_houses_to_rent():
+    assert parse_location("houses to rent in Lisbon") == "Lisbon"
+
+
+def test_location_show_me_houses_to_rent():
+    assert parse_location("show me all the available houses to rent in Lisbon") == "Lisbon"
+
+
+def test_location_spend_the_weekend():
+    assert parse_location("I need to spend the weekend in Lisbon") == "Lisbon"
+
+
+def test_location_trailing_fragment_picks_last_match():
+    """When a multi-utterance turn mentions two cities, pick the last one."""
+    txt = "I want a weekend in Lisbon. Actually, change that — in Porto."
+    assert parse_location(txt) == "Porto"
+
+
+def test_location_trip_to_fallback():
+    """No primary `in/at/near/around` — fall back to `trip/going to <Place>`."""
+    assert parse_location("trip to Rome") == "Rome"
+    assert parse_location("going to Paris next week") == "Paris"
+    assert parse_location("visiting Berlin for a couple of days") == ""  # no anchor verb
+
+
+def test_location_long_user_transcript():
+    """Real failing transcript from the 2026-05-27 voice session."""
+    txt = (
+        "can you show me all the availabilities of I need to spend the "
+        "weekend in Lisbon. Show me all the available houses to rent. "
+        "In Lisbon."
+    )
+    assert parse_location(txt) == "Lisbon"
+
+
 # ── Guests ───────────────────────────────────────────────────────────
 
 
