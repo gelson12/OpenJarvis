@@ -555,6 +555,34 @@ def maybe_preexecute(
 
     text = latest_user_text.strip()
 
+    # Round 17.1 — fragment-tolerant intent text.
+    # Voice STT routinely splits a single request into 2-4 separate user
+    # turns ("do I have a meeting" / "schedule on my Google Calendar?" /
+    # "Today."). If we run intent detection ONLY on the latest fragment
+    # ("Today.") it returns None -> LLM disavows ("I don't have a tool
+    # to check your calendar"). Defence in depth: when the current text
+    # is short and recent history contains calendar/email keywords,
+    # build a combined-text view (last 3 user turns joined) and use
+    # THAT for intent regex matching. The actual tool call still uses
+    # the combined view for things like provider/window detection.
+    intent_text = text
+    if (
+        history_texts
+        and len(text) < 40  # short -> likely a fragment continuation
+        and not (_CALENDAR_INTENT_RE.search(text) or _calendar_broad_match(text))
+        and not (_EMAIL_SEARCH_INTENT_RE.search(text) or _email_broad_match(text))
+    ):
+        recent = " ".join((history_texts or [])[-3:] + [text]).strip()
+        if recent and recent != text:
+            if (_CALENDAR_INTENT_RE.search(recent) or _calendar_broad_match(recent)
+                or _EMAIL_SEARCH_INTENT_RE.search(recent) or _email_broad_match(recent)):
+                logger.info(
+                    "intent_preexec: using history-joined text (%d chars) "
+                    "for fragment continuation. latest=%r",
+                    len(recent), text[:40],
+                )
+                intent_text = recent
+
     # ── Self-improvement layer: check LEARNED intents first ─────────────
     # learned_intents.match_learned() returns the full match dict
     # ({domain, action, hint_text, regex}) when any auto-promoted pattern
@@ -670,7 +698,9 @@ def maybe_preexecute(
             }
 
     # Calendar (hardcoded regex path)
-    cal = _detect_calendar_intent(text, history_texts=history_texts)
+    # Round 17.1 — use the fragment-tolerant intent_text so detection
+    # works even when STT split the request across multiple turns.
+    cal = _detect_calendar_intent(intent_text, history_texts=history_texts)
     if cal:
         if cal["provider"] == "outlook":
             tool_name = "outlook_list_events"
@@ -718,7 +748,7 @@ def maybe_preexecute(
         # the full list. The look-back tool result contains every event
         # in the window — the user wants the latest one.
         past_nudge = ""
-        if _is_past_query(text):
+        if _is_past_query(intent_text):
             past_nudge = (
                 "  6. The user asked about a PAST meeting (e.g. 'last meeting',\n"
                 "     'most recent'). Pick the SINGLE most-recent event from\n"
@@ -763,7 +793,7 @@ def maybe_preexecute(
         return {"tool_name": tool_name, "result": result, "context_block": block}
 
     # Email
-    eml = _detect_email_intent(text, history_texts=history_texts)
+    eml = _detect_email_intent(intent_text, history_texts=history_texts)
     if eml:
         if eml["provider"] == "outlook":
             tool_name = "outlook_list_messages"
