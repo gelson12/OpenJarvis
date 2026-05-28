@@ -374,6 +374,11 @@ def _get_always_on_tools() -> list[dict]:
         "env_introspect",
         "source_grep",
         "source_read",
+        # Round 20 Piece 2: TOOL-registry self-introspection. Lets the
+        # LLM ask "what tools do I have for X?" via a semantic-rank
+        # query against ALL ~140 registered tools, instead of guessing
+        # (which led to the `google_bridge` hallucination in Round 18).
+        "introspect_tools",
     ):
         tool_cls = ToolRegistry.get(name)
         if tool_cls is None:
@@ -732,6 +737,45 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
         logging.getLogger("openjarvis.server").debug(
             "configured-integrations system-block inject failed",
             exc_info=True,
+        )
+
+    # Round 20 Piece 1 — embedding-based tool router. For the user's
+    # current query, semantically rank ALL ~140 registered tools and
+    # inject a "your most relevant tools for this query are: ..."
+    # system message. Augments (does NOT replace) the keyword-based
+    # auto-inject; gives the LLM tool awareness even on novel phrasings
+    # that the keyword groups don't anticipate. Best-effort; falls back
+    # to the existing keyword filter silently on any failure.
+    try:
+        from openjarvis.server.tool_router import build_tool_hint_block
+        _latest_user_for_router = ""
+        if request_body.messages:
+            for _m in reversed(request_body.messages):
+                if _m.role == "user" and _m.content:
+                    _latest_user_for_router = _m.content
+                    break
+        _router_block = build_tool_hint_block(_latest_user_for_router)
+        if _router_block and request_body.messages:
+            from openjarvis.server.models import ChatMessage
+            _msgs = list(request_body.messages)
+            _insert_at = 0
+            for _i, _m in enumerate(_msgs):
+                if _m.role != "system":
+                    break
+                _insert_at = _i + 1
+            _msgs.insert(
+                _insert_at,
+                ChatMessage(role="system", content=_router_block, name=None,
+                            tool_call_id=None),
+            )
+            request_body.messages = _msgs
+            logging.getLogger("openjarvis.server").info(
+                "tool_router.served preview=%r",
+                _router_block[:120].replace("\n", " "),
+            )
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "tool_router system-block inject failed", exc_info=True,
         )
 
     # Inject memory context into messages before dispatching

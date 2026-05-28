@@ -502,6 +502,15 @@ def _probe_learning_mirrors() -> Dict[str, Any]:
     return out
 
 
+def _probe_tool_router() -> Dict[str, Any]:
+    """Round 20 Piece 1 — embedding-based tool retrieval status."""
+    try:
+        from openjarvis.server import tool_router as _tr
+        return _tr.snapshot()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -536,6 +545,8 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
     learned_prompt_hints_block = _probe_learned_prompt_hints()
     disavowal_detector_block = _probe_disavowal_detector()
     learning_mirrors_block = _probe_learning_mirrors()
+    # Round 20 Piece 1 — embedding-based tool router
+    tool_router_block = _probe_tool_router()
 
     return {
         "_timestamp": datetime.now(timezone.utc).isoformat(),
@@ -565,6 +576,8 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
         "learned_intents": learned_intents_block,
         "learned_prompt_hints": learned_prompt_hints_block,
         "learning_mirrors": learning_mirrors_block,
+        # Round 20 — autonomous architecture
+        "tool_router": tool_router_block,
     }
 
 

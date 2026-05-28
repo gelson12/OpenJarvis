@@ -83,6 +83,13 @@ except ImportError:
     pass
 
 try:
+    # Round 20 Piece 2: self-introspection meta-tool. Lets the LLM ask
+    # its own registry "what tools do I have for X?" instead of guessing.
+    import openjarvis.tools.introspect_tools  # noqa: F401
+except ImportError:
+    pass
+
+try:
     # Round 2.2: persistent goal tracker (env-gated by OPENJARVIS_GOALS_ENABLED).
     import openjarvis.tools.goal  # noqa: F401
 except ImportError:
