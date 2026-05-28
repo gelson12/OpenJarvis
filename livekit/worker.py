@@ -645,7 +645,24 @@ _CONTENT_VERB = re.compile(
     r"launch(?:ing|es)?|"
     r"see(?:ing)?|"
     r"let'?s\s+(?:start|begin)\s+(?:by|with)|"
-    r"start\s+(?:by|with)"
+    r"start\s+(?:by|with)|"
+    # Round 13.5 — natural-speech ways to ask. The user transcript had:
+    #   "Just wanna know the world's news"
+    #   "Would like to know today's news"
+    #   "I want today's news"
+    # None of which matched the verb list above, so the news intent
+    # silently dropped to LLM fallthrough -> disavowal. These verbs +
+    # the calendar-noun / news-noun coexistence already gate against
+    # false positives like "I want a Tesla" (no news noun there).
+    r"want(?:s|ed)?(?:\s+to\s+(?:know|hear|see))?|"
+    r"wanna(?:\s+(?:know|hear|see))?|"
+    r"need(?:s|ed)?(?:\s+to\s+(?:know|hear|see))?|"
+    r"tell\s+me|"
+    r"hear(?:ing)?|"
+    r"would\s+like\s+to\s+(?:know|hear|see)|"
+    r"i'?d\s+like\s+to\s+(?:know|hear|see)|"
+    r"let\s+me\s+know|"
+    r"what'?s\s+(?:in|on|the)"
     r")\b", re.I
 )
 
@@ -846,9 +863,28 @@ def _is_generic_news_topic(topic: str) -> bool:
         return True
     # Also accept "just news" / "the news" / "latest news the news"
     # (duplicated-news fragments from STT reassembly).
+    # Round 13.2 — extended with discourse markers ("first of all",
+    # "actually", "well", "now", "so", "you know") that STT routinely
+    # captures at the start of voice requests.
     stripped = re.sub(
-        r"\b(?:just|the|some|any|please|sir|now|news|headlines|stories|"
-        r"updates|latest|today'?s|recent|world|global|top)\b",
+        r"\b(?:"
+        # Generic news/topic words
+        r"just|the|some|any|please|sir|now|news|headlines|stories|"
+        r"updates|latest|today'?s|recent|world|global|top|"
+        # Discourse markers (Round 13.2)
+        r"first|of|all|actually|well|so|okay|ok|right|alright|"
+        r"you|know|hi|hello|hey|jarvis|jarvi[sz]|"
+        # Polite-request stems
+        r"could|would|will|should|can|may|"
+        r"want|to|wanna|need|like|love|prefer|"
+        # Command verbs (also covered by _QUERY_NOISE upstream but
+        # belt-and-suspenders)
+        r"give|me|show|tell|open|display|bring|up|see|pull|get|"
+        r"search|find|look|"
+        # Time fillers
+        r"tonight|tomorrow|today|day|this|that|here|there|"
+        r"morning|afternoon|evening"
+        r")\b",
         "", t, flags=re.I,
     )
     stripped = re.sub(r"[^a-z0-9]+", " ", stripped, flags=re.I).strip()
@@ -964,7 +1000,22 @@ def _content_intent(text: str):
         q = re.sub(r"\b(?:videos?|clips?|footage)\s+(?:of|about|for|on|with)\b",
                    " ", q, flags=re.I)
         q = re.sub(r"\b(?:videos?|clips?|footage)\b", " ", q, flags=re.I)
-        return ("youtube", _clean_query(q))
+        q = _clean_query(q)
+        # Round 13.4 — strip leading discourse / time-filler that STT
+        # routinely produces at the start of voice queries ("now to",
+        # "first", "okay", "actually") so the title shown doesn't read
+        # "YouTube — NOW TO TODAY'S LATEST NEWS".
+        q = re.sub(
+            r"^(?:"
+            r"now\s+(?:to|on|for)?|"
+            r"first(?:\s+of\s+all)?|"
+            r"actually|well|so|okay|ok|right|alright|"
+            r"hey|hi|hello|jarvis|"
+            r"and|but|then|"
+            r"to\s+|for\s+|on\s+|of\s+"
+            r")\s*", "", q, flags=re.I,
+        ).strip(" .,;:!?'\"")
+        return ("youtube", q)
 
     if _NEWS_RE.search(low) and (_CONTENT_VERB.search(low) or "headlines" in low):
         q = re.sub(r"\b(?:news|headlines)\b|\b(?:about|on|regarding)\b",
@@ -3566,14 +3617,30 @@ class Assistant(Agent):
             return False
         kind, arg = intent
 
-        # Coherence gate — refuse to dispatch on a garbled topic. The
-        # user just saw their news search return Elton John because the
-        # transcript was junk ("a little bit of delay, fix that, also,
-        # , the"); a conscious AGI asks instead of guessing.
-        # Empty arg is allowed for news/browser (= top of category).
+        # Round 13.1 — for `news` (and `browser`), a noisy/empty topic is
+        # FINE: news_search falls back to top headlines, browser opens
+        # google.com. The user just said "show me the news" — they don't
+        # want a clarification dialogue, they want headlines. So when
+        # noise is detected for these kinds we strip the topic to "" and
+        # dispatch anyway.
+        if kind in ("news", "browser") and _topic_looks_noisy(arg):
+            logger.info(
+                "intent_preexec.content: noisy topic for %s, "
+                "dispatching with empty topic. raw=%r",
+                kind, arg[:60],
+            )
+            arg = ""
+
+        # Coherence gate (only youtube/web/maps still need this) — refuse
+        # to dispatch on a garbled topic. The user just saw their news
+        # search return Elton John because the transcript was junk
+        # ("a little bit of delay, fix that, also, , the"); a conscious
+        # AGI asks instead of guessing.
         needs_topic = kind in ("youtube", "web", "maps")
         topic_required_but_missing = needs_topic and not arg.strip()
-        if topic_required_but_missing or _topic_looks_noisy(arg):
+        if topic_required_but_missing or (
+            needs_topic and _topic_looks_noisy(arg)
+        ):
             return await self._ask_content_clarification(kind, arg, text)
 
         dispatch = {
@@ -4892,11 +4959,26 @@ class Assistant(Agent):
         transient Google News RSS hiccup doesn't leave the user with a
         bare "I couldn't reach the news feed" message.
 
+        Round 13.3: sanitizes the topic before using it as the widget
+        title so leaked STT noise ("Give me a minute. Give me a minute")
+        never leaks into the displayed panel title.
+
         Args:
             topic: Optional subject to focus the news on (e.g.
                 "technology"). Leave empty for the top headlines.
         """
         topic = (topic or "").strip()
+        # Round 13.3 — if the topic looks generic / noisy / discourse-
+        # marker-only, treat it as empty. This is the LAST line of
+        # defense after _content_intent and 13.1 dispatch. Catches
+        # cases where show_news is called directly (LLM tool call,
+        # follow-up resume) with a junky topic.
+        if topic and (_is_generic_news_topic(topic) or _topic_looks_noisy(topic)):
+            logger.info(
+                "show_news: sanitized topic %r -> empty (generic/noisy)",
+                topic[:60],
+            )
+            topic = ""
 
         # Round 10.4 retry loop — Google News RSS occasionally 503s.
         articles = []
