@@ -627,9 +627,26 @@ _WEBSEARCH_RE = re.compile(
 # An explicit "put it on screen" verb. The bare nouns `news`/`maps` match
 # far too eagerly ("any news on my project" should be answered, not turned
 # into a news panel), so those two intents additionally require this verb.
+# Round 12.1: extended with -ing and other natural-speech forms so phrases
+# like "let's start by SHOWING me the news" / "opening the news for me"
+# match the content intent BEFORE the desktop router (whose hint regex
+# also contains "start"/"open"/"launch") misroutes the turn.
 _CONTENT_VERB = re.compile(
-    r"\b(show|open|bring up|pull up|display|get me|give me|pop up|put up|"
-    r"launch|see)\b", re.I
+    r"\b("
+    r"show(?:ing|s|n|\s+me)?|"
+    r"open(?:ing|s)?|"
+    r"bring(?:ing)?\s+up|"
+    r"pull(?:ing)?\s+up|"
+    r"display(?:ing|s)?|"
+    r"get(?:ting)?\s+me|"
+    r"give\s+me|"
+    r"pop(?:ping)?\s+up|"
+    r"put(?:ting)?\s+up|"
+    r"launch(?:ing|es)?|"
+    r"see(?:ing)?|"
+    r"let'?s\s+(?:start|begin)\s+(?:by|with)|"
+    r"start\s+(?:by|with)"
+    r")\b", re.I
 )
 
 # Accommodation booking intent. Broad pattern to catch the many ways users
@@ -793,6 +810,51 @@ def _looks_like_complaint(text: str) -> bool:
     return bool(_USER_COMPLAINT_RE.search(text or ""))
 
 
+# Round 12.2 — generic-news topic detector.
+# After we strip "news" / "headlines" / "about" / "on" / "regarding" out of
+# the user's request, what's LEFT is the topic. But users routinely frame
+# a generic ask as "latest news" / "today's news" / "the news" / "world
+# news" — once "news" is stripped that leaves filler words ("latest",
+# "today", "the", "world", "just"). Passing those as the search topic
+# produces zero useful results AND lets the LLM say nonsense like "Top
+# headline on Just latest news. the news". Match those filler-only
+# topics so show_news() can fall back to TOP HEADLINES instead.
+_GENERIC_NEWS_FILLER_RE = re.compile(
+    r"^(?:"
+    r"(?:just\s+|the\s+|some\s+|any\s+)?"
+    r"(?:latest|today'?s|tonight'?s|recent|breaking|world|global|"
+    r"international|local|top|main|important|big|current)?"
+    r"(?:\s+(?:news|headlines|stories|updates))?"
+    r"(?:\s+(?:please|sir|now))?"
+    r")$",
+    re.I,
+)
+
+
+def _is_generic_news_topic(topic: str) -> bool:
+    """True when the post-strip topic is just news-synonyms / filler
+    words and should be treated as 'top headlines'."""
+    t = (topic or "").strip(" .,;:!?'\"")
+    if not t:
+        return True
+    # Strip simple punctuation runs and collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > 60:
+        # Long topics are real queries even if they include filler words
+        return False
+    if _GENERIC_NEWS_FILLER_RE.match(t):
+        return True
+    # Also accept "just news" / "the news" / "latest news the news"
+    # (duplicated-news fragments from STT reassembly).
+    stripped = re.sub(
+        r"\b(?:just|the|some|any|please|sir|now|news|headlines|stories|"
+        r"updates|latest|today'?s|recent|world|global|top)\b",
+        "", t, flags=re.I,
+    )
+    stripped = re.sub(r"[^a-z0-9]+", " ", stripped, flags=re.I).strip()
+    return not stripped  # if nothing meaningful left -> generic
+
+
 # Round 10.5 — STT-artifact guard. Used as a fast gate at the very top
 # of intent dispatchers BEFORE any regex runs. Catches truly empty,
 # 3-char-or-less, or single-word filler/STT-noise transcripts that
@@ -907,7 +969,17 @@ def _content_intent(text: str):
     if _NEWS_RE.search(low) and (_CONTENT_VERB.search(low) or "headlines" in low):
         q = re.sub(r"\b(?:news|headlines)\b|\b(?:about|on|regarding)\b",
                    " ", t, flags=re.I)
-        return ("news", _clean_query(q))
+        q = _clean_query(q)
+        # Round 12.2 — when the user just wants "today's news" / "the
+        # latest news" / "top headlines" / "world news" (generic news
+        # framing) the cleaned topic ends up as a filler phrase that
+        # show_news would either reject as noisy OR pass to the news
+        # source as a literal search query (returning weak/no results).
+        # Detect those generic phrasings and clear the topic so we
+        # serve TOP HEADLINES instead.
+        if _is_generic_news_topic(q):
+            q = ""
+        return ("news", q)
 
     if _MAP_RE.search(low) and (
         _CONTENT_VERB.search(low)
@@ -4900,58 +4972,57 @@ class Assistant(Agent):
         except Exception as exc:  # noqa: BLE001
             logger.debug("show_news: cache write failed: %s", exc)
 
-        # Derive a SAFE YouTube query from the top headline. Strip
-        # source suffix (" - Reuters"), pipe-separated subtitle, and
-        # truncate to the first 8 meaningful words — real headlines
-        # routinely run 80-130 chars, which is far too specific for
-        # YouTube (returns 0 results) AND used to trip our noise
-        # heuristic (intended for spoken topics, not headline strings)
-        # so we fell off the companion-video path entirely.
         top = articles[0] if articles else {}
         top_title = (top.get("title") or "").strip()
         top_source = (top.get("source") or "").strip()
-        video_query = re.sub(r"\s+-\s+[A-Z][A-Za-z0-9 .&'-]+$", "", top_title)
-        video_query = re.sub(r"\s+\|.*$", "", video_query).strip()
-        # Drop punctuation that YouTube treats as nothing useful.
-        video_query_clean = re.sub(r"[\"'`]", "", video_query)
-        # First N words is the right granularity for YouTube — the
-        # core noun phrase is almost always within the first 6-8 words,
-        # and over-specifying just kills recall.
-        video_query_short = " ".join(video_query_clean.split()[:8])
 
-        # We deliberately DO NOT apply `_topic_looks_noisy` here —
-        # headlines are inherently long and that heuristic would
-        # reject every legitimate one. Just gate on having SOMETHING
-        # substantive to search (>= 12 chars).
-        if len(video_query_short) >= 12:
-            try:
-                videos = await asyncio.wait_for(
-                    search_tools.youtube_search(video_query_short, limit=6),
-                    timeout=6.0,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("news-companion youtube fetch failed: %s", exc)
-                videos = []
-            if videos:
-                # Open the companion YouTube widget immediately, in
-                # parallel with the headlines panel. The previous 4-second
-                # sleep was a UX delay the user explicitly asked to remove.
+        # Round 12.3 — companion YouTube widget defaults OFF.
+        # Production surprise: the top BBC headline was "An unhealthy
+        # focus on sex - Married at First Sight UK insiders on show's
+        # 'toxic' culture", which YouTube-searched to "An unhealthy
+        # focus on sex" and returned ADULT-themed health/wellness
+        # videos in a panel titled "News Video — An Unhealthy Focus on
+        # Sex". Inappropriate for an assistant. Until we have an
+        # adult-content filter on the derived query, the companion
+        # video is opt-in via OPENJARVIS_NEWS_COMPANION_YOUTUBE_ENABLED.
+        # The headlines panel still opens normally — just no
+        # potentially-surprising adjacent video.
+        if os.environ.get(
+            "OPENJARVIS_NEWS_COMPANION_YOUTUBE_ENABLED", "false",
+        ).lower() in ("1", "true", "yes", "on"):
+            # Derive a SAFE YouTube query from the top headline. Strip
+            # source suffix (" - Reuters"), pipe-separated subtitle,
+            # and truncate to the first 8 meaningful words.
+            video_query = re.sub(r"\s+-\s+[A-Z][A-Za-z0-9 .&'-]+$", "", top_title)
+            video_query = re.sub(r"\s+\|.*$", "", video_query).strip()
+            video_query_clean = re.sub(r"[\"'`]", "", video_query)
+            video_query_short = " ".join(video_query_clean.split()[:8])
+            if len(video_query_short) >= 12:
                 try:
-                    await self._publish_ui(
-                        {
-                            "type": "open_widget",
-                            "kind": "youtube",
-                            "title": f"News Video — {video_query_short[:50]}",
-                            "payload": {
-                                "query": video_query_short,
-                                "videos": videos,
-                            },
-                        }
+                    videos = await asyncio.wait_for(
+                        search_tools.youtube_search(video_query_short, limit=6),
+                        timeout=6.0,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "news-companion video open failed: %s", exc
-                    )
+                    logger.debug("news-companion youtube fetch failed: %s", exc)
+                    videos = []
+                if videos:
+                    try:
+                        await self._publish_ui(
+                            {
+                                "type": "open_widget",
+                                "kind": "youtube",
+                                "title": f"News Video — {video_query_short[:50]}",
+                                "payload": {
+                                    "query": video_query_short,
+                                    "videos": videos,
+                                },
+                            }
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "news-companion video open failed: %s", exc
+                        )
 
         where = f" on {topic}" if topic else ""
         if top_title:
