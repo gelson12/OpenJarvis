@@ -520,6 +520,15 @@ def _probe_outcome_logger() -> Dict[str, Any]:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _probe_agentic_loop() -> Dict[str, Any]:
+    """Round 20 Piece 3 — plan-act-verify agentic loop."""
+    try:
+        from openjarvis.server import agentic_loop as _al
+        return _al.snapshot()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -558,6 +567,8 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
     tool_router_block = _probe_tool_router()
     # Round 20 Piece 4 — outcome logger + reward shaping
     outcome_logger_block = _probe_outcome_logger()
+    # Round 20 Piece 3 — agentic loop (opt-in)
+    agentic_loop_block = _probe_agentic_loop()
 
     return {
         "_timestamp": datetime.now(timezone.utc).isoformat(),
@@ -590,6 +601,7 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
         # Round 20 — autonomous architecture
         "tool_router": tool_router_block,
         "outcome_logger": outcome_logger_block,
+        "agentic_loop": agentic_loop_block,
     }
 
 
