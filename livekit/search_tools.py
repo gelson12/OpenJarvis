@@ -282,37 +282,84 @@ async def youtube_search(query: str, limit: int = 8) -> list[dict]:
         return []
 
 
-# ── News (keyless — Google News RSS) ─────────────────────────────────
-async def news_search(query: str = "", limit: int = 8) -> list[dict]:
-    """Top headlines (or a topic) from the keyless Google News RSS feed."""
-    query = (query or "").strip()
-    if query:
-        url = (
+# ── News (keyless RSS with multi-source fallback chain) ──────────────
+#
+# Round 11.1: Google News RSS routinely 503s during peak hours and used
+# to return [] with no fallback. We now try a sequence of free RSS
+# sources until one yields headlines. Order matters: Google first because
+# it supports topic search; the rest serve top-headlines only.
+def _build_news_sources(query: str) -> list[tuple[str, str]]:
+    """Return list of (label, url) news RSS sources to try in order."""
+    q = (query or "").strip()
+    sources: list[tuple[str, str]] = []
+    if q:
+        sources.append((
+            "Google News (search)",
             "https://news.google.com/rss/search?q="
-            + urllib.parse.quote(query)
-            + "&hl=en-US&gl=US&ceid=US:en"
-        )
+            + urllib.parse.quote(q)
+            + "&hl=en-US&gl=US&ceid=US:en",
+        ))
     else:
-        url = "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en"
-    try:
-        async with httpx.AsyncClient(
-            timeout=12.0, headers={"User-Agent": _UA}, follow_redirects=True
-        ) as client:
-            resp = await client.get(url)
-        resp.raise_for_status()
-        root = ElementTree.fromstring(resp.text)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("news fetch failed: %s", exc)
-        return []
-    out: list[dict] = []
-    for item in root.findall(".//item")[:limit]:
-        source_el = item.find("source")
-        out.append(
-            {
-                "title": item.findtext("title", default="") or "",
-                "url": item.findtext("link", default="") or "",
-                "source": (source_el.text if source_el is not None else "") or "",
-                "published": item.findtext("pubDate", default="") or "",
-            }
-        )
-    return out
+        sources.append((
+            "Google News (top)",
+            "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en",
+        ))
+    # Top-headlines fallbacks. These don't support topic search but at
+    # least give the user *something* when Google News is down. The
+    # set is curated for 2026 reliability:
+    #   * BBC, NPR, NYT, Guardian publish stable RSS at canonical URLs.
+    #   * Reuters dropped their public RSS in 2020 (404).
+    #   * AP only via 3rd-party rsshub which is itself unreliable.
+    # Order is by historical uptime + name recognition.
+    sources.extend([
+        ("BBC News",      "https://feeds.bbci.co.uk/news/rss.xml"),
+        ("NPR News",      "https://feeds.npr.org/1001/rss.xml"),
+        ("NYT Home",      "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"),
+        ("Guardian World","https://www.theguardian.com/world/rss"),
+    ])
+    return sources
+
+
+async def news_search(query: str = "", limit: int = 8) -> list[dict]:
+    """Top headlines (or a topic) from a chain of keyless RSS sources.
+
+    Tries Google News first, then BBC/Reuters/NPR/AP as fallbacks if
+    Google 503s or returns empty. Returns the FIRST source that yields
+    >= 1 article; never raises.
+    """
+    last_exc: BaseException | None = None
+    for label, url in _build_news_sources(query):
+        try:
+            async with httpx.AsyncClient(
+                timeout=8.0,  # Tighter per-source so the chain finishes fast
+                headers={"User-Agent": _UA},
+                follow_redirects=True,
+            ) as client:
+                resp = await client.get(url)
+            resp.raise_for_status()
+            root = ElementTree.fromstring(resp.text)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning("news fetch failed [%s]: %s", label, exc)
+            continue
+        out: list[dict] = []
+        for item in root.findall(".//item")[:limit]:
+            source_el = item.find("source")
+            out.append(
+                {
+                    "title": item.findtext("title", default="") or "",
+                    "url": item.findtext("link", default="") or "",
+                    "source": (
+                        (source_el.text if source_el is not None else "")
+                        or label
+                    ),
+                    "published": item.findtext("pubDate", default="") or "",
+                }
+            )
+        if out:
+            if label != "Google News (search)" and label != "Google News (top)":
+                logger.info("news: served %d articles from fallback %s", len(out), label)
+            return out
+    if last_exc is not None:
+        logger.error("news: ALL sources failed, last error: %s", last_exc)
+    return []

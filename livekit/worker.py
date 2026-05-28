@@ -765,6 +765,33 @@ _BARE_INTERJECTION_RE = re.compile(
     re.I,
 )
 
+# Round 11.4 — user-complaint / meta-question detector.
+# Phrasings like "why haven't you opened a youtube video", "why didn't
+# you show me the news", "what's taking you so long" are NOT new
+# requests for content — they're complaints about a previous command.
+# Re-dispatching the content intent on these turns the LLM's words
+# into a fresh widget that the user didn't ask for. Detect and skip
+# content dispatch entirely so the LLM answers conversationally.
+_USER_COMPLAINT_RE = re.compile(
+    r"\b(?:"
+    r"why\s+(?:haven'?t|hasn'?t|aren'?t|isn'?t|didn'?t|don'?t|can'?t|wouldn'?t)|"
+    r"why\s+is\s+(?:it|this|that)|"
+    r"why\s+are\s+you|why\s+is\s+(?:there|jarvis)|"
+    r"what'?s\s+(?:taking|going\s+on|wrong|happening|the\s+problem)|"
+    r"how\s+come|why\s+only|"
+    r"you\s+didn'?t|you\s+haven'?t|you\s+(?:never|still)|"
+    r"are\s+you\s+(?:there|listening|hearing)|"
+    r"did\s+you\s+(?:hear|get|catch|see)\s+(?:what|that|me)"
+    r")\b",
+    re.I,
+)
+
+
+def _looks_like_complaint(text: str) -> bool:
+    """True when the user's turn is a complaint / meta-question about
+    Jarvis's behaviour, not a fresh content request."""
+    return bool(_USER_COMPLAINT_RE.search(text or ""))
+
 
 # Round 10.5 — STT-artifact guard. Used as a fast gate at the very top
 # of intent dispatchers BEFORE any regex runs. Catches truly empty,
@@ -3451,6 +3478,16 @@ class Assistant(Agent):
         # would silence the LLM too; returning False here lets the (now
         # short) text reach the LLM unchanged but blocks the widget path.
         if _is_stt_artifact(text):
+            return False
+        # Round 11.4 — when the user is complaining ("why haven't you...",
+        # "what's taking so long?"), don't re-fire a widget on the
+        # mention of "youtube"/"news"/etc. inside their complaint. Let
+        # the LLM answer conversationally.
+        if _looks_like_complaint(text):
+            logger.info(
+                "intent_preexec.content: skipping (complaint detected): %r",
+                text[:80],
+            )
             return False
         intent = _content_intent(text)
         if intent is None:

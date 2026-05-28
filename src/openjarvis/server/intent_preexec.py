@@ -401,13 +401,52 @@ def _run_outlook_list_events(start: str, end: str) -> Optional[str]:
 
 
 def _run_calendar_list_events(start: str, end: str) -> Optional[str]:
+    """List Google Calendar events. Round 11.2: tries the 'primary'
+    account first; if its OAuth isn't configured (refresh token missing)
+    we automatically retry with account='bridge' before giving up.
+
+    Also fixes a pre-existing param-name bug: the tool spec uses
+    `time_min`/`time_max`, not `start`/`end`.
+    """
     try:
         from openjarvis.core.registry import ToolRegistry
         cls = ToolRegistry.get("calendar_list_events")
         if cls is None:
             return None
-        result = cls().execute(start=start, end=end)
-        return getattr(result, "content", None) or str(result)
+        # First attempt — primary account
+        result = cls().execute(time_min=start, time_max=end, account="primary")
+        content = getattr(result, "content", None) or str(result)
+        # Round 11.2 — auto-fallback to bridge account when primary OAuth
+        # isn't configured. The error string contains "OAuth not
+        # configured" or "GOOGLE_CLIENT_ID"-style markers.
+        success = bool(getattr(result, "success", True))
+        looks_like_oauth_missing = (
+            ("oauth not configured" in (content or "").lower())
+            or ("google_client_id" in (content or "").lower())
+            or ("google_refresh_token" in (content or "").lower())
+        )
+        if (not success) or looks_like_oauth_missing:
+            from openjarvis.core.env import is_configured
+            if is_configured("BRIDGE_GOOGLE_REFRESH_TOKEN"):
+                logger.info(
+                    "intent_preexec.calendar: primary OAuth missing — "
+                    "retrying with account='bridge'"
+                )
+                try:
+                    result2 = cls().execute(
+                        time_min=start, time_max=end, account="bridge",
+                    )
+                    content2 = getattr(result2, "content", None) or str(result2)
+                    if getattr(result2, "success", True) and content2:
+                        return (
+                            "[Google account: BRIDGE — your primary "
+                            "account isn't OAuth-authorized yet]\n" + content2
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "intent_preexec.calendar bridge retry failed: %s", exc,
+                    )
+        return content
     except Exception as exc:
         logger.warning("intent_preexec: calendar_list_events failed: %s", exc)
         return None
@@ -621,6 +660,36 @@ def maybe_preexecute(
                 "intent_preexec: matched calendar intent but tool returned None"
             )
             return None
+
+        # Round 11.3 — when Google OAuth is unconfigured AND bridge is
+        # unavailable, the result still contains the raw error string.
+        # The LLM has been hallucinating a `google_bridge` tool to "fix
+        # it" — wasting 5+ tool-call retries before timing out. Replace
+        # the raw error with a short, action-able context block that
+        # gives the LLM a clear sentence to read aloud instead.
+        looks_like_oauth_error = (
+            "oauth not configured" in result.lower()
+            or "google_client_id" in result.lower()
+            or "google_refresh_token" in result.lower()
+        )
+        if cal["provider"] != "outlook" and looks_like_oauth_error:
+            block = (
+                "GOOGLE CALENDAR UNAVAILABLE: the user's Google account "
+                "has not finished the one-time OAuth authorization for "
+                "calendar access (the refresh token is missing).\n\n"
+                "ABSOLUTE INSTRUCTIONS (you MUST follow these):\n"
+                "  1. Tell the user PLAINLY in ONE sentence: \"Your Google "
+                "Calendar isn't authorized yet, sir — I'd need you to "
+                "complete the one-time OAuth setup. Your Outlook calendar "
+                "is working if you'd like me to check that instead.\"\n"
+                "  2. Do NOT invent tool names like `google_bridge` — no "
+                "such tool exists. Do NOT call any tool to 'fix' this.\n"
+                "  3. Do NOT loop or retry. Speak the sentence and stop.\n"
+                "  4. If the user offers to switch to Outlook, just say "
+                "yes and wait for their next request.\n"
+            )
+            logger.info("intent_preexec.calendar: surfaced OAuth-missing notice")
+            return {"tool_name": tool_name, "result": result, "context_block": block}
         # Hotfix #2: when the user explicitly asked about past meetings,
         # nudge the LLM to surface the MOST RECENT entry rather than dump
         # the full list. The look-back tool result contains every event
