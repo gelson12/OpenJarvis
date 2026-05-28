@@ -910,6 +910,38 @@ _GENERIC_NEWS_FILLER_RE = re.compile(
 )
 
 
+def _topic_safe_for_announcement(topic: str) -> bool:
+    """Round 15.2 — strict gate for embedding a topic in a SPOKEN
+    sentence ("Top headline on {topic}: ..."). Wider than
+    _is_generic_news_topic (which is just for the news SEARCH key);
+    this protects the user from hearing garbled mid-sentence STT.
+
+    A topic is safe for announcement iff:
+      - non-empty and 3..50 chars
+      - contains only letters / digits / spaces / hyphens (no mid-
+        string periods or commas from "First step. the" leakage)
+      - doesn't END on a stop-word ("the", "a", "of", "to", "for",
+        "and", "on", "in", "with", "step", "the.")
+      - has at least one word >= 4 chars (so "us uk" / "a b" miss)
+    """
+    if not topic:
+        return False
+    t = topic.strip()
+    if len(t) < 3 or len(t) > 50:
+        return False
+    if re.search(r"[.,;:!?]", t):
+        return False
+    last = t.rsplit(" ", 1)[-1].lower().strip(" .,;:!?")
+    if last in {
+        "the", "a", "an", "of", "to", "for", "and", "on", "in", "with",
+        "by", "or", "but", "as", "at", "step", "well", "uh", "um", "first",
+    }:
+        return False
+    if not any(len(w) >= 4 for w in t.split()):
+        return False
+    return True
+
+
 def _is_generic_news_topic(topic: str) -> bool:
     """True when the post-strip topic is just news-synonyms / filler
     words and should be treated as 'top headlines'."""
@@ -936,6 +968,12 @@ def _is_generic_news_topic(topic: str) -> bool:
         # Discourse markers (Round 13.2)
         r"first|of|all|actually|well|so|okay|ok|right|alright|"
         r"you|know|hi|hello|hey|jarvis|jarvi[sz]|"
+        # Round 15.1 additions — STT mishearings + voice filler that
+        # production transcripts surfaced. "First step" was STT's
+        # version of "First of all"; "uh"/"um" are speech-stalls.
+        r"step|steps|stage|stages|"
+        r"uh+|um+|hmm+|eh+|er+|ah+|"
+        r"thing|things|stuff|kinda|kind\s+of|sort\s+of|"
         # Polite-request stems
         r"could|would|will|should|can|may|"
         r"want|to|wanna|need|like|love|prefer|"
@@ -950,7 +988,16 @@ def _is_generic_news_topic(topic: str) -> bool:
         "", t, flags=re.I,
     )
     stripped = re.sub(r"[^a-z0-9]+", " ", stripped, flags=re.I).strip()
-    return not stripped  # if nothing meaningful left -> generic
+    # Round 15.1 — if what remains is JUST 1-2 short words (<= 6 chars
+    # total ignoring spaces) or nothing useful, treat as generic. This
+    # catches residuals like "step", "the", "well" that survive the
+    # blacklist when surrounded by punctuation.
+    if not stripped:
+        return True
+    compact = stripped.replace(" ", "")
+    if len(compact) <= 6:
+        return True
+    return False
 
 
 # Round 10.5 — STT-artifact guard. Used as a fast gate at the very top
@@ -5186,7 +5233,17 @@ class Assistant(Agent):
                             "news-companion video open failed: %s", exc
                         )
 
-        where = f" on {topic}" if topic else ""
+        # Round 15.2 — final guard on the spoken sentence. Even if the
+        # topic survived the upstream filters, we ONLY say "on {topic}"
+        # when the topic is clean enough to be embedded in a sentence
+        # naturally. Production transcript showed the LLM had been
+        # speaking lines like "Top headline on First step. the: ...";
+        # the widget was right but the spoken sentence was embarrassing.
+        # Rules: the topic must (a) be short, (b) contain only letters/
+        # digits/spaces (no mid-string periods/commas from STT), and
+        # (c) not END on a stop-word like "the"/"a"/"of".
+        spoken_topic = topic if _topic_safe_for_announcement(topic) else ""
+        where = f" on {spoken_topic}" if spoken_topic else ""
         if top_title:
             lead = f"Top headline{where}: {top_title}"
             lead += f", from {top_source}." if top_source else "."
