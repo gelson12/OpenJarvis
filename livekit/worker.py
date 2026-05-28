@@ -620,9 +620,21 @@ _URL_RE = re.compile(
 _YOUTUBE_RE = re.compile(r"\byoutube\b|\bvideos?\s+(?:of|about|for)\b", re.I)
 _NEWS_RE = re.compile(r"\b(?:news|headlines)\b", re.I)
 _MAP_RE = re.compile(r"\b(?:maps?|directions?)\b", re.I)
+# Round 16.1 — the bare `|google|` alternative was hijacking ANY mention
+# of Google ("my Google account", "my Gmail/Google calendar") and routing
+# the turn to web-search. Now "google" only triggers when it isn't
+# immediately followed by a Google-service noun (account/calendar/drive/
+# maps/mail/etc.) — which is the only signal that the user means
+# "google X" as a verb, not "Google X" as a possessive.
 _WEBSEARCH_RE = re.compile(
-    r"\b(?:search\s+(?:the\s+)?(?:web|internet|google)|google|look\s+up|"
-    r"web\s+search|search\s+for)\b", re.I
+    r"\b(?:"
+    r"search\s+(?:the\s+)?(?:web|internet|google)|"
+    r"google\s+(?!(?:account|calendar|drive|maps|docs|sheets|mail|gmail|"
+    r"photos?|chrome|search|services|api|cloud|workspace|now|today|home|"
+    r"meet|hangouts?|youtube|news|alerts?|bridge|client|inbox|email|"
+    r"emails?|message|messages?)\b)|"
+    r"look\s+up|web\s+search|search\s+for"
+    r")\b", re.I
 )
 # An explicit "put it on screen" verb. The bare nouns `news`/`maps` match
 # far too eagerly ("any news on my project" should be answered, not turned
@@ -5185,27 +5197,28 @@ class Assistant(Agent):
         top_title = (top.get("title") or "").strip()
         top_source = (top.get("source") or "").strip()
 
-        # Round 12.3 — companion YouTube widget defaults OFF.
-        # Production surprise: the top BBC headline was "An unhealthy
-        # focus on sex - Married at First Sight UK insiders on show's
-        # 'toxic' culture", which YouTube-searched to "An unhealthy
-        # focus on sex" and returned ADULT-themed health/wellness
-        # videos in a panel titled "News Video — An Unhealthy Focus on
-        # Sex". Inappropriate for an assistant. Until we have an
-        # adult-content filter on the derived query, the companion
-        # video is opt-in via OPENJARVIS_NEWS_COMPANION_YOUTUBE_ENABLED.
-        # The headlines panel still opens normally — just no
-        # potentially-surprising adjacent video.
+        # Round 16.2 — companion YouTube widget re-enabled with a SAFE
+        # generic query rather than the (potentially adult) top-headline
+        # title. User requested both panels (headlines + video) back.
+        # Round 12.3 had disabled this because deriving the YouTube
+        # query from the headline "An unhealthy focus on sex…" returned
+        # adult-themed videos. Solution: use a GENERIC stable query
+        # ("world news today" / "{topic} news" when a topic exists)
+        # that always returns mainstream news network footage, never
+        # tabloid-style headline-specific videos.
+        # Env-gated: OPENJARVIS_NEWS_COMPANION_YOUTUBE_ENABLED defaults
+        # to "true" now; flip to false to suppress.
         if os.environ.get(
-            "OPENJARVIS_NEWS_COMPANION_YOUTUBE_ENABLED", "false",
+            "OPENJARVIS_NEWS_COMPANION_YOUTUBE_ENABLED", "true",
         ).lower() in ("1", "true", "yes", "on"):
-            # Derive a SAFE YouTube query from the top headline. Strip
-            # source suffix (" - Reuters"), pipe-separated subtitle,
-            # and truncate to the first 8 meaningful words.
-            video_query = re.sub(r"\s+-\s+[A-Z][A-Za-z0-9 .&'-]+$", "", top_title)
-            video_query = re.sub(r"\s+\|.*$", "", video_query).strip()
-            video_query_clean = re.sub(r"[\"'`]", "", video_query)
-            video_query_short = " ".join(video_query_clean.split()[:8])
+            # SAFE query — generic news framing, never the headline.
+            # When a topic was requested ("news about Tesla") we use
+            # "Tesla news"; otherwise "world news today" returns the
+            # standard CBS/CNBC/Reuters news network livestreams.
+            if topic and _topic_safe_for_announcement(topic):
+                video_query_short = f"{topic} news today"
+            else:
+                video_query_short = "world news today"
             if len(video_query_short) >= 12:
                 try:
                     videos = await asyncio.wait_for(

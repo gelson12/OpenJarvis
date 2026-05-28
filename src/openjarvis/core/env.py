@@ -194,9 +194,13 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
     ),
     "GOOGLE_CLIENT_SECRET": EnvSpec(
         "GOOGLE_CLIENT_SECRET",
-        ("GMAIL_Client_Secret", "GMAIL_CLIENT_SECRET"),
+        # Round 16.3 — env-var lookups are case-sensitive on Linux.
+        # Railway stores the var as "GMAIL_Client_secret" (lowercase
+        # 's' in 'secret'). Without this alias the OAuth refresh was
+        # silently failing because GOOGLE_CLIENT_SECRET stayed unset.
+        ("GMAIL_Client_secret", "GMAIL_Client_Secret", "GMAIL_CLIENT_SECRET"),
         "Google OAuth2 client secret (paired with GOOGLE_CLIENT_ID). "
-        "GMAIL_Client_Secret resolves here via the alias pass.",
+        "GMAIL_Client_secret resolves here via the alias pass.",
         "google",
     ),
     "GOOGLE_REFRESH_TOKEN": EnvSpec(

@@ -437,11 +437,34 @@ def _run_calendar_list_events(start: str, end: str) -> Optional[str]:
                         time_min=start, time_max=end, account="bridge",
                     )
                     content2 = getattr(result2, "content", None) or str(result2)
-                    if getattr(result2, "success", True) and content2:
+                    success2 = bool(getattr(result2, "success", True))
+                    if success2 and content2 and "error" not in content2[:60].lower():
                         return (
                             "[Google account: BRIDGE — your primary "
                             "account isn't OAuth-authorized yet]\n" + content2
                         )
+                    # Round 16.3 — bridge ALSO failed (e.g. expired
+                    # refresh token returning 400). Surface that fact
+                    # to the LLM so it tells the user what's actually
+                    # broken instead of falsely claiming "Google isn't
+                    # authorized" (it WAS authorized; the token expired).
+                    logger.warning(
+                        "intent_preexec.calendar bridge retry returned "
+                        "error: %s", (content2 or "")[:200],
+                    )
+                    return (
+                        "[Google Calendar UNAVAILABLE — both primary and "
+                        "BRIDGE accounts failed]\n"
+                        f"Primary error: {(content or '')[:200]}\n"
+                        f"Bridge error: {(content2 or '')[:200]}\n"
+                        "INSTRUCTION TO LLM: tell the user CONCISELY that "
+                        "Google Calendar isn't reachable right now. If the "
+                        "bridge error mentions a 400 Bad Request or token "
+                        "refresh, suggest re-running the OAuth setup for "
+                        "the bridge account. Do NOT say 'I don't have the "
+                        "tool' — the tool exists, the credentials need "
+                        "renewal."
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "intent_preexec.calendar bridge retry failed: %s", exc,
