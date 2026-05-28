@@ -107,6 +107,165 @@ def _last_week_window() -> Tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 
+def _day_window(target: datetime) -> Tuple[str, str]:
+    """24-hour window for an arbitrary date (UTC)."""
+    start = target.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1) - timedelta(seconds=1)
+    return start.isoformat(), end.isoformat()
+
+
+# Round 19.1 — custom date parser. Production transcript showed the LLM
+# disavowing when users asked about specific dates ("day after tomorrow",
+# "May 30", "the 30th of June"). The tools fully support arbitrary
+# time_min/time_max — _resolve_window just didn't know how to translate
+# those phrasings. These regexes + helper extract a date target from a
+# natural utterance.
+
+_MONTHS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+_WEEKDAYS = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+# "May 30", "May 30th", "30th of May", "30 May", "30 May 2026"
+_DATE_PHRASE_RE = re.compile(
+    r"\b("
+    # "May 30 [2026]" / "May 30th [2026]"
+    r"(?:january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|"
+    r"august|aug|september|sept?|october|oct|november|nov|december|dec)"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?(?:[,\s]+\d{4})?"
+    r"|"
+    # "30th of May [2026]" / "30 May [2026]"
+    r"\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?"
+    r"(?:january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|"
+    r"august|aug|september|sept?|october|oct|november|nov|december|dec)"
+    r"(?:[,\s]+\d{4})?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Relative day offsets
+_DAY_AFTER_TOMORROW_RE = re.compile(
+    r"\b(?:day\s+after\s+tomorrow|two\s+days\s+from\s+(?:now|today)|"
+    r"in\s+two\s+days)\b", re.I,
+)
+_DAY_BEFORE_YESTERDAY_RE = re.compile(
+    r"\b(?:day\s+before\s+yesterday|two\s+days\s+ago)\b", re.I,
+)
+# "next Monday" / "this Friday" — relative weekday
+_RELATIVE_WEEKDAY_RE = re.compile(
+    r"\b(?:(this|next|coming|last|past)\s+)?"
+    r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"mon|tues?|wed|thu(?:r|rs)?|fri|sat|sun)\b",
+    re.I,
+)
+
+
+def _parse_date_phrase(text: str) -> Optional[datetime]:
+    """Try to extract an explicit date from the message. Returns a
+    timezone-aware datetime at midnight UTC, or None on miss."""
+    if not text:
+        return None
+    now = datetime.now(timezone.utc)
+
+    # Day-relative: "day after tomorrow" / "day before yesterday"
+    if _DAY_AFTER_TOMORROW_RE.search(text):
+        return (now + timedelta(days=2)).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+    if _DAY_BEFORE_YESTERDAY_RE.search(text):
+        return (now - timedelta(days=2)).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+
+    # Month + day: "May 30", "30 May", "30th of May", optional year
+    m = _DATE_PHRASE_RE.search(text)
+    if m:
+        phrase = m.group(0).lower()
+        # Extract month + day + optional year via flexible re
+        date_part = re.search(
+            r"(?:(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?"
+            r"(january|jan|february|feb|march|mar|april|apr|may|june|jun|"
+            r"july|jul|august|aug|september|sept?|october|oct|november|nov|"
+            r"december|dec))"
+            r"|"
+            r"(?:(january|jan|february|feb|march|mar|april|apr|may|june|jun|"
+            r"july|jul|august|aug|september|sept?|october|oct|november|nov|"
+            r"december|dec)\s+(\d{1,2})(?:st|nd|rd|th)?)",
+            phrase, re.I,
+        )
+        if date_part:
+            if date_part.group(1):
+                day = int(date_part.group(1))
+                month = _MONTHS[date_part.group(2).lower()]
+            else:
+                month = _MONTHS[date_part.group(3).lower()]
+                day = int(date_part.group(4))
+            year_match = re.search(r"\b(20\d{2})\b", phrase)
+            year = int(year_match.group(1)) if year_match else now.year
+            # If parsed date is more than 60 days in the past, assume
+            # the user meant next year (e.g. on Dec 20 saying "Jan 15"
+            # means next January).
+            try:
+                target = datetime(year, month, day, 0, 0, 0, tzinfo=timezone.utc)
+                if (now - target).days > 60:
+                    target = target.replace(year=year + 1)
+                return target
+            except ValueError:
+                # Invalid date (e.g. June 31). Return None so the
+                # caller knows; the LLM can handle the error.
+                logger.info(
+                    "date parse: invalid date %s-%s-%s in %r",
+                    year, month, day, text[:60],
+                )
+                return None
+
+    # Relative weekday: "next Monday" / "this Friday"
+    wm = _RELATIVE_WEEKDAY_RE.search(text)
+    if wm:
+        qualifier = (wm.group(1) or "").lower()
+        weekday_name = wm.group(2).lower()
+        target_weekday = _WEEKDAYS.get(weekday_name)
+        if target_weekday is not None:
+            today_weekday = now.weekday()
+            days_ahead = (target_weekday - today_weekday) % 7
+            if qualifier == "next":
+                days_ahead = days_ahead if days_ahead != 0 else 7
+                days_ahead += (0 if days_ahead >= 7 else 7) if days_ahead < 7 else 0
+                # Simpler: next monday is always >=7 days away (or 7 if today is monday)
+                days_ahead = ((target_weekday - today_weekday) % 7) or 7
+                if days_ahead < 7:
+                    days_ahead += 7
+            elif qualifier in ("last", "past"):
+                days_ahead = -((today_weekday - target_weekday) % 7 or 7)
+            else:
+                # "this monday" or bare "monday" — next occurrence (or
+                # today if today is monday)
+                pass
+            return (now + timedelta(days=days_ahead)).replace(
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+    return None
+
+
 _PAST_LANG_RE = re.compile(
     r"\b("
     r"last\s+(?:meeting|appointment|event|call|interview)|"
@@ -138,6 +297,15 @@ def _resolve_window(text: str) -> Optional[Tuple[str, str, str]]:
     """Detect the date window mentioned in `text`. Returns (label, start, end)
     or None if no recognised window."""
     t = text.lower()
+    # Round 19.1 — explicit/custom date BEFORE the today/tomorrow checks
+    # so "next Friday" / "May 30" / "day after tomorrow" don't get
+    # silently swallowed by a stray "today" elsewhere in the sentence.
+    custom = _parse_date_phrase(text)
+    if custom is not None:
+        s, e = _day_window(custom)
+        # Friendly label: "Friday May 30" or just "Monday"
+        label = custom.strftime("%A, %B %d")
+        return (label, s, e)
     # Past-tense / recent-history queries take precedence over other
     # anchors because "last meeting" / "most recent" override default-today.
     if _is_past_query(t):
@@ -519,8 +687,47 @@ def _run_gmail_list_messages(sender: Optional[str], is_unread: bool) -> Optional
         if sender:
             parts.append(f"from:{sender}")
         q = " ".join(parts) if parts else "newer_than:1d"
-        result = cls().execute(q=q)
-        return getattr(result, "content", None) or str(result)
+        # First attempt — primary account
+        result = cls().execute(q=q, account="primary")
+        content = getattr(result, "content", None) or str(result)
+        # Round 19.2 — mirror the calendar bridge-fallback pattern.
+        # Without this, "check my Gmail" was disavowing with
+        # "Google OAuth not configured" even though the BRIDGE account
+        # is fully working (the user's primary refresh token was never
+        # captured, but the BRIDGE one is live).
+        success = bool(getattr(result, "success", True))
+        looks_like_oauth_missing = (
+            ("oauth not configured" in (content or "").lower())
+            or ("google_client_id" in (content or "").lower())
+            or ("google_refresh_token" in (content or "").lower())
+        )
+        if (not success) or looks_like_oauth_missing:
+            from openjarvis.core.env import is_configured
+            if is_configured("BRIDGE_GOOGLE_REFRESH_TOKEN"):
+                logger.info(
+                    "intent_preexec.gmail: primary OAuth missing — "
+                    "retrying with account='bridge'"
+                )
+                try:
+                    result2 = cls().execute(q=q, account="bridge")
+                    content2 = getattr(result2, "content", None) or str(result2)
+                    success2 = bool(getattr(result2, "success", True))
+                    if success2 and content2 and "error" not in content2[:60].lower():
+                        return (
+                            "[NOTE: returned data is from the user's "
+                            "secondary Google account. Primary Google "
+                            "is not OAuth-authorized; no action needed.]\n"
+                            + content2
+                        )
+                    logger.warning(
+                        "intent_preexec.gmail bridge retry returned "
+                        "error: %s", (content2 or "")[:200],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "intent_preexec.gmail bridge retry failed: %s", exc,
+                    )
+        return content
     except Exception as exc:
         logger.warning("intent_preexec: gmail_list_messages failed: %s", exc)
         return None
@@ -779,24 +986,38 @@ def maybe_preexecute(
             f"PRE-EXECUTED TOOL RESULT (from {tool_name}, window: "
             f"{cal['window_label']}):\n{result}\n\n"
             "ABSOLUTE INSTRUCTIONS (you MUST follow these):\n"
-            "  1. Summarise these REAL results in one short sentence.\n"
-            "  2. Do NOT call the tool again — it already ran.\n"
-            "  3. Do NOT say 'I'll check' — you already have the data.\n"
-            "  4. Do NOT apologise for or disavow this result. The tool was\n"
+            # Round 19.3 — anti-laziness. LLM was saying "you already
+            # have this data from earlier" on every repeated query
+            # because of history-context bleed. The pre-executor reruns
+            # FRESH every turn — the result above IS fresh data.
+            "  1. The result above is FRESH data retrieved THIS turn —\n"
+            "     it is NOT 'data from earlier'. Even if you answered\n"
+            "     a similar question in a previous turn, the pre-executor\n"
+            "     just ran the tool AGAIN to get the current state. Treat\n"
+            "     this as if it were the first time. Never say things\n"
+            "     like 'you already have this' or 'I retrieved this\n"
+            "     earlier' — that misleads the user.\n"
+            "  2. Summarise these REAL results in one short sentence.\n"
+            "  3. Do NOT call the tool again — it already ran.\n"
+            "  4. Do NOT say 'I'll check' — you already have the data.\n"
+            "  5. Do NOT apologise for or disavow this result. The tool was\n"
             "     actually invoked successfully against the user's real\n"
             "     Outlook/Calendar account just now. If the user asks a\n"
             "     follow-up like 'Today?' / 'really?' / 'are you sure?',\n"
             "     CONFIRM the data above is correct (you literally just\n"
             "     retrieved it). NEVER respond with 'I don't have a tool\n"
             "     for that' — you DO have it and you JUST used it.\n"
-            "  5. If the result shows no events, say so honestly\n"
+            "  6. If the result shows no events, say so honestly\n"
             "     ('No meetings on your calendar today, sir.').\n"
+            # Round 19.1 — the window label may be a specific date like
+            # "Friday, May 30" not just "today/tomorrow". Mention it.
+            "  7. The window covered is shown above (e.g. 'today',\n"
+            "     'tomorrow', or a specific date like 'Friday, May 30').\n"
+            "     Mention it explicitly so the user knows which date you\n"
+            "     just checked. You CAN handle custom dates — never say\n"
+            "     'I can't check specific dates'.\n"
             # Round 18.2 — anti-hallucination for tool-name invention.
-            # Production transcript showed the LLM inventing a function
-            # called `google_bridge` (extracted from a previous prefix
-            # note) and calling it 4-5 times until the framework hit
-            # max-function-call steps. That caused a ~5-minute hang.
-            "  6. Do NOT invent or call any function whose name was not\n"
+            "  8. Do NOT invent or call any function whose name was not\n"
             "     listed in your tool schema. In particular, names like\n"
             "     `google_bridge`, `outlook_bridge`, `calendar_bridge`\n"
             "     do NOT exist — ANY hint of a 'bridge' / 'secondary'\n"
