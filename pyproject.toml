@@ -65,6 +65,14 @@ memory-faiss = [
     "sentence-transformers>=2.2",
     "numpy>=1.24",
 ]
+# Round 20 Phase A — embedding-based tool router. Same embedder as
+# memory-faiss but WITHOUT the faiss-cpu dep (router uses a simple
+# numpy dot-product for ~140 vectors, no need for the FAISS index).
+# Keeps the image smaller for deployments that don't need full RAG.
+tool-router = [
+    "sentence-transformers>=2.2",
+    "numpy>=1.24",
+]
 memory-colbert = [
     "colbert-ai>=0.2",
     "torch>=2.0",

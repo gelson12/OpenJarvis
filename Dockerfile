@@ -33,7 +33,7 @@ COPY accommodation/ accommodation/
 COPY --from=frontend /app/src/openjarvis/server/static src/openjarvis/server/static/
 
 RUN pip install --no-cache-dir uv && \
-    uv pip install --system ".[server,memory-obsidian,inference-cloud,browser]" && \
+    uv pip install --system ".[server,memory-obsidian,inference-cloud,browser,tool-router]" && \
     uv pip install --system -r livekit/requirements.txt
 
 # Stage 3: Runtime
