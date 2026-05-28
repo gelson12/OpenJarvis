@@ -667,12 +667,20 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     try:
         from openjarvis.server.intent_preexec import maybe_preexecute
         _latest_user_for_preexec = ""
+        _history_for_preexec: list[str] = []
         if request_body.messages:
-            for _m in reversed(request_body.messages):
+            # Collect ALL user messages (most recent last) so the provider
+            # detector can look back if "Gmail" was mentioned earlier but
+            # not in the current fragment (Round 10.3).
+            for _m in request_body.messages:
                 if _m.role == "user" and _m.content:
-                    _latest_user_for_preexec = _m.content
-                    break
-        _preexec = maybe_preexecute(_latest_user_for_preexec)
+                    _history_for_preexec.append(_m.content)
+            if _history_for_preexec:
+                _latest_user_for_preexec = _history_for_preexec[-1]
+        _preexec = maybe_preexecute(
+            _latest_user_for_preexec,
+            history_texts=_history_for_preexec[:-1] if _history_for_preexec else None,
+        )
         if _preexec and _preexec.get("context_block"):
             from openjarvis.server.models import ChatMessage
             _msgs = list(request_body.messages)

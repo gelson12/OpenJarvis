@@ -47,7 +47,8 @@ import random
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
 from datetime import datetime, timedelta, timezone
 
@@ -743,9 +744,59 @@ def _clean_query(text: str) -> str:
 _NOISY_TOPIC_RE = re.compile(
     r"\b(?:fix\s+(?:that|this|it)|do\s+that|also[,]?|by\s+the\s+way|"
     r"never\s*mind|nevermind|stop|wait|hold\s+on|cancel|forget\s+it|"
-    r"hmm+|uh+|um+|like\s+i\s+said)\b",
+    r"hmm+|uh+|um+|like\s+i\s+said|"
+    # Round 10.2 — short refusal / clarification / filler fragments that
+    # the semantic turn-detector splits out as standalone "turns" and
+    # then leak into the search widget as ambient queries.
+    r"i\s+said|i\s+mean(?:t)?|i\s+don'?t|i\s+didn'?t|"
+    r"that'?s|that\s+is|that\s+was|"
+    r"what|sorry|huh|pardon|excuse\s+me|come\s+again|"
+    r"no\s+i\s+said|no\s+i\s+meant|nope|nah)\b",
     re.I,
 )
+
+# Standalone single-word fragments that are NEVER a real search query.
+# These slip past _NOISY_TOPIC_RE when they arrive alone (e.g. just "no"
+# after the LLM proposed something) so we reject them up front.
+_BARE_INTERJECTION_RE = re.compile(
+    r"^(?:no|yes|nope|yeah|nah|right|okay|ok|sure|hello|hi|hey|"
+    r"thanks|thank\s+you|cheers|cool|great|fine|bye|goodbye|"
+    r"you|um|uh|hmm|so|well|alright|got\s+it|understood)$",
+    re.I,
+)
+
+
+# Round 10.5 — STT-artifact guard. Used as a fast gate at the very top
+# of intent dispatchers BEFORE any regex runs. Catches truly empty,
+# 3-char-or-less, or single-word filler/STT-noise transcripts that
+# should never trigger widget side effects or a tool call. The text
+# still reaches the LLM (so the LLM can react if it WAS conversational
+# context), but no widget pops, no tool fires from regex matching.
+_STT_ARTIFACT_WORD_RE = re.compile(
+    r"^(?:you|ok|okay|um+|uh+|hmm+|right|so|yeah|yep|nope|nah|"
+    r"no|yes|hi|hey|hello|sorry|huh|what|like|well|alright|"
+    r"of|to|in|on|at|the|a|an|is|am|are|was|were|i|me|my|"
+    r"thank\s+you|thanks)$",
+    re.I,
+)
+
+
+def _is_stt_artifact(text: str) -> bool:
+    """True when `text` looks like STT noise, not a real user turn.
+
+    Conservative — only returns True for truly tiny fragments. The LLM
+    still receives them in conversation history; this only blocks regex
+    intent handlers from acting on them.
+    """
+    if not text:
+        return True
+    cleaned = text.strip().strip(".,!?;:'\"")
+    if not cleaned or len(cleaned) <= 3:
+        return True
+    words = cleaned.split()
+    if len(words) <= 1 and _STT_ARTIFACT_WORD_RE.match(cleaned):
+        return True
+    return False
 
 
 def _topic_looks_noisy(arg: str) -> bool:
@@ -755,6 +806,9 @@ def _topic_looks_noisy(arg: str) -> bool:
       - is suspiciously long (> 8 words / > 60 chars after cleaning)
       - contains an imperative fragment (`fix that` / `also,` / filler)
       - has 2+ commas (multi-clause sentence stitched into the topic)
+      - is a bare interjection (`no`, `yes`, `okay`, ...) -- Round 10.2
+      - is too short to be a search (<= 2 words AND <= 12 chars), unless
+        it's a clear proper noun (one capitalised word > 4 chars).
     """
     a = (arg or "").strip()
     if not a:
@@ -767,6 +821,20 @@ def _topic_looks_noisy(arg: str) -> bool:
         return True
     if _NOISY_TOPIC_RE.search(a):
         return True
+    if _BARE_INTERJECTION_RE.match(a):
+        return True
+    # Round 10.2 — short fragments don't constitute search queries.
+    words = a.split()
+    if len(words) <= 2 and len(a) <= 12:
+        # Allow a single capitalised proper noun > 4 chars
+        # (e.g. "Tesla", "Anthropic") through; reject everything else.
+        if not (
+            len(words) == 1
+            and len(words[0]) > 4
+            and words[0][0].isupper()
+            and words[0][1:].islower()
+        ):
+            return True
     return False
 
 
@@ -2342,6 +2410,16 @@ class Assistant(Agent):
         self._elab_task: asyncio.Task | None = None
         self._oj_base: str = ""
         self._oj_auth: dict = {}
+        # Round 10.6 — STT fragment reassembly. When the semantic turn-
+        # detector (or natural pauses) splits a single utterance into
+        # multiple "user turns" within a short window, we concatenate
+        # them for intent-regex matching so e.g. "tell me if I have any
+        # meeting schedule" + "in my calendar" + "For the Outlook
+        # account" gets dispatched as one coherent request. The LLM
+        # still sees them as separate turns in conversation history;
+        # this only affects regex intent detection.
+        self._last_user_text: str = ""
+        self._last_user_ts: float = 0.0
         # HUD widget inventory pushed from the frontend on jarvis-ui-state.
         # Stays [] until the first publish lands. `_open_widgets_at == 0.0`
         # means "no state ever received" — close-widget priority falls back
@@ -3321,6 +3399,44 @@ class Assistant(Agent):
             pass
         return True
 
+    def _reassemble_for_intent(self, text: str) -> str:
+        """Round 10.6 — concatenate the prior user fragment when both
+        landed within a short window (default 2.5s). Returns the merged
+        text for INTENT REGEX dispatch only; the LLM still receives the
+        original text untouched.
+
+        Behind ``OPENJARVIS_TRANSCRIPT_REASSEMBLY_ENABLED`` (default
+        true). Bounded to ~250 chars total to avoid pathological growth.
+        """
+        if os.environ.get(
+            "OPENJARVIS_TRANSCRIPT_REASSEMBLY_ENABLED", "true",
+        ).lower() not in ("1", "true", "yes", "on"):
+            self._last_user_text = text or ""
+            self._last_user_ts = time.time()
+            return text or ""
+        try:
+            window = float(os.environ.get(
+                "OPENJARVIS_TRANSCRIPT_REASSEMBLY_WINDOW_SEC", "2.5"))
+        except Exception:
+            window = 2.5
+        now = time.time()
+        prior = self._last_user_text or ""
+        gap = now - self._last_user_ts if self._last_user_ts else None
+        merged = text or ""
+        if prior and gap is not None and gap <= window:
+            # Merge — keep prior tail (avoid dups) and append current.
+            combined = (prior.rstrip(" .,;:") + " " + (text or "")).strip()
+            if len(combined) <= 250:
+                merged = combined
+                logger.info(
+                    "transcript-reassembly: merged prior fragment "
+                    "(gap=%.1fs, prior=%r, current=%r)",
+                    gap, prior[:40], (text or "")[:40],
+                )
+        self._last_user_text = text or ""
+        self._last_user_ts = now
+        return merged
+
     async def _maybe_handle_content(self, text: str) -> bool:
         """Handle search / video / news / maps / browser intents by regex.
 
@@ -3329,6 +3445,13 @@ class Assistant(Agent):
         web_search / search_youtube / show_news / show_map / open_browser
         methods, which never fire as LLM tools on an OpenJarvis backend.
         """
+        # Round 10.5 — drop empty / fragment transcripts BEFORE running any
+        # intent regex so single-word STT artifacts ("you", "ok", "no") can
+        # never fire the search widget. Returning True without dispatch
+        # would silence the LLM too; returning False here lets the (now
+        # short) text reach the LLM unchanged but blocks the widget path.
+        if _is_stt_artifact(text):
+            return False
         intent = _content_intent(text)
         if intent is None:
             return False
@@ -4656,22 +4779,53 @@ class Assistant(Agent):
         related video can be derived from the actual headlines) open a
         news-themed YouTube panel alongside.
 
+        Round 10.4: adds a 2-attempt retry and a durable cache so a
+        transient Google News RSS hiccup doesn't leave the user with a
+        bare "I couldn't reach the news feed" message.
+
         Args:
             topic: Optional subject to focus the news on (e.g.
                 "technology"). Leave empty for the top headlines.
-
-        Why this is shaped the way it is:
-          Previously this fetched YouTube with the raw user `topic` (or
-          "breaking news today" on empty), which routinely returned
-          unrelated content — a noisy STT turn would search YouTube for
-          "delay, fix that" and Elton John's catalogue would appear next
-          to the news panel. We now (a) skip YouTube entirely if there
-          are no real headlines, and (b) derive the YouTube query from
-          the top headline's TITLE, so the companion video is actually
-          on-topic.
         """
         topic = (topic or "").strip()
-        articles = await search_tools.news_search(topic, limit=8)
+
+        # Round 10.4 retry loop — Google News RSS occasionally 503s.
+        articles = []
+        last_exc: Optional[BaseException] = None
+        for attempt in range(2):
+            try:
+                articles = await search_tools.news_search(topic, limit=8)
+                if articles:
+                    break
+            except BaseException as exc:  # noqa: BLE001
+                last_exc = exc
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+
+        # Round 10.4 cache — if the live feed yielded nothing, fall back
+        # to the most recent cached headlines (durable on volume).
+        _home_base = os.environ.get("OPENJARVIS_HOME", "").strip()
+        cache_path = (
+            Path(_home_base) if _home_base else Path.home() / ".openjarvis"
+        ) / "news_cache.json"
+        served_from_cache = False
+        if not articles:
+            try:
+                if cache_path.exists():
+                    raw = json.loads(cache_path.read_text(encoding="utf-8"))
+                    ts = float(raw.get("ts", 0))
+                    cached = raw.get("articles") or []
+                    # 24h freshness window — old enough to be useful, not
+                    # so stale it's misleading.
+                    if cached and (time.time() - ts) <= 24 * 3600:
+                        articles = cached
+                        served_from_cache = True
+                        logger.info(
+                            "show_news: serving %d cached articles (age=%ds, exc=%s)",
+                            len(articles), int(time.time() - ts), last_exc,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("show_news: cache read failed: %s", exc)
 
         # News widget up front so the user has something to read while
         # we (maybe) fetch a related video.
@@ -4680,12 +4834,34 @@ class Assistant(Agent):
                 "type": "open_widget",
                 "kind": "news",
                 "title": f"News — {topic}" if topic else "Top Headlines",
-                "payload": {"query": topic, "articles": articles},
+                "payload": {
+                    "query": topic,
+                    "articles": articles,
+                    "cached": served_from_cache,
+                },
             }
         )
 
         if not articles:
             return "I couldn't reach the news feed just now, sir."
+
+        if served_from_cache:
+            # Inform the user we're serving stale content.
+            return (
+                "Showing the last-known headlines, sir — the live news feed "
+                "is briefly unavailable."
+            )
+
+        # Cache the fresh result for next time the feed is down.
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps({"ts": time.time(), "articles": articles},
+                           ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("show_news: cache write failed: %s", exc)
 
         # Derive a SAFE YouTube query from the top headline. Strip
         # source suffix (" - Reuters"), pipe-separated subtitle, and
@@ -5340,10 +5516,15 @@ class Assistant(Agent):
         if await self._maybe_handle_music(text):
             raise StopResponse()
 
+        # Round 10.6 — fragment reassembly for intent regex only.
+        # See _reassemble_for_intent docstring; the original `text` is
+        # still used for LLM context (untouched).
+        intent_text = self._reassemble_for_intent(text)
+
         # Screen content — search / video / news / maps / live browser.
         # Handled by regex (worker @function_tools never fire on
         # OpenJarvis); we speak our own confirmation, so stop the turn.
-        if await self._maybe_handle_content(text):
+        if await self._maybe_handle_content(intent_text):
             raise StopResponse()
 
         # Accommodation booking — search / book hotels via LiteAPI (Phase 1).
@@ -5616,12 +5797,29 @@ def _build_cascade_session(ctx: agents.JobContext) -> AgentSession:
         ),
         tts=tts,
     )
-    if _TURN_DETECTOR_AVAILABLE and _TurnDetectorEnglish is not None:
+    # Round 10.1 — semantic turn-detector defaults OFF.
+    # The c77ae8c-shipped EnglishModel() was over-segmenting natural pauses
+    # into separate turns ("tell me if I have any meeting schedule" /
+    # "in my calendar" / "For the Outlook account" as 3 turns), causing
+    # intent_preexec regexes to miss because they need noun+signal in a
+    # single utterance. Until thresholds are tuned, default to VAD-only
+    # endpointing (pre-c77ae8c behaviour). Flip the env to re-enable for
+    # tuning experiments without touching code.
+    _turn_det_enabled = os.environ.get(
+        "OPENJARVIS_TURN_DETECTOR_ENABLED", "false",
+    ).lower() in ("1", "true", "yes", "on")
+    if _turn_det_enabled and _TURN_DETECTOR_AVAILABLE and _TurnDetectorEnglish is not None:
         try:
             session_kwargs["turn_detection"] = _TurnDetectorEnglish()
             logger.info("turn-detector: EnglishModel active (semantic endpointing)")
         except Exception as exc:  # noqa: BLE001
             logger.warning("turn-detector init failed (%s) — VAD endpointing only", exc)
+    else:
+        logger.info(
+            "turn-detector: VAD-only endpointing "
+            "(OPENJARVIS_TURN_DETECTOR_ENABLED=%s)",
+            os.environ.get("OPENJARVIS_TURN_DETECTOR_ENABLED", "<unset>"),
+        )
     return AgentSession(**session_kwargs)
 
 

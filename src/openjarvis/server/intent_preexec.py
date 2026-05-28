@@ -243,9 +243,46 @@ _PREFER_OUTLOOK_RE = re.compile(r"\b(outlook|hotmail|office\s*365|microsoft)\b",
 _PREFER_GOOGLE_RE = re.compile(r"\b(google|gmail|gcal)\b", re.I)
 
 
-def _detect_calendar_intent(text: str) -> Optional[Dict[str, Any]]:
-    """Return {provider, start, end, window_label} when the user asks for
-    calendar data, else None."""
+def _detect_provider(
+    text: str,
+    *,
+    history_texts: Optional[List[str]] = None,
+    default: str = "outlook",
+    google_label: str = "google",
+) -> Tuple[str, bool]:
+    """Resolve calendar/email provider with history fallback.
+
+    Returns (provider, assumed) where `assumed=True` means the choice
+    was the default (neither current message nor history specified a
+    provider). Callers can surface this so the LLM knows to switch on
+    a follow-up.
+
+    Round 10.3: turn-detector fragmentation could land "Gmail" in one
+    utterance and the noun ("calendar") in the next. We now scan up to
+    the last 3 history user messages for provider hints before silently
+    defaulting to Outlook.
+    """
+    if _PREFER_OUTLOOK_RE.search(text):
+        return ("outlook", False)
+    if _PREFER_GOOGLE_RE.search(text):
+        return (google_label, False)
+    # History sweep — most-recent 3 user messages
+    if history_texts:
+        for h in reversed(history_texts[-3:]):
+            if not h:
+                continue
+            if _PREFER_GOOGLE_RE.search(h):
+                return (google_label, False)
+            if _PREFER_OUTLOOK_RE.search(h):
+                return ("outlook", False)
+    return (default, True)
+
+
+def _detect_calendar_intent(
+    text: str, *, history_texts: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return {provider, start, end, window_label, provider_assumed} when
+    the user asks for calendar data, else None."""
     if not text:
         return None
     # Narrow regex first (high confidence); fall back to broad sentence
@@ -258,17 +295,13 @@ def _detect_calendar_intent(text: str) -> Optional[Dict[str, Any]]:
         s, e = _today_window()
         window = ("today", s, e)
     label, start, end = window
-    if _PREFER_OUTLOOK_RE.search(text):
-        provider = "outlook"
-    elif _PREFER_GOOGLE_RE.search(text):
-        provider = "google"
-    else:
-        provider = "outlook"  # default
+    provider, assumed = _detect_provider(text, history_texts=history_texts)
     return {
         "provider": provider,
         "start": start,
         "end": end,
         "window_label": label,
+        "provider_assumed": assumed,
     }
 
 
@@ -322,7 +355,9 @@ def _email_broad_match(text: str) -> bool:
     return bool(_EMAIL_NOUN_RE.search(text) and _CALENDAR_SIGNAL_RE.search(text))
 
 
-def _detect_email_intent(text: str) -> Optional[Dict[str, Any]]:
+def _detect_email_intent(
+    text: str, *, history_texts: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
     if not text:
         return None
     # Narrow regex first; fall back to broad sentence match.
@@ -332,17 +367,17 @@ def _detect_email_intent(text: str) -> Optional[Dict[str, Any]]:
     m = _FROM_SENDER_RE.search(text)
     if m:
         sender = m.group(1).strip()
-    if _PREFER_OUTLOOK_RE.search(text):
-        provider = "outlook"
-    elif _PREFER_GOOGLE_RE.search(text):
-        provider = "gmail"
-    else:
-        provider = "outlook"
+    # Round 10.3 — history-aware provider with assumption flag.
+    # For email the Google brand uses 'gmail' as the provider label.
+    provider, assumed = _detect_provider(
+        text, history_texts=history_texts, google_label="gmail",
+    )
     is_unread = bool(re.search(r"\bunread\b", text, re.I))
     return {
         "provider": provider,
         "sender": sender,
         "is_unread": is_unread,
+        "provider_assumed": assumed,
     }
 
 
@@ -431,10 +466,20 @@ def _enabled() -> bool:
     )
 
 
-def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
+def maybe_preexecute(
+    latest_user_text: str,
+    *,
+    history_texts: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
     """If the user's latest message matches a known intent, execute the
     corresponding tool and return a context block to inject into the LLM
     prompt. Returns None when no intent matches.
+
+    `history_texts` is the optional list of prior user message contents
+    (most recent first or last — both supported; the provider detector
+    scans the tail). When provided, "Gmail" mentioned in a prior turn
+    will route a subsequent ambiguous "any meetings today?" to Google
+    instead of silently defaulting to Outlook (Round 10.3).
 
     Return shape:
         {
@@ -563,7 +608,7 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
             }
 
     # Calendar (hardcoded regex path)
-    cal = _detect_calendar_intent(text)
+    cal = _detect_calendar_intent(text, history_texts=history_texts)
     if cal:
         if cal["provider"] == "outlook":
             tool_name = "outlook_list_events"
@@ -588,6 +633,18 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
                 "     the list above and answer with its date + subject.\n"
                 "     Do not list every event unless asked.\n"
             )
+        # Round 10.3 — surface the provider-assumption flag so the LLM
+        # knows to switch on a follow-up if the user actually wanted the
+        # other provider.
+        assumption_note = ""
+        if cal.get("provider_assumed"):
+            assumption_note = (
+                f"  7. PROVIDER ASSUMPTION: defaulted to {cal['provider']} "
+                "because the user did not name a provider and there was no\n"
+                "     hint in recent history. If the user follows up naming\n"
+                "     Google/Gmail/Outlook, SWITCH and re-run the appropriate\n"
+                "     calendar tool — do NOT say you can't.\n"
+            )
         block = (
             f"PRE-EXECUTED TOOL RESULT (from {tool_name}, window: "
             f"{cal['window_label']}):\n{result}\n\n"
@@ -605,6 +662,7 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
             "  5. If the result shows no events, say so honestly\n"
             "     ('No meetings on your calendar today, sir.').\n"
             f"{past_nudge}"
+            f"{assumption_note}"
         )
         logger.info(
             "intent_preexec.calendar served via %s window=%s",
@@ -613,7 +671,7 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
         return {"tool_name": tool_name, "result": result, "context_block": block}
 
     # Email
-    eml = _detect_email_intent(text)
+    eml = _detect_email_intent(text, history_texts=history_texts)
     if eml:
         if eml["provider"] == "outlook":
             tool_name = "outlook_list_messages"
@@ -628,6 +686,15 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
             return None
         sender_part = f" (sender filter: {eml['sender']})" if eml["sender"] else ""
         unread_part = " (unread only)" if eml["is_unread"] else ""
+        # Round 10.3 — provider-assumption nudge for email too.
+        assumption_note = ""
+        if eml.get("provider_assumed"):
+            assumption_note = (
+                f"  6. PROVIDER ASSUMPTION: defaulted to {eml['provider']} "
+                "because the user did not name a provider. If they follow up\n"
+                "     naming Google/Gmail/Outlook, SWITCH and re-run the\n"
+                "     appropriate email tool instead of disavowing.\n"
+            )
         block = (
             f"PRE-EXECUTED TOOL RESULT (from {tool_name}{sender_part}"
             f"{unread_part}):\n{result}\n\n"
@@ -641,7 +708,8 @@ def maybe_preexecute(latest_user_text: str) -> Optional[Dict[str, Any]]:
             "     'I don't have a tool for that' — you DO have it and\n"
             "     you just used it.\n"
             "  5. If the result is empty, say so honestly ('No matching\n"
-            "     emails, sir.')."
+            "     emails, sir.').\n"
+            f"{assumption_note}"
         )
         logger.info(
             "intent_preexec.email served via %s sender=%s unread=%s",
