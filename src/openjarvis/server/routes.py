@@ -2501,11 +2501,32 @@ def _fire_post_turn_hooks_safe(*, request, latest_user_text: str,
     # promoter daemon reads these events, clusters by category + phrasing,
     # and auto-promotes new patterns into intent_preexec so the same
     # query bypasses the LLM entirely on subsequent turns.
+    _disavow_event = None
     try:
         from openjarvis.server import disavowal_detector as _dd
-        _dd.record_if_disavowal(
+        _disavow_event = _dd.record_if_disavowal(
             user_text=latest_user_text,
             assistant_text=assistant_text,
+            session_id=session_id,
+        )
+    except Exception:
+        _disavow_event = None
+
+    # Round 20 Piece 4 — OUTCOME LOGGER. Record this turn so the
+    # tool router can learn which tools work for which kinds of
+    # queries. Tool-call detection is best-effort: the response text
+    # may or may not have surfaced a tool_calls field upstream; we
+    # log what we can see. The disavowal signal is the inverse —
+    # negative reward when the LLM refused a capability it should
+    # have had.
+    try:
+        from openjarvis.server import outcome_logger as _ol
+        _ol.record_turn(
+            query=latest_user_text,
+            tools_offered=None,
+            tool_called=None,
+            tool_success=None,
+            llm_disavowed=bool(_disavow_event),
             session_id=session_id,
         )
     except Exception:

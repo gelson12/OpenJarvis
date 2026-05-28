@@ -511,6 +511,15 @@ def _probe_tool_router() -> Dict[str, Any]:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _probe_outcome_logger() -> Dict[str, Any]:
+    """Round 20 Piece 4 — outcome logger + tool-affinity reward map."""
+    try:
+        from openjarvis.server import outcome_logger as _ol
+        return _ol.snapshot()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -547,6 +556,8 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
     learning_mirrors_block = _probe_learning_mirrors()
     # Round 20 Piece 1 — embedding-based tool router
     tool_router_block = _probe_tool_router()
+    # Round 20 Piece 4 — outcome logger + reward shaping
+    outcome_logger_block = _probe_outcome_logger()
 
     return {
         "_timestamp": datetime.now(timezone.utc).isoformat(),
@@ -578,6 +589,7 @@ async def debug_agentic(request: Request) -> Dict[str, Any]:
         "learning_mirrors": learning_mirrors_block,
         # Round 20 — autonomous architecture
         "tool_router": tool_router_block,
+        "outcome_logger": outcome_logger_block,
     }
 
 

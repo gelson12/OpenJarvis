@@ -37,21 +37,31 @@ def router_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 class _FakeEmbedder:
     """Deterministic stub embedder: hashes tokens into a small vector
-    so semantically-similar phrases share dimensions. Good enough for
-    unit-testing ranking without the real model."""
+    so semantically-similar phrases share dimensions. Uses hashlib for
+    cross-process determinism — Python's built-in hash() is randomised
+    per process. Good enough for unit-testing ranking without the real
+    model."""
 
-    def __init__(self, dim: int = 16) -> None:
+    def __init__(self, dim: int = 32) -> None:
         self._dim = dim
 
     def dim(self) -> int:
         return self._dim
 
+    @staticmethod
+    def _hash_tok(tok: str, mod: int) -> int:
+        import hashlib
+        return int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16) % mod
+
     def embed(self, texts: List[str]) -> Any:
+        import re
         import numpy as np
         out = np.zeros((len(texts), self._dim), dtype=np.float32)
         for i, t in enumerate(texts):
-            for tok in (t or "").lower().split():
-                bucket = hash(tok) % self._dim
+            # Split on non-word characters so "tool_list_events." and
+            # "tool list events" both tokenize the same way.
+            for tok in re.findall(r"[a-z0-9]+", (t or "").lower()):
+                bucket = self._hash_tok(tok, self._dim)
                 out[i, bucket] += 1.0
         # L2-normalise
         norms = np.linalg.norm(out, axis=1, keepdims=True)

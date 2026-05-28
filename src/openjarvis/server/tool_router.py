@@ -327,6 +327,22 @@ def rank_tools_for_query(
         q_n = _norm(q)
         t_n = _norm(_TOOL_EMBEDDINGS)
         scores = (t_n @ q_n.T).flatten()  # (N,)
+        # Round 20 Piece 4 — outcome-driven affinity bias. Tools that
+        # historically succeeded for queries in this same bucket get
+        # a score lift; tools that flopped get a penalty. Pure semantic
+        # similarity is the prior; outcomes are the update.
+        try:
+            from openjarvis.server import outcome_logger as _ol
+            weight = float(os.environ.get(
+                "OPENJARVIS_OUTCOME_AFFINITY_BIAS_WEIGHT", "0.3",
+            ))
+            weight = max(0.0, min(1.0, weight))
+            if weight > 0.0:
+                for i, name in enumerate(_TOOL_NAMES):
+                    bias = _ol.affinity_bias_for_tool(query, name)
+                    scores[i] = scores[i] + weight * bias
+        except Exception:
+            pass
         k = top_k if top_k is not None else _top_k_default()
         k = max(1, min(k, len(_TOOL_NAMES)))
         # Get top-K indices

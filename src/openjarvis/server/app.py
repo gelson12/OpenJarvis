@@ -397,6 +397,17 @@ def create_app(
     except Exception as _exc:
         logger.warning("learning_pg.rehydrate failed: %s", _exc)
 
+    # Round 20 Piece 4 — outcome-logger daemon. Periodically recomputes
+    # the (query_bucket, tool) success-rate map that the tool router
+    # reads to bias its ranking. This is the reward signal that closes
+    # the self-improvement loop visibly: which tools work for which
+    # queries gets reinforced over time.
+    try:
+        from openjarvis.server import outcome_logger as _ol
+        _ol.start_daemon()
+    except Exception as _exc:
+        logger.warning("outcome_logger daemon failed to start: %s", _exc)
+
     # Restore SendBlue channel bindings from database on startup
     _restore_sendblue_bindings(app)
 
