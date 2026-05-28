@@ -439,9 +439,17 @@ def _run_calendar_list_events(start: str, end: str) -> Optional[str]:
                     content2 = getattr(result2, "content", None) or str(result2)
                     success2 = bool(getattr(result2, "success", True))
                     if success2 and content2 and "error" not in content2[:60].lower():
+                        # Round 18.1 — original prefix said "Google
+                        # account: BRIDGE" which the LLM mis-read as a
+                        # tool name `google_bridge` and tried to call
+                        # it 4-5 times before timing out (~5 min hang).
+                        # Reworded to be a plain English note that
+                        # contains nothing resembling a tool identifier.
                         return (
-                            "[Google account: BRIDGE — your primary "
-                            "account isn't OAuth-authorized yet]\n" + content2
+                            "[NOTE: returned data is from the user's "
+                            "secondary Google account. Primary Google "
+                            "is not OAuth-authorized; no action needed.]\n"
+                            + content2
                         )
                     # Round 16.3 — bridge ALSO failed (e.g. expired
                     # refresh token returning 400). Surface that fact
@@ -783,6 +791,18 @@ def maybe_preexecute(
             "     for that' — you DO have it and you JUST used it.\n"
             "  5. If the result shows no events, say so honestly\n"
             "     ('No meetings on your calendar today, sir.').\n"
+            # Round 18.2 — anti-hallucination for tool-name invention.
+            # Production transcript showed the LLM inventing a function
+            # called `google_bridge` (extracted from a previous prefix
+            # note) and calling it 4-5 times until the framework hit
+            # max-function-call steps. That caused a ~5-minute hang.
+            "  6. Do NOT invent or call any function whose name was not\n"
+            "     listed in your tool schema. In particular, names like\n"
+            "     `google_bridge`, `outlook_bridge`, `calendar_bridge`\n"
+            "     do NOT exist — ANY hint of a 'bridge' / 'secondary'\n"
+            "     account in the result above is descriptive METADATA,\n"
+            "     not a tool you should call. The data is already here;\n"
+            "     just summarise it and stop.\n"
             f"{past_nudge}"
             f"{assumption_note}"
         )
@@ -831,6 +851,11 @@ def maybe_preexecute(
             "     you just used it.\n"
             "  5. If the result is empty, say so honestly ('No matching\n"
             "     emails, sir.').\n"
+            # Round 18.2 — same anti-hallucination guard as calendar.
+            "  6. Do NOT invent or call functions named `google_bridge`,\n"
+            "     `gmail_bridge`, `outlook_bridge`, etc. — they do NOT\n"
+            "     exist. Any 'bridge' / 'secondary account' note in the\n"
+            "     result is descriptive METADATA, not a tool to call.\n"
             f"{assumption_note}"
         )
         logger.info(
