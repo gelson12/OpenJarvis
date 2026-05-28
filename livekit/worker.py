@@ -815,7 +815,23 @@ _USER_COMPLAINT_RE = re.compile(
     r"how\s+come|why\s+only|"
     r"you\s+didn'?t|you\s+haven'?t|you\s+(?:never|still)|"
     r"are\s+you\s+(?:there|listening|hearing)|"
-    r"did\s+you\s+(?:hear|get|catch|see)\s+(?:what|that|me)"
+    r"did\s+you\s+(?:hear|get|catch|see)\s+(?:what|that|me)|"
+    # Round 14.2 — voice transcript surfaced these as common complaints
+    # that previously fell through to the web-search router as bare
+    # noise topics. Treat them as conversational so the LLM answers,
+    # not the search widget.
+    r"too\s+many\s+(?:widgets?|panels?|box(?:es)?|windows?|things|tabs|"
+    r"of\s+(?:them|those))|"
+    r"too\s+much\s+(?:going\s+on|stuff|noise|clutter)|"
+    r"that'?s\s+(?:not|wrong|incorrect|crazy)|"
+    r"that\s+is\s+(?:not|wrong|incorrect|crazy)|"
+    r"(?:that'?s|this\s+is|it'?s)\s+(?:crazy|wild|nuts|ridiculous|"
+    r"frustrating|annoying|pissing\s+me\s+off|too\s+much)|"
+    r"(?:no\s+)?(?:that'?s|that\s+is)\s+not\s+what|"
+    # Bare "I asked" / "I said" / "what I asked is" — voice users say
+    # these only when correcting Jarvis. Don't gate on trailing word.
+    r"(?:what\s+)?i\s+(?:asked|said|told\s+you)|"
+    r"recheck|re-check|check\s+(?:that|this|again)"
     r")\b",
     re.I,
 )
@@ -825,6 +841,52 @@ def _looks_like_complaint(text: str) -> bool:
     """True when the user's turn is a complaint / meta-question about
     Jarvis's behaviour, not a fresh content request."""
     return bool(_USER_COMPLAINT_RE.search(text or ""))
+
+
+# Round 14.1 — pivot detector. If a content clarification is pending
+# but the user's next utterance clearly matches a DIFFERENT intent
+# (calendar, email, music, desktop, volume, accommodation, system meta),
+# we abandon the clarification rather than treat the new utterance as
+# a web/news/etc. topic. Captures the common pivot pattern: noisy news
+# request -> clarification -> user gives up and asks about something
+# else entirely.
+_PIVOT_INTENT_HINTS = (
+    # Calendar / meetings
+    r"\bcalend(?:ar|er)\b",
+    r"\b(?:meet|meeting|meetings|appointment|appointments|event|events|"
+    r"schedule[d]?|agenda|booking|bookings)\b",
+    # Email
+    r"\b(?:email|emails|mail|inbox|messages?|outlook|gmail)\b",
+    # Music
+    r"\b(?:play|pause|skip|song|music|track|tune|volume|mute|unmute)\b",
+    # Desktop
+    r"\b(?:laptop|rog|pc|computer|machine|file|folder|directory|"
+    r"download|notepad|chrome|firefox|edge|spotify|word|excel|"
+    r"shutdown|restart|reboot|lock|sleep|screen|wallpaper|"
+    r"recycle|bin|process|task|disk|memory|cpu)\b",
+    # Accommodation
+    r"\b(?:hotel|hotels|airbnb|hostel|motel|inn|villa|guest\s*house|"
+    r"resort|condo|stay|book|rent)\b",
+    # System meta / control
+    r"\b(?:close|cancel|stop|never\s*mind|nevermind|forget|enough|"
+    r"too\s+many|widgets?|panels?|box(?:es)?|windows?)\b",
+    # Camera / gesture
+    r"\b(?:camera|gesture|webcam)\b",
+)
+_PIVOT_INTENT_RE = re.compile(
+    r"|".join(_PIVOT_INTENT_HINTS), re.I,
+)
+
+
+def _looks_like_fresh_intent(text: str) -> bool:
+    """True when `text` clearly matches a non-content intent (calendar,
+    email, music, desktop, etc.) and should NOT be treated as a topic
+    reply to a pending content clarification."""
+    if not text:
+        return False
+    if _USER_COMPLAINT_RE.search(text):
+        return True
+    return bool(_PIVOT_INTENT_RE.search(text))
 
 
 # Round 12.2 — generic-news topic detector.
@@ -3094,6 +3156,24 @@ class Assistant(Agent):
         # the answer, in full sentence form. We pass `text` straight to
         # the resumer, which re-extracts the topic.
         if pc.intent_kind == "content":
+            # Round 14.1 — DON'T hijack a turn that's clearly a fresh
+            # intent. Before this guard, a sequence like
+            #   user: "show me the news"   -> noisy -> web clarification
+            #   user: "check my calendar"  -> treated as web topic ->
+            #          "I couldn't find anything for 'check my calendar'"
+            # was the failure pattern. If the new turn matches any of
+            # calendar / email / volume / desktop / music / cancel /
+            # complaint, abandon the clarification silently and let the
+            # rest of the dispatcher chain handle it normally.
+            if _looks_like_fresh_intent(text):
+                logger.info(
+                    "clarification.content: abandoned — new text looks "
+                    "like a fresh intent: %r",
+                    text[:80],
+                )
+                self._pending_clarification = None
+                return False  # let normal dispatch handle the new intent
+
             captured = pc
             self._pending_clarification = None
             resumer = self._clarification_resumers.get("content")
