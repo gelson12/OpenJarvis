@@ -3367,23 +3367,31 @@ class Assistant(Agent):
                 continue
             title = (w.get("title") or wkind).strip() or wkind
             match_words = {wkind, title.lower()}
+            # Round 22 — REMOVED "panel" from every widget's match_words.
+            # Production transcript: user said "reduce the volume of the
+            # video news", both YouTube and news widgets matched (each
+            # had "panel" in its set), then user clarified with "Panel."
+            # and the disambiguator picked the WRONG widget (news instead
+            # of the YouTube video they actually wanted). Generic words
+            # like "panel" should never disambiguate — force the user to
+            # use the SPECIFIC widget word (news/video/youtube/music/etc.).
             if wkind == "youtube":
-                match_words.update({"youtube", "video", "the video", "panel"})
+                match_words.update({"youtube", "video", "the video"})
                 # The companion YouTube widget that `show_news` opens has
                 # title prefixed "News Video — …". If we see that, also
                 # match on news/headlines so "mute the news" routes here.
                 if title.lower().startswith("news video"):
                     match_words.update({"news", "headlines", "the news"})
             elif wkind == "music":
-                match_words.update({"music", "the music", "panel"})
+                match_words.update({"music", "the music"})
             elif wkind == "browser":
-                match_words.update({"browser", "the browser", "panel"})
+                match_words.update({"browser", "the browser"})
             elif wkind == "news":
                 # The headlines panel itself is silent; the audio comes
                 # from the companion YouTube widget (matched separately).
                 # But the user says "mute the news" so we still want this
                 # candidate to appear in the disambiguation list.
-                match_words.update({"news", "headlines", "the news", "panel"})
+                match_words.update({"news", "headlines", "the news"})
             candidates.append({
                 "label": title if wkind != "youtube" else "YouTube",
                 "target_kind": "widget",
