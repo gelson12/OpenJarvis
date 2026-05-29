@@ -381,8 +381,16 @@ _CALENDAR_SIGNAL_RE = re.compile(
     r"is\s+there|are\s+there|"
     # question words paired with calendar
     r"what(?:'s|\s+is|\s+was|\s+were)?\s+(?:on|in|scheduled|my|the|"
-    r"last|previous|most\s+recent|recent)|"
+    r"last|previous|most\s+recent|recent|about)|"
     r"when\s+(?:is|was|did)|which\s+(?:day|time)|"
+    # Round 21 — conversational follow-ups: "what about", "how about",
+    # "any (meetings/events) (on/for)" cover the natural-speech ways
+    # users pivot between providers ("Outlook? OK. What about my
+    # Gmail calendar?"). Without these the calendar broad-match
+    # silently misses and the LLM falls through to disavowal.
+    r"what\s+about|how\s+about|"
+    r"any\s+(?:meeting|meetings|appointment|appointments|event|events|"
+    r"booking|bookings)(?:\s+(?:on|for|in|today|tomorrow))?|"
     # strong time anchors (any of these next to a calendar noun is decisive)
     r"today|tomorrow|tonight|"
     r"this\s+(?:morning|afternoon|evening|week)|"

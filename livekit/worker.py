@@ -1136,6 +1136,21 @@ def _content_intent(text: str):
             r"to\s+|for\s+|on\s+|of\s+"
             r")\s*", "", q, flags=re.I,
         ).strip(" .,;:!?'\"")
+        # Round 21 — strip TRAILING orphan prepositions ("the latest
+        # news on" -> "the latest news"). The production transcript
+        # showed "Open YouTube and show me the latest news on /
+        # global news." getting split by STT; the first fragment
+        # ended with the bare preposition "on" and the topic looked
+        # noisy enough to clarify. Also strip duplicate filler when
+        # users say "news on global news" — the second "news" is
+        # filler; collapse to "global news".
+        q = re.sub(
+            r"\s+(?:on|for|about|of|in|with|to|by)\s*$",
+            "", q, flags=re.I,
+        ).strip(" .,;:!?'\"")
+        # If the cleaned-up topic now ends in "news" preceded by a
+        # NON-trivial qualifier ("world news", "tech news"), keep the
+        # qualifier+news; otherwise generic "news" alone is a filler.
         return ("youtube", q)
 
     if _NEWS_RE.search(low) and (_CONTENT_VERB.search(low) or "headlines" in low):
