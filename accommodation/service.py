@@ -86,18 +86,35 @@ class AccommodationService:
             tuple(sorted(query.preferred_providers)),
         )
 
+    @property
+    def last_search_all_providers_failed(self) -> bool:
+        """True when the most recent (uncached) search reached zero providers
+        successfully — i.e. an infrastructure outage, not an empty market.
+        The voice layer reads this to tell the difference between
+        "I couldn't reach the booking services" and "no stays available".
+        Cached hits set this False (a cache hit means a prior search worked).
+        """
+        return getattr(self.aggregator, "last_all_providers_failed", False)
+
     async def search(self, query: SearchQuery, limit: int = 20) -> list[Property]:
         key = self._cache_key(query)
         now = time.monotonic()
         cached = self._search_cache.get(key)
         if cached and cached.expires_at > now:
+            # A cache hit is by definition a prior successful search.
+            self.aggregator.last_attempted = 0
+            self.aggregator.last_failed = 0
             return cached.properties[:limit]
         properties = await self.aggregator.search(query, limit_per_provider=limit)
         # Sort by price ascending — voice surfaces "cheapest first" by default.
         properties.sort(key=lambda p: p.price_total)
-        self._search_cache[key] = _CacheEntry(
-            expires_at=now + _SEARCH_CACHE_TTL_S, properties=properties
-        )
+        # Never cache a total-outage result: a retry seconds later would then
+        # masquerade as a genuine "no stays" answer. Only successful searches
+        # (even legitimately empty ones) get cached.
+        if not self.last_search_all_providers_failed:
+            self._search_cache[key] = _CacheEntry(
+                expires_at=now + _SEARCH_CACHE_TTL_S, properties=properties
+            )
         # Bound cache size — discard expired entries occasionally.
         if len(self._search_cache) > 64:
             self._search_cache = {

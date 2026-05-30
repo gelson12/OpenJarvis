@@ -1,9 +1,14 @@
-"""Tests for the dedup logic in the aggregator."""
+"""Tests for the dedup logic and provider-health signal in the aggregator."""
 
 from __future__ import annotations
 
-from accommodation.aggregator import dedup
-from accommodation.models import Property
+from datetime import date, timedelta
+
+import pytest
+
+from accommodation.aggregator import Aggregator, dedup
+from accommodation.models import Property, SearchQuery
+from accommodation.providers.base import ProviderError
 
 
 def _p(provider: str, name: str, lat: float, lng: float, price: float) -> Property:
@@ -44,3 +49,57 @@ def test_dedup_keeps_different_buildings_same_address():
     ]
     out = dedup(properties)
     assert len(out) == 2
+
+
+# ── Provider-health signal: outage must NOT read as "no listings" ────────
+
+
+class _FakeProvider:
+    def __init__(self, pid: str, *, fail: bool, results=None):
+        self.id = pid
+        self._fail = fail
+        self._results = results or []
+
+    @property
+    def can_book(self) -> bool:
+        return True
+
+    async def search(self, query, limit: int = 20):
+        if self._fail:
+            raise ProviderError("Name or service not known")
+        return self._results
+
+    async def aclose(self):
+        pass
+
+
+def _query() -> SearchQuery:
+    today = date(2026, 6, 1)
+    return SearchQuery(location="Lisbon", check_in=today, check_out=today + timedelta(days=2))
+
+
+@pytest.mark.asyncio
+async def test_all_providers_failed_flag_set_on_total_outage():
+    agg = Aggregator([_FakeProvider("liteapi", fail=True),
+                      _FakeProvider("apify_airbnb", fail=True)])
+    out = await agg.search(_query())
+    assert out == []
+    assert agg.last_all_providers_failed is True  # honest: outage, not empty
+
+
+@pytest.mark.asyncio
+async def test_partial_failure_is_not_total_outage():
+    good = _p("liteapi", "Hotel", 38.7, -9.1, 100)
+    agg = Aggregator([_FakeProvider("liteapi", fail=False, results=[good]),
+                      _FakeProvider("apify_airbnb", fail=True)])
+    out = await agg.search(_query())
+    assert len(out) == 1
+    assert agg.last_all_providers_failed is False
+
+
+@pytest.mark.asyncio
+async def test_genuine_empty_is_not_an_outage():
+    agg = Aggregator([_FakeProvider("liteapi", fail=False, results=[])])
+    out = await agg.search(_query())
+    assert out == []
+    assert agg.last_all_providers_failed is False  # market empty, not down

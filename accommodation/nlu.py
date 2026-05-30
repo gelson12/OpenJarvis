@@ -132,22 +132,65 @@ _LOCATION_TRIP_RE = re.compile(
 # ── Public API ───────────────────────────────────────────────────────
 
 
+# Leading filler the anchor regex can accidentally swallow. STT often
+# doubles prepositions ("in in Lisbon"), and "in any of your sources" must
+# NOT parse as a city named "Any Of Your Sources".
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:in|at|on|near|around|to|the|a|an|some|somewhere|place|places)\s+",
+    re.I,
+)
+# Phrases that are clearly NOT a place even though they follow an anchor.
+# A captured location that reduces to one of these (after filler-stripping)
+# is rejected so we ask "which city?" instead of inventing a destination.
+_NON_PLACE_TOKENS = {
+    "", "any", "anywhere", "any of your sources", "your sources", "sources",
+    "any other sources", "other sources", "any source", "stock", "mind",
+    "fact", "general", "town", "city", "area", "the area", "rent", "let",
+    "the morning", "the afternoon", "the evening", "your records",
+}
+
+
+def _clean_location(raw: str) -> str:
+    """Strip leading filler/prepositions and reject obvious non-places.
+
+    "in Lisbon" -> "Lisbon" ; "any of your sources" -> "" (rejected).
+    """
+    s = (raw or "").strip().rstrip(".,?!").strip()
+    # Strip leading filler repeatedly: "in in Lisbon" -> "Lisbon".
+    prev = None
+    while s and s != prev:
+        prev = s
+        s = _LEADING_FILLER_RE.sub("", s).strip()
+    if s.lower() in _NON_PLACE_TOKENS:
+        return ""
+    # Reject captures that are entirely stop-words ("your sources").
+    words = s.lower().split()
+    if words and all(
+        w in {"any", "of", "your", "other", "the", "my", "some", "sources",
+              "source", "a", "an", "place", "places", "stuff", "things"}
+        for w in words
+    ):
+        return ""
+    return s.title()
+
+
 def parse_location(text: str) -> str:
     """Extract city/area noun-phrase. Returns the LAST match so that
     "find me somewhere ... in Lisbon" returns Lisbon (rather than an
     earlier red-herring "in" phrase).
 
     Falls back to "trip/going/visit to <Place>" when no primary
-    `in/at/near/around` anchor exists.
+    `in/at/near/around` anchor exists. Leading filler ("in in Lisbon") is
+    stripped and non-place captures ("any of your sources") are rejected so
+    we ask for a real city instead of inventing one.
     """
     if not text:
         return ""
-    matches = _LOCATION_PRIMARY_RE.findall(text)
-    if matches:
-        return matches[-1].strip().rstrip(".,?!").title()
-    matches = _LOCATION_TRIP_RE.findall(text)
-    if matches:
-        return matches[-1].strip().rstrip(".,?!").title()
+    for pattern in (_LOCATION_PRIMARY_RE, _LOCATION_TRIP_RE):
+        for raw in reversed(pattern.findall(text)):
+            cleaned = _clean_location(raw)
+            if cleaned:
+                return cleaned
     return ""
 
 

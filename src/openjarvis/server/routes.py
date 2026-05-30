@@ -487,6 +487,46 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     agent = getattr(request.app.state, "agent", None)
     model = request_body.model
 
+    # ═══════════════════════════════════════════════════════════════════
+    # KERNEL — the single deterministic authority (replaces the old
+    # "inject data + ABSOLUTE INSTRUCTIONS + anti-disavow guard + hope"
+    # stack). For data capabilities the user actually asked for (calendar,
+    # email, …) the kernel executes the real tool, honours its success
+    # flag, and returns a final answer built from real data. The LLM is
+    # bypassed entirely, so it CANNOT disavow a capability that exists, and
+    # there is no tool-loop to stall (the cause of the multi-minute
+    # silences). A tool failure is spoken as an honest ERROR — never a
+    # fabricated "you have no meetings". Kill-switch:
+    # OPENJARVIS_KERNEL_ENABLED=false.
+    if os.getenv("OPENJARVIS_KERNEL_ENABLED", "true").lower() in ("1", "true", "yes", "on"):
+        try:
+            from openjarvis import kernel as _kernel
+            from openjarvis.kernel import sse as _kernel_sse
+            _latest_user_kernel = ""
+            for _m in reversed(request_body.messages or []):
+                if _m.role == "user" and _m.content:
+                    _latest_user_kernel = _m.content
+                    break
+            _outcome = _kernel.resolve(_latest_user_kernel)
+            if _outcome.is_final:
+                logging.getLogger("openjarvis.server").warning(
+                    "openjarvis.kernel.served capability=%s status=%s msg=%r",
+                    _outcome.capability, _outcome.status.value, _outcome.message[:120],
+                )
+                _fire_post_turn_hooks_safe(
+                    request=request,
+                    latest_user_text=_latest_user_kernel,
+                    assistant_text=_outcome.message,
+                    complexity_info=None,
+                )
+                if request_body.stream:
+                    return _kernel_sse.as_stream(_outcome, model)
+                return _kernel_sse.as_response(_outcome, model)
+        except Exception as _kexc:
+            logging.getLogger("openjarvis.server").debug(
+                "kernel resolve skipped: %s", _kexc,
+            )
+
     # Round 7g — DAILY SELF-REPORT. On the first chat turn of a new UTC
     # day, surface yesterday's self-improvement metrics (disavowals
     # detected, intent patterns auto-promoted, skills proposed) as a
@@ -706,6 +746,34 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     except Exception as _pe_exc:
         logging.getLogger("openjarvis.server").debug(
             "intent_preexec skipped: %s", _pe_exc,
+        )
+
+    # KERNEL MANIFEST — ground truth for the LLM passthrough path. We reach
+    # here only when no data capability claimed the turn, so the LLM is now
+    # answering. Hand it a factual list of what the assistant can really do,
+    # so even open conversation can never disavow a real capability ("I don't
+    # have a tool for that"). This is the structural replacement for the
+    # scattered anti-disavow guards.
+    try:
+        from openjarvis import kernel as _kernel_manifest
+        _manifest_block = _kernel_manifest.manifest()
+        if _manifest_block and request_body.messages:
+            from openjarvis.server.models import ChatMessage
+            _msgs = list(request_body.messages)
+            _insert_at = 0
+            for _i, _m in enumerate(_msgs):
+                if _m.role != "system":
+                    break
+                _insert_at = _i + 1
+            _msgs.insert(
+                _insert_at,
+                ChatMessage(role="system", content=_manifest_block, name=None,
+                            tool_call_id=None),
+            )
+            request_body.messages = _msgs
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "kernel manifest inject failed", exc_info=True,
         )
 
     # Round 6 — inject a "you have these integrations" system message so

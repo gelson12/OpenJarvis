@@ -65,12 +65,27 @@ class Aggregator:
     """Fan-out search across the registered providers in parallel.
     Single-provider failures are logged and skipped, never propagated — a
     booking-search shouldn't crash because one supplier had a bad day.
+
+    BUT a crucial distinction is preserved end-to-end: after every search,
+    ``last_all_providers_failed`` records whether EVERY attempted provider
+    errored. A total outage ("Name or service not known" from both LiteAPI
+    and Apify) is NOT the same as "there are genuinely no listings", and the
+    voice layer must say so honestly instead of "no houses to rent in Lisbon".
     """
 
     def __init__(self, providers: list[Provider]):
         if not providers:
             raise ValueError("Aggregator needs at least one provider")
         self.providers = providers
+        # Health of the most recent search — read by the caller to choose
+        # between an honest ERROR and a genuine EMPTY result.
+        self.last_attempted: int = 0
+        self.last_failed: int = 0
+        self.last_errors: list[str] = []
+
+    @property
+    def last_all_providers_failed(self) -> bool:
+        return self.last_attempted > 0 and self.last_failed >= self.last_attempted
 
     async def search(self, query: SearchQuery, limit_per_provider: int = 20) -> list[Property]:
         preferred = set(query.preferred_providers)
@@ -81,6 +96,9 @@ class Aggregator:
         )
         if not active:
             active = self.providers
+        self.last_attempted = len(active)
+        self.last_failed = 0
+        self.last_errors = []
         results = await asyncio.gather(
             *(self._safe_search(p, query, limit_per_provider) for p in active),
             return_exceptions=False,
@@ -95,9 +113,13 @@ class Aggregator:
             return await provider.search(query, limit=limit)
         except ProviderError as e:
             _log.warning("provider %s search failed: %s", provider.id, e)
+            self.last_failed += 1
+            self.last_errors.append(f"{provider.id}: {e}")
             return []
         except Exception as e:  # noqa: BLE001
             _log.exception("provider %s crashed: %s", provider.id, e)
+            self.last_failed += 1
+            self.last_errors.append(f"{provider.id}: {e}")
             return []
 
     def get(self, provider_id: str) -> Provider:

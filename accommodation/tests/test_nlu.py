@@ -52,6 +52,28 @@ def test_location_show_me_houses_to_rent():
     assert parse_location("show me all the available houses to rent in Lisbon") == "Lisbon"
 
 
+# ── Regression: bug from live voice test 2026-05-29 ──────────────────────
+#    STT doubled the preposition ("in in Lisbon") so the parser captured
+#    "in Lisbon" and the widget showed "Stays in In Lisbon". And the
+#    follow-up "in any of your sources" was parsed as a city called
+#    "Any Of Your Sources". The kernel-grade parser strips leading filler
+#    and rejects non-place captures.
+
+
+def test_location_doubled_preposition():
+    assert parse_location("any accommodation to rent in in Lisbon for this weekend") == "Lisbon"
+
+
+def test_location_triple_preposition():
+    assert parse_location("in in in Lisbon") == "Lisbon"
+
+
+def test_location_any_of_your_sources_is_not_a_place():
+    assert parse_location("any other sources, is there no houses to rent or to let?") == ""
+    assert parse_location("no place in any of your sources") == ""
+    assert parse_location("isn't there anything in any other sources") == ""
+
+
 def test_location_spend_the_weekend():
     assert parse_location("I need to spend the weekend in Lisbon") == "Lisbon"
 

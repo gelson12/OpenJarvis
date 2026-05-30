@@ -101,6 +101,16 @@ import search_tools
 from resource_ledger import ResourceLedger
 from hermes_router import HermesRouter, enabled as _hermes_route_enabled, should_route as _hermes_should_route
 
+# Worker-side Kernel — deterministic device-capability layer. Mirrors the
+# server kernel's contract so the assistant behaves one consistent way. Camera
+# and gesture mode are native capabilities on it; legacy _maybe_handle_* run
+# through register_legacy adapters as they migrate.
+from kernel import (
+    WorkerKernel,
+    camera_capability as _kernel_camera_capability,
+    gesture_capability as _kernel_gesture_capability,
+)
+
 # Accommodation booking — lazy import so a missing/broken accommodation
 # module never crashes worker startup. See
 # `brain/Accommodation Booking — Implementation Plan` in the user's vault.
@@ -2749,6 +2759,14 @@ class Assistant(Agent):
         # Env-gated by OPENJARVIS_HERMES_ROUTE; off by default.
         self._hermes_router: HermesRouter = HermesRouter()
 
+        # Device kernel — the worker half of the deterministic capability
+        # layer. Camera + gesture mode are native capabilities; more migrate
+        # onto it over time via register_legacy. One ordered registry, one
+        # contract, no LLM guessing about device control.
+        self._device_kernel: WorkerKernel = WorkerKernel()
+        self._device_kernel.register("camera", _kernel_camera_capability)
+        self._device_kernel.register("gesture", _kernel_gesture_capability)
+
         # Accommodation booking. Lazy-init: build once on first use so a
         # missing LITEAPI_KEY doesn't crash worker startup. Last-search
         # results are cached for the "book the X" follow-up turn.
@@ -3917,6 +3935,21 @@ class Assistant(Agent):
                 pass
             return True
         self._accommodation_last_results = properties
+        # Distinguish a true empty market from a provider outage BEFORE we
+        # touch the HUD. The production failure was a DNS error on BOTH
+        # providers being reported as "there are no houses in Lisbon" — a lie.
+        all_failed = getattr(service, "last_search_all_providers_failed", False)
+        if not properties and all_failed:
+            # Don't open a misleading "no stays" widget during an outage.
+            try:
+                await self.session.say(
+                    f"I'm having trouble reaching the booking services right "
+                    f"now, sir — I couldn't get a result for {location}. "
+                    f"Shall I try again in a moment?"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return True
         # Surface the carousel on the HUD.
         widget_payload = {
             "query": location,
@@ -3948,7 +3981,7 @@ class Assistant(Agent):
         if not properties:
             try:
                 await self.session.say(
-                    f"I couldn't find any properties in {location} for those dates, sir."
+                    f"I couldn't find any stays in {location} for those dates, sir."
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -5793,53 +5826,21 @@ class Assistant(Agent):
         if await self._maybe_handle_apk_repo_followup(text):
             raise StopResponse()
 
-        # Camera on/off — highly specific, runs FIRST among voice intents
-        # so phrases like "turn on the camera" never get swallowed by the
-        # desktop hint gate (which contains "open|launch|start|run").
-        _early_cam = _camera_intent(text)
-        if _early_cam is not None:
-            try:
-                await self._room.local_participant.publish_data(
-                    json.dumps({"type": "camera", "enabled": _early_cam}).encode(),
-                    reliable=True,
-                    topic=UI_COMMAND_TOPIC,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("camera command publish failed: %s", exc)
-            try:
-                await self.session.say(
-                    "Camera on, sir." if _early_cam else "Camera off, sir."
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            raise StopResponse()
-
-        # Gesture mode — same rationale as camera. Must precede desktop +
-        # content dispatchers so "gesture mode" / "turn on gesture mode"
-        # never hits the desktop router (which produces the misleading
-        # "your laptop's desktop-bridge isn't connected" error).
-        _early_gm = _gesture_mode_intent(text)
-        if _early_gm is not None:
-            try:
-                if _early_gm:
-                    await self._room.local_participant.publish_data(
-                        json.dumps({"type": "camera", "enabled": True}).encode(),
-                        reliable=True,
-                        topic=UI_COMMAND_TOPIC,
-                    )
-                await self._room.local_participant.publish_data(
-                    json.dumps({"type": "gesture_mode", "enabled": _early_gm}).encode(),
-                    reliable=True,
-                    topic=UI_COMMAND_TOPIC,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("gesture-mode command publish failed: %s", exc)
-            try:
-                await self.session.say(
-                    "Gesture mode on, sir." if _early_gm else "Gesture mode off, sir."
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        # ── Device kernel — camera + gesture mode ────────────────────────
+        # These run FIRST among voice intents (so "turn on the camera" /
+        # "open gesture mode" never get swallowed by the desktop hint gate).
+        # They go through the WorkerKernel so they obey the same deterministic
+        # contract as the server: a matched capability is executed and a fixed
+        # confirmation is spoken — never an LLM guess, never a disavowal.
+        # ("open gesture mode" used to fall through to the LLM, which replied
+        # "I'm not sure what gesture mode is"; it's a native capability now.)
+        _device_outcome = await self._device_kernel.resolve(text, self)
+        if _device_outcome.stops_turn:
+            if _device_outcome.speak:
+                try:
+                    await self.session.say(_device_outcome.speak)
+                except Exception:  # noqa: BLE001
+                    pass
             raise StopResponse()
 
         # Volume — disambiguates across HUD widgets and desktop apps.
