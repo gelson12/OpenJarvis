@@ -31,7 +31,8 @@ export type WidgetKind =
   | 'system'
   | 'cti'
   | 'site'
-  | 'accommodation';
+  | 'accommodation'
+  | 'accommodation-details';
 
 /** A live widget panel rendered on screen. */
 export interface WidgetInstance {
@@ -143,6 +144,25 @@ export interface AccommodationPayload {
   price_currency?: string;
 }
 
+/** `accommodation-details` widget payload — sibling "Search context" panel
+ * shown next to the main carousel so the search shape (where/when/who/how
+ * many results/top pick) stays visible while the user scrolls. Sent
+ * immediately after the main `accommodation` widget on every search. */
+export interface AccommodationDetailsPayload {
+  location: string;
+  check_in: string;        // ISO date
+  check_out: string;       // ISO date
+  nights: number;
+  guests: number;
+  providers: string[];     // e.g. ["liteapi", "apify_airbnb"]
+  count: number;           // total results returned
+  top_pick: {
+    name: string;
+    price_total: number;
+    price_currency: string;
+  };
+}
+
 /** Commands the worker sends to the browser on {@link JARVIS_UI_TOPIC}. */
 export type JarvisUIMessage =
   | { type: 'open_widget'; kind: WidgetKind; title?: string; payload?: unknown; id?: string }
@@ -183,6 +203,7 @@ export const WIDGET_KINDS: WidgetKind[] = [
   'cti',
   'site',
   'accommodation',
+  'accommodation-details',
 ];
 
 /** Default panel size per widget kind, in CSS pixels. */
@@ -200,6 +221,7 @@ export const WIDGET_DEFAULT_SIZE: Record<WidgetKind, { w: number; h: number }> =
   cti: { w: 900, h: 640 },
   site: { w: 900, h: 640 },
   accommodation: { w: 880, h: 580 },
+  'accommodation-details': { w: 320, h: 580 },
 };
 
 /** Default header text per widget kind. */
@@ -217,4 +239,5 @@ export const WIDGET_DEFAULT_TITLE: Record<WidgetKind, string> = {
   cti: 'Intelligence',
   site: 'Generated Site',
   accommodation: 'Stays',
+  'accommodation-details': 'Search context',
 };

@@ -2779,6 +2779,13 @@ class Assistant(Agent):
         # likely won't contain the keyword regex — still routes back to
         # the accommodation handler via _maybe_resume_accommodation_search.
         self._accommodation_pending_search: dict | None = None
+        # One proactive suggestion per accommodation conversation. Set to
+        # True after the FIRST non-empty search of a fresh conversation
+        # speaks one suggestion (action shortcut / comparison / cross-
+        # feature / upcoming-provider). Cleared by the topic-switch path
+        # in _maybe_resume_accommodation_search or by long idle.
+        self._accommodation_suggestion_offered: bool = False
+        self._accommodation_suggestion_offered_at: float = 0.0
 
     def _has_widget(self, kind: str) -> bool:
         """True when a panel of `kind` is currently visible on the HUD."""
@@ -3978,6 +3985,33 @@ class Assistant(Agent):
             "title": f"Stays in {location}",
             "payload": widget_payload,
         })
+        # Phase 3.2.d — sibling "Search context" details panel. Static
+        # summary that sits next to the main carousel so the search shape
+        # (where/when/who/how many results/top pick) stays visible while
+        # the user scrolls the carousel. Frontend renders via the new
+        # `accommodation-details` widget kind.
+        if properties:
+            providers_used = sorted({p.provider_id for p in properties})
+            top = properties[0]
+            await self._publish_ui({
+                "type": "open_widget",
+                "kind": "accommodation-details",
+                "title": "Search context",
+                "payload": {
+                    "location": location,
+                    "check_in": check_in.isoformat(),
+                    "check_out": check_out.isoformat(),
+                    "nights": (check_out - check_in).days,
+                    "guests": guests,
+                    "providers": providers_used,
+                    "count": len(properties),
+                    "top_pick": {
+                        "name": top.name,
+                        "price_total": top.price_total,
+                        "price_currency": top.price_currency,
+                    },
+                },
+            })
         if not properties:
             try:
                 await self.session.say(
@@ -3997,6 +4031,42 @@ class Assistant(Agent):
             )
         except Exception:  # noqa: BLE001
             pass
+        # Phase 3.2.c — ONE proactive suggestion per accommodation
+        # conversation, AFTER the first non-empty result lands. Rotates
+        # by clock-second to avoid feeling templated; suppressed for the
+        # rest of this conversation by the boolean flag. The state-reset
+        # path lives in _maybe_resume_accommodation_search (topic switch).
+        if not self._accommodation_suggestion_offered:
+            try:
+                first_token = cheapest.name.split()[0] if cheapest.name else "the cheapest"
+                suggestions = [
+                    # 0 — action shortcut: reveal commands the user may not know
+                    (
+                        f"You can say 'book the {first_token}' when you've decided, sir. "
+                        f"Or 'show only Airbnbs' to narrow it down."
+                    ),
+                    # 1 — comparison nudge: explore nearby alternatives
+                    (
+                        "Want me to also check a nearby city for the same dates, sir? "
+                        "Just say the word."
+                    ),
+                    # 2 — cross-feature: bridge to existing OpenJarvis tools
+                    (
+                        "I can email this shortlist to bridge.digital.solution@gmail.com "
+                        "if you'd like, sir."
+                    ),
+                    # 3 — upcoming-providers: roadmap transparency
+                    (
+                        "Booking.com is in our application queue, sir; Vrbo too. "
+                        "Once approved I'll widen the search automatically."
+                    ),
+                ]
+                pick = suggestions[int(time.time()) % len(suggestions)]
+                await self.session.say(pick)
+                self._accommodation_suggestion_offered = True
+                self._accommodation_suggestion_offered_at = time.time()
+            except Exception:  # noqa: BLE001
+                pass
         return True
 
     async def _handle_accommodation_book_start(self, text: str) -> bool:
@@ -4202,9 +4272,13 @@ class Assistant(Agent):
             return False
         if time.time() - pending["created_at"] > 120:
             self._accommodation_pending_search = None
+            # Also clear the suggestion flag — a new conversation starts later
+            # and deserves a fresh suggestion.
+            self._accommodation_suggestion_offered = False
             return False
         if re.search(r"\b(weather|time|news|forget|never\s*mind|cancel|stop)\b", text or "", re.I):
             self._accommodation_pending_search = None
+            self._accommodation_suggestion_offered = False
             return False
         return await self._handle_accommodation_search(text)
 
