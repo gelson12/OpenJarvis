@@ -751,6 +751,142 @@ def _enabled() -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Intent detection — accommodation (LLM-fallback safety net)
+# ---------------------------------------------------------------------------
+#
+# The worker's _ACCOMMODATION_RE catches direct phrasings ("find me a hotel",
+# "book a place"). This intent_preexec layer is the safety net for natural
+# phrasings the worker regex misses — "I'm thinking of crashing somewhere
+# in Madrid this weekend", "places to stay near the airport for a few nights".
+#
+# Without this, the LLM gets the turn and disavows: "I don't have access to
+# booking platforms". The pre-executor calls LiteAPI sandbox directly via
+# sync httpx and injects real data so the LLM just summarises.
+
+_ACCOMMODATION_PREEXEC_RE = re.compile(
+    r"\b("
+    r"hotel|airbnb|accommodation|vacation\s+rental|short\s+let|"
+    r"book\s+(?:a\s+|me\s+)?(?:room|place|hotel|stay)|where\s+to\s+stay|"
+    r"find\s+(?:me\s+)?(?:a\s+|an\s+)?(?:hotel|place|stay|room)|"
+    r"places?\s+to\s+(?:stay|crash|rent|book)|"
+    r"houses?\s+to\s+rent|apartments?\s+to\s+(?:let|rent)|"
+    r"need\s+(?:a\s+)?place|somewhere\s+to\s+stay"
+    r")\b",
+    re.I,
+)
+# Trip-context fallback when the explicit nouns above are absent but the
+# user clearly described accommodation intent ("crash in Madrid", "spend
+# the weekend in Lisbon", "visiting Barcelona next month").
+_ACCOMMODATION_BROAD_RE = re.compile(
+    r"\b("
+    r"(?:crash|stay)\s+(?:in|at|near)\s+[A-Z]?[a-z]+|"
+    r"spend\s+the\s+(?:weekend|night|nights|week)\s+(?:in|at|near)|"
+    r"(?:trip|getaway|holiday|vacation)\s+to\s+[A-Z]?[a-z]+|"
+    r"visiting\s+[A-Z]?[a-z]+.*(?:weekend|week|month|next)"
+    r")\b",
+    re.I,
+)
+
+
+def _accommodation_broad_match(text: str) -> bool:
+    return bool(_ACCOMMODATION_BROAD_RE.search(text or ""))
+
+
+def _detect_accommodation_intent(
+    text: str, *, history_texts: Optional[List[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return {location, check_in, check_out, guests, currency} when the
+    user's text matches an accommodation intent, else None. Reuses the
+    accommodation NLU module's parsers (parse_location, parse_dates,
+    parse_guests) so we share regex behaviour with the worker."""
+    if not text:
+        return None
+    if not (_ACCOMMODATION_PREEXEC_RE.search(text) or _accommodation_broad_match(text)):
+        return None
+    try:
+        from accommodation import nlu as _acc_nlu
+    except Exception:
+        return None
+    location = _acc_nlu.parse_location(text) or ""
+    if not location:
+        # Without a location we can't search — let the LLM ask.
+        return None
+    check_in, check_out = _acc_nlu.parse_dates(text)
+    guests = _acc_nlu.parse_guests(text)
+    currency = os.environ.get("ACCOMMODATION_DEFAULT_CURRENCY", "GBP")
+    return {
+        "location": location,
+        "check_in": check_in.isoformat(),
+        "check_out": check_out.isoformat(),
+        "nights": (check_out - check_in).days,
+        "guests": guests,
+        "currency": currency,
+    }
+
+
+def _run_accommodation_search_sync(
+    *, location: str, check_in: str, check_out: str, guests: int, currency: str,
+) -> Optional[str]:
+    """Sync LiteAPI sandbox search. Returns a short text summary suitable
+    for injection as a context block. None on any failure (the dispatcher
+    falls through to the LLM).
+
+    Uses sync httpx (NOT the async AccommodationService) so this can run
+    inside the sync `maybe_preexecute` without an event-loop bridge."""
+    key = os.environ.get("LITEAPI_KEY", "").strip()
+    if not key:
+        logger.info("intent_preexec.accommodation: LITEAPI_KEY not set")
+        return None
+    env = (os.environ.get("LITEAPI_ENV", "sandbox") or "sandbox").lower()
+    base = (
+        "https://api.liteapi.travel" if env == "production"
+        else "https://api.sandbox.liteapi.travel"
+    )
+    payload = {
+        "checkin": check_in,
+        "checkout": check_out,
+        "currency": currency,
+        "guestNationality": "GB",
+        "occupancies": [{"adults": max(1, guests), "children": []}],
+        "cityName": location,
+        "limit": 8,
+    }
+    try:
+        import httpx
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.post(
+                f"{base}/v3.0/hotels/rates",
+                json=payload,
+                headers={"X-API-Key": key, "Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        logger.warning("intent_preexec.accommodation: liteapi call failed: %s", exc)
+        return None
+    hotels = (data.get("data") or [])[:8]
+    if not hotels:
+        return f"No properties found in {location} for {check_in}->{check_out}."
+    # Build compact summary
+    lines = [
+        f"Found {len(hotels)} properties in {location} for "
+        f"{check_in} -> {check_out} ({guests} guest(s)):"
+    ]
+    for h in hotels:
+        info = h.get("hotel", {}) or {}
+        name = str(info.get("name", "(unknown)"))
+        rooms = h.get("roomTypes") or []
+        if not rooms:
+            continue
+        rate = (rooms[0].get("rates") or [{}])[0]
+        amt = (rate.get("retailRate", {}) or {}).get("total", [{}])[0]
+        price = amt.get("amount", "?")
+        cur = amt.get("currency", currency)
+        lines.append(f"  - {name}: {price} {cur}")
+    return "\n".join(lines)
+
+
 def maybe_preexecute(
     latest_user_text: str,
     *,
@@ -1092,5 +1228,54 @@ def maybe_preexecute(
             tool_name, eml["sender"], eml["is_unread"],
         )
         return {"tool_name": tool_name, "result": result, "context_block": block}
+
+    # Accommodation (LLM-fallback safety net). Catches phrasings the worker
+    # regex misses — "I'm thinking of crashing somewhere in Madrid", "any
+    # decent places to stay in Barcelona this weekend". Fires AFTER email
+    # so explicit email intents (which sometimes mention places) take
+    # priority. Uses sync httpx → LiteAPI so we never need an event-loop
+    # bridge inside this sync function.
+    acc = _detect_accommodation_intent(intent_text, history_texts=history_texts)
+    if acc:
+        result = _run_accommodation_search_sync(
+            location=acc["location"],
+            check_in=acc["check_in"],
+            check_out=acc["check_out"],
+            guests=acc["guests"],
+            currency=acc["currency"],
+        )
+        if result is None:
+            logger.info(
+                "intent_preexec: matched accommodation intent but provider returned None"
+            )
+            return None
+        block = (
+            f"PRE-EXECUTED TOOL RESULT (from accommodation_search, "
+            f"location={acc['location']}, dates={acc['check_in']}->{acc['check_out']}, "
+            f"guests={acc['guests']}):\n{result}\n\n"
+            "ABSOLUTE INSTRUCTIONS (you MUST follow these):\n"
+            "  1. The result above is FRESH data retrieved THIS turn from the\n"
+            "     LiteAPI sandbox — it is REAL property data for the user's\n"
+            "     query. Trust it.\n"
+            "  2. Summarise the top 1-2 picks in one short sentence (e.g. "
+            "'Found N properties in <city>; cheapest is X at <price>').\n"
+            "  3. Do NOT disavow accommodation capability — the worker DOES\n"
+            "     have hotel + Airbnb search. The user can also say 'book\n"
+            "     the X' to reserve a property, which the worker handles.\n"
+            "  4. Do NOT invent platform names not in the result (no\n"
+            "     'Booking.com' / 'Expedia' suggestions unless the user\n"
+            "     specifically asks about them).\n"
+            "  5. If the result is empty, say so honestly ('No properties\n"
+            "     in <city> for those dates, sir').\n"
+        )
+        logger.info(
+            "intent_preexec.accommodation served for location=%s dates=%s->%s",
+            acc["location"], acc["check_in"], acc["check_out"],
+        )
+        return {
+            "tool_name": "accommodation_search",
+            "result": result,
+            "context_block": block,
+        }
 
     return None
