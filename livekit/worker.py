@@ -4253,11 +4253,22 @@ class Assistant(Agent):
     async def _maybe_handle_accommodation(self, text: str) -> bool:
         """Top-level dispatch for accommodation intents. Cascade-only — when
         OPENJARVIS_VOICE_PROVIDER=realtime, regex handlers are skipped, so
-        this never fires (documented gap)."""
+        this never fires (documented gap).
+
+        Order matters here:
+        1. Book-the-X CHECK FIRST. "Book the Barcelona Central Suite"
+           contains NO keyword in _ACCOMMODATION_RE (no hotel/airbnb/stay/
+           etc), so requiring main-regex first short-circuited the book
+           flow entirely — the LLM then got the turn and disavowed. Safe
+           to fire book handler unconditionally because the guard
+           `self._accommodation_last_results` ensures we only book when
+           there's something to book.
+        2. Main keyword regex for fresh search intents.
+        """
+        if _ACCOMMODATION_BOOK_RE.search(text or "") and self._accommodation_last_results:
+            return await self._handle_accommodation_book_start(text)
         if not _ACCOMMODATION_RE.search(text or ""):
             return False
-        if _ACCOMMODATION_BOOK_RE.search(text) and self._accommodation_last_results:
-            return await self._handle_accommodation_book_start(text)
         return await self._handle_accommodation_search(text)
 
     async def _maybe_resume_accommodation_search(self, text: str) -> bool:
